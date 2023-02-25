@@ -1,0 +1,27 @@
+# -------------------------------------------------------------------------------------
+# Theme Core Configuration | 主题核心配置
+# See: https://fixit.lruihao.cn/theme-documentation-basics/#site-configuration
+# -------------------------------------------------------------------------------------
+
+
+[home]
+  rss = 10
+  [home.profile]
+    enable = true
+    gravatarEmail = ""
+    avatarURL = "/avatar.png"
+    title = ""
+    subtitle = "Don't let yourself stop."
+    typeit = true
+    social = true
+    disclaimer = ""
+  [home.posts]
+    enable = true
+    paginate = 6
+
+[social]
+  GitHub = "haiyux"
+  QQ = "99347745"
+  Bilibili = "437910315"
+  Email = "haiyux@foxmail.com"
+  RSS = true

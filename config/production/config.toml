@@ -1,0 +1,8 @@
+# -------------------------------------------------------------------------------------
+# Hugo Configuration | Hugo 配置
+# See: https://gohugo.io/getting-started/configuration/
+# -------------------------------------------------------------------------------------
+
+# Hostname (and path) to the root
+# 根目录的主机名（和路径）
+baseURL = "https://haiyux.cc"
