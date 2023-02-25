@@ -3,7 +3,7 @@ title: "kratos http原理"
 date: 2022-08-07T15:59:44+08:00
 draft: false
 toc: true
-categories: [go，kratos]
+categories: [go,kratos]
 tags: [golang,http]
 authors:
     - haiyux
