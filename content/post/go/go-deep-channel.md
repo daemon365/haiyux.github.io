@@ -44,7 +44,7 @@ func main() {
 
 上面只是个简单的例子，只输出goRoutineA ，没有执行goRoutineB，说明channel仅允许被一个goroutine读写。
 
-go并发知识：[go并发](https://zhaohaiyu.com/post/go/go-concurrent/)
+go并发知识：[go并发](https://zhaiyux.cc/post/go/go-concurrent/)
 
 说道channel这里不得不提通道的结构hchan。
 

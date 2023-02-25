@@ -262,7 +262,7 @@ func _Greeter_SayHello0_HTTP_Handler(srv GreeterHTTPServer) func(ctx http.Contex
 
 >什么事责任链模式？
 >
-> https://www.zhaohaiyu.com/post/designmode/behavioral/#%E8%B4%A3%E4%BB%BB%E9%93%BE%E6%A8%A1%E5%BC%8F
+> https://haiyux.cc/post/designmode/behavioral/#%E8%B4%A3%E4%BB%BB%E9%93%BE%E6%A8%A1%E5%BC%8F
 
 上段代码中的POST方法为：
 

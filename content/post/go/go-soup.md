@@ -59,7 +59,7 @@ import (
 )
 
 func main() {
-	resp, err := soup.Get("http://zhaohaiyu.com")
+	resp, err := soup.Get("https://zhaiyux.cc")
 	if err != nil {
 		os.Exit(1)
 	}
@@ -76,14 +76,14 @@ func main() {
 结果
 
 ```
-【置顶】golang目录 --------> https://zhaohaiyu.com/post/go/go_catalog/
-go语言文件系统 --------> https://zhaohaiyu.com/post/go/go_file/
-Flex --------> https://zhaohaiyu.com/post/javascript/flex/
-makefile --------> https://zhaohaiyu.com/post/go/makefile/
-air热加载 --------> https://zhaohaiyu.com/post/go/air/
-thrift的介绍及其使用 --------> https://zhaohaiyu.com/post/go/thrift/
-golang中间件的实现 --------> https://zhaohaiyu.com/post/go/middleware/
-zap高性能日志 --------> https://zhaohaiyu.com/post/go/zap/
-viper配置管理 --------> https://zhaohaiyu.com/post/go/viper/
-proto Prometheus --------> https://zhaohaiyu.com/post/go/promethues/
+【置顶】golang目录 --------> https://zhaiyux.cc/post/go/go_catalog/
+go语言文件系统 --------> https://zhaiyux.cc/post/go/go_file/
+Flex --------> https://zhaiyux.cc/post/javascript/flex/
+makefile --------> https://zhaiyux.cc/post/go/makefile/
+air热加载 --------> https://zhaiyux.cc/post/go/air/
+thrift的介绍及其使用 --------> https://zhaiyux.cc/post/go/thrift/
+golang中间件的实现 --------> https://zhaiyux.cc/post/go/middleware/
+zap高性能日志 --------> https://zhaiyux.cc/post/go/zap/
+viper配置管理 --------> https://zhaiyux.cc/post/go/viper/
+proto Prometheus --------> https://zhaiyux.cc/post/go/promethues/
 ```

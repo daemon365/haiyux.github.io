@@ -143,8 +143,8 @@ Nginx主配置文件/etc/nginx/nginx.conf是一个纯文本类型的文件，整
     *   当存在多个域名时，如果所有配置都写在 nginx.conf 主配置文件中，难免会显得杂乱与臃肿。为了方便配置文件的维护，所以需要进行拆分配置。
 
         ```nginx
-        # 在nginx.conf中 加入  include a.zhaohaiyu.com/nginx.conf; 
-        # 在a.zhaohaiyu.com/nginx.conf中加入 
+        # 在nginx.conf中 加入  include a.zhaiyux.cc/nginx.conf; 
+        # 在a.zhaiyux.cc/nginx.conf中加入 
         server {  
         		listen 8000;  
         		server_name test2.com; 
@@ -156,7 +156,7 @@ Nginx主配置文件/etc/nginx/nginx.conf是一个纯文本类型的文件，整
                 ## proxy_pass 				   http://xxx.xxx.xxx;  echo "test2.com"; ## 输出测试   
              } 
          } 
-        # 等于把zhaohaiyu.com/nginx.conf直接吸入nginx.conf中
+        # 等于把zhaiyux.cc/nginx.conf直接吸入nginx.conf中
         ```
 
 ## Nginx虚拟主机
@@ -361,7 +361,7 @@ root实例：
 location ^~ /av {  root /data/av;   注意这里可有可无结尾的   / }
 ```
 
-请求url是zhaohaiyu.com/av/index.html时 web服务器会返回服务器上的/data/av/av/index.html
+请求url是zhaiyux.cc/av/index.html时 web服务器会返回服务器上的/data/av/av/index.html
 
 root实例2：
 
@@ -369,7 +369,7 @@ root实例2：
 location ~* .*\.(jpg|gif|png|js|css)$ {  root /data/av/; }
 ```
 
-请求url是zhaohaiyu.com/girl.gif时 web服务器会返回服务器上的/data/static/girl.gif
+请求url是zhaiyux.cc/girl.gif时 web服务器会返回服务器上的/data/static/girl.gif
 
 alias实例：
 
@@ -379,7 +379,7 @@ alias实例：
 location ^~ /av {  alias /data/static/; }
 ```
 
-请求url是zhaohaiyu.com/av/index.html时 web服务器会返回服务器上的/data/static/index.html
+请求url是zhaiyux.cc/av/index.html时 web服务器会返回服务器上的/data/static/index.html
 
 ## Keepalived高可用软件
 

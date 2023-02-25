@@ -99,7 +99,7 @@ message HelloReply {
 
 安装工具包:
 
-1. 下载protoc [链接](https://www.zhaohaiyu.com/protobuf/)
+1. 下载protoc [链接](https://haiyux.cc/protobuf/)
 2. `go install google.golang.org/protobuf/cmd/protoc-gen-go@latest`
 3. `go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest`
 
