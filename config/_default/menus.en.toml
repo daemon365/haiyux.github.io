@@ -71,4 +71,4 @@
   weight = 8
   [main.params]
     class = "text-center"
-    # type = "mobile"
+    type = "mobile"
