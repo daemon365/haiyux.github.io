@@ -268,8 +268,6 @@ Overlay 只有两层：upper 层和 lower 层，Lower 层代表镜像层，upper
 
 ![image-20211201223026631](/images/image-20211201223026631.png)
 
-### 
-
 ## Reference
 
 1. https://jiajially.gitbooks.io/dockerguide/content/dockerCoreNS.html
