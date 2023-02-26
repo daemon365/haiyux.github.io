@@ -11,7 +11,7 @@
   # you can add extra information after the name (HTML format is supported), such as icons
   # 你可以在名称 (允许 HTML 格式) 之后添加其他信息, 例如图标
   post = ""
-  name = "所有文章"
+  name = "文章"
   url = "posts/"
   # title will be shown when you hover on this menu link
   # 当您将鼠标悬停在此菜单链接上时, 将显示标题
@@ -50,14 +50,6 @@
   [main.params]
     icon = "fa-solid fa-tags"
 [[main]]
-  identifier = "documentation"
-  name = "文档"
-  url = "documentation/"
-  title = "文档"
-  weight = 4
-  [main.params]
-    icon = "fa-solid fa-book"
-[[main]]
   identifier = "friends"
   name = "友链"
   url = "friends/"
@@ -75,9 +67,9 @@
 [[main]]
   identifier = "github"
   pre = "<i class='fa-brands fa-github fa-fw' aria-hidden='true'></i>"
-  url = "https://github.com/hugo-fixit/FixIt"
+  url = "https://github.com/haiyux"
   title = "GitHub"
   weight = 8
   [main.params]
     class = "text-center"
-    type = "mobile"
+    # type = "mobile"

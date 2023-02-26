@@ -50,14 +50,6 @@
   [main.params]
     icon = "fa-solid fa-tags"
 [[main]]
-  identifier = "documentation"
-  name = "Docs"
-  url = "categories/documentation/"
-  title = "Theme Documentation"
-  weight = 4
-  [main.params]
-    icon = "fa-solid fa-book"
-[[main]]
   identifier = "friends"
   name = "Friends"
   url = "friends/"
@@ -79,4 +71,4 @@
   weight = 8
   [main.params]
     class = "text-center"
-    type = "mobile"
+    # type = "mobile"
