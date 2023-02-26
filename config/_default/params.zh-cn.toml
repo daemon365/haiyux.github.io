@@ -16,7 +16,7 @@
     disclaimer = ""
   [home.posts]
     enable = true
-    paginate = 6
+    paginate = 10
 
 [social]
   GitHub = "haiyux"
