@@ -22,4 +22,13 @@ You can add this website to your friend chain and comment your website informati
   description: <description of your site>
 ```
 
+example:
+
+```yaml
+- nickname: haiyux
+  avatar: https://haiyux.cc/avatar.png
+  url: https://haiyux.cc
+  description: haiyux's blog
+```
+
 {{< /admonition >}}
