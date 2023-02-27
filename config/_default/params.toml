@@ -444,7 +444,7 @@ disableThemeInject = false
     keepStatic = false
     # whether to make the table of the contents in the sidebar automatically collapsed
     # 是否使侧边目录自动折叠展开
-    auto = true
+    auto = false
     # position of TOC ["left", "right"] since v0.2.13
     # 目录位置 ["left", "right"] since v0.2.13
     position = "right"
@@ -469,10 +469,10 @@ disableThemeInject = false
     copy = true
     # whether to show the edit button of the code block since v0.2.13
     # 是否显示代码块的编辑按钮 since v0.2.13
-    edit = true
+    edit = false
     # the maximum number of lines of displayed code by default
     # 默认展开显示的代码行数
-    maxShownLines = 20
+    maxShownLines = 200
   # Post edit since v0.2.14
   # 文章编辑 since v0.2.14
   [page.edit]
