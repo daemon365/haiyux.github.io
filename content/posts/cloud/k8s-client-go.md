@@ -1,5 +1,5 @@
 ---
-title: "kubernetes client-go"
+title: "kubernetes client-go功能介绍"
 date: 2023-02-26T12:03:20+08:00
 draft: false
 toc: true
@@ -369,11 +369,348 @@ name:pods group:metrics.k8s.io version:v1beta1
 */
 ```
 
-## indexer informer lister机制
+## informer indexer  lister机制
 
 ![img](/images/client-go-controller-interaction-20230226221459038.jpeg)
 
+上图展示了自定义控制器的工作方式。在虚线上方，是client-go包的informer和indexer工作方式。informer负责监听Kubernetes API资源对象的变化，如创建、更新、删除等操作，并将这些变化通知给indexer进行索引和缓存。而indexer则是将API对象进行索引，以便在需要时快速地访问它们。lister则是对indexer的封装，提供了一种简单的方式来获取已经索引的对象列表，以供代码中的其他部分使用。这种分层结构的设计使得client-go可以高效地处理Kubernetes资源对象的变化，并在应用程序中方便地使用这些资源对象。
 
+### informer
+
+Informer是Kubernetes API客户端中一种重要的机制，它可以实现对资源对象的监视和事件通知。当Kubernetes集群中的资源对象发生变化时，Informer可以及时地获取到这些变化，并将这些变化以事件的形式通知给相关的监听器。Informer通过调用API Server提供的REST接口，以及Kubernetes中定义的watch机制，实现了对集群资源对象的全面监视。
+
+下面是一个简单的pod informer示例，用于监控所有pod的变化并将其放入队列中，worker从队列中取出pod并打印相关信息。
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/workqueue"
+)
+
+func main() {
+	// 获取 kubeconfig 文件路径
+	kubeconfigPath := os.Getenv("KUBECONFIG")
+	if kubeconfigPath == "" {
+		kubeconfigPath = os.Getenv("HOME") + "/.kube/config"
+	}
+
+	// 使用 kubeconfig 文件创建 kubernetes 客户端
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		panic(err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err)
+	}
+
+	// 创建 informer 工厂
+	informerFactory := informers.NewSharedInformerFactory(clientset, time.Minute)
+
+	// 创建 informer 对象
+	podInformer := informerFactory.Core().V1().Pods()
+
+	// 创建工作队列
+	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+
+	// 定义处理新增、更新和删除事件的回调函数
+	podHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(obj)
+			if err == nil {
+				queue.Add(key)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(newObj)
+			if err == nil {
+				queue.Add(key)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(obj)
+			if err == nil {
+				queue.Add(key)
+			}
+		},
+	}
+
+	// 将回调函数注册到 informer 上
+	podInformer.Informer().AddEventHandler(podHandler)
+
+	// 启动 informer
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	informerFactory.Start(stopCh)
+
+	// 等待 informer 同步完成
+	if !cache.WaitForCacheSync(stopCh) {
+		panic("同步 informer 缓存失败")
+	}
+
+	// 创建信号处理程序，用于捕捉 SIGTERM 和 SIGINT 信号
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGTERM, syscall.SIGINT)
+
+	// 创建 worker 函数，用于处理队列中的事件
+	processNextItem := func() {
+		obj, shutdown := queue.Get()
+		if shutdown {
+			return
+		}
+
+		// 转换对象为 Pod
+		key := obj.(string)
+		podObj, exists, err := podInformer.Informer().GetIndexer().GetByKey(key)
+		if err != nil {
+			queue.Forget(obj)
+			panic(fmt.Sprintf("获取 Pod 失败：%v", err))
+		}
+
+		if !exists {
+			// 如果对象已经被删除，就把它从队列中移除
+			queue.Forget(obj)
+			return
+		}
+
+		// 在这里添加处理 Pod 的逻辑
+		pod := podObj.(*v1.Pod)
+		fmt.Printf("处理 Pod: namespace:%v,podName:%v\n", pod.Namespace, pod.Name)
+
+		// 处理完事件后，把它从队列中移除
+		queue.Forget(obj)
+		return
+	}
+
+	// 启动 worker
+	go wait.Until(processNextItem, time.Second, stopCh)
+
+	// 等待信号
+	<-signalCh
+}
+
+/*
+处理 Pod: namespace:kube-system,podName:kindnet-h25kv
+处理 Pod: namespace:kube-system,podName:kube-apiserver-minikube
+处理 Pod: namespace:kube-system,podName:metrics-server-c9fb666df-zk4tb
+处理 Pod: namespace:kubernetes-dashboard,podName:dashboard-metrics-scraper-b74747df5-4pb7w
+处理 Pod: namespace:default,podName:nginx-76d6c9b8c-jqv9h
+处理 Pod: namespace:default,podName:nginx-76d6c9b8c-m4g5l
+处理 Pod: namespace:kube-system,podName:coredns-7f8cbcb969-48nz6
+处理 Pod: namespace:kube-system,podName:kube-proxy-t766g
+处理 Pod: namespace:kube-system,podName:kube-scheduler-minikube
+处理 Pod: namespace:kube-system,podName:kindnet-44zl6
+处理 Pod: namespace:kube-system,podName:kube-controller-manager-minikube
+处理 Pod: namespace:kube-system,podName:kube-proxy-gq68w
+处理 Pod: namespace:kube-system,podName:kube-proxy-l92vg
+处理 Pod: namespace:kube-system,podName:storage-provisioner
+处理 Pod: namespace:kubernetes-dashboard,podName:kubernetes-dashboard-57bbdc5f89-466rh
+处理 Pod: namespace:default,podName:nginx-76d6c9b8c-kr9d2
+处理 Pod: namespace:default,podName:nginx-76d6c9b8c-n8st9
+处理 Pod: namespace:kube-system,podName:kindnet-w9f7t
+处理 Pod: namespace:default,podName:nginx-76d6c9b8c-8ljkt
+处理 Pod: namespace:kube-system,podName:etcd-minikube
+处理 Pod: namespace:default,podName:nginx
+处理 Pod: namespace:default,podName:ubuntu
+*/
+```
+
+### indexer
+
+Indexer是client-go中用于本地缓存资源对象的一种方式。它支持多种索引方式，并且可以使用函数`func(obj interface{}) ([]string, error)`进行索引。在检索时，需要使用相同的`indexName`参数。借助`informer`，indexer就可以维护一个特定资源的本地缓存，例如pod、namespace等。这种方法省去了每次get pod都要访问api-server的过程，从而减小了api-server的压力。
+
+```go
+// 如何使用索引器来检索Pod对象
+package main
+
+import (
+	"fmt"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
+)
+
+const (
+	NamespaceIndexName = "namespace" // 定义一个索引器名称，用于按照命名空间检索Pod
+	NodeNameIndexName  = "nodeName"  // 定义一个索引器名称，用于按照节点名称检索Pod
+)
+
+// NamespaceIndexFunc是一个函数，用于从对象中提取命名空间作为索引键
+func NamespaceIndexFunc(obj interface{}) ([]string, error) {
+	m, err := meta.Accessor(obj) // 获取对象的元数据
+	if err != nil {
+		return []string{""}, fmt.Errorf("object has no meta: %v", err)
+	}
+	return []string{m.GetNamespace()}, nil // 返回对象的命名空间
+}
+
+// NodeNameIndexFunc是一个函数，用于从Pod对象中提取节点名称作为索引键
+func NodeNameIndexFunc(obj interface{}) ([]string, error) {
+	pod, ok := obj.(*v1.Pod) // 判断对象是否是Pod类型
+	if !ok {
+		return []string{}, nil // 如果不是，返回空切片
+	}
+	return []string{pod.Spec.NodeName}, nil // 如果是，返回Pod的节点名称
+}
+
+func main() {
+	index := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		NamespaceIndexName: NamespaceIndexFunc,
+		NodeNameIndexName:  NodeNameIndexFunc,
+	}) // 创建一个新的索引器，指定主键函数和辅助键函数
+
+	pod1 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "index-pod-1",
+			Namespace: "default",
+		},
+		Spec: v1.PodSpec{NodeName: "node1"},
+	} // 创建一个Pod对象，属于default命名空间和node1节点
+
+	pod2 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "index-pod-2",
+			Namespace: "default",
+		},
+		Spec: v1.PodSpec{NodeName: "node2"},
+	} // 创建另一个Pod对象，属于default命名空间和node2节点
+
+	pod3 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "index-pod-3",
+			Namespace: "kube-system",
+		},
+		Spec: v1.PodSpec{NodeName: "node2"},
+	} // 创建第三个Pod对象，属于kube-system命名空间和node2节点
+
+	index.Add(pod1) // 将pod1添加到索引器中
+	index.Add(pod2) // 将pod2添加到索引器中
+	index.Add(pod3) // 将pod3添加到索引器中
+
+	pods, err := index.ByIndex(NamespaceIndexName, "default") // 按照命名空间为default检索Pod列表
+	if err != nil {
+		panic(err)
+	}
+	for _, pod := range pods {
+		fmt.Println(pod.(*v1.Pod).Name)
+	} // 遍历并打印检索到的Pod名称
+
+	fmt.Println("*****************")
+
+	pods, err = index.ByIndex(NodeNameIndexName, "node2") // 按照节点名称为node2检索Pod列表
+	if err != nil {
+		panic(err)
+	}
+	for _, pod := range pods {
+		fmt.Println(pod.(*v1.Pod).Name)
+	} // 遍历并打印
+}
+
+/*
+index-pod-2
+index-pod-1
+*****************
+index-pod-2
+index-pod-3
+*/
+```
+
+### lister
+
+Lister是对Indexer的封装，提供了一种方便的方式来获取已经索引的Kubernetes资源对象列表。
+
+具体而言，Lister是一个接口，包含了获取所有已索引对象的列表以及根据名称获取单个对象的方法。这些方法可以帮助开发者在应用程序中快速访问已经缓存的资源对象，而无需直接与Indexer交互。
+
+Lister的主要功能包括：
+
+1. 提供方便的接口：Lister接口的方法定义清晰简洁，使用起来非常方便，可以快速地获取已经索引的资源对象列表。
+2. 提高代码可读性：通过使用Lister接口，代码可读性得到提高。开发者可以更加专注于业务逻辑，而无需关注底层的Indexer实现细节。
+3. 提高代码复用性：由于Lister接口已经提供了通用的方法，因此可以更容易地在不同的代码模块中重用相同的逻辑，减少代码重复。
+
+总之，Lister作为client-go包中的一个重要组件，可以帮助开发者更加高效地处理Kubernetes资源对象，提高代码的可读性和可重用性。
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+func main() {
+	// 获取 kubeconfig 文件路径
+	kubeconfigPath := os.Getenv("KUBECONFIG")
+	if kubeconfigPath == "" {
+		kubeconfigPath = os.Getenv("HOME") + "/.kube/config"
+	}
+	// 使用 kubeconfig 文件创建 kubernetes 客户端
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		panic(err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// 创建Informer
+	factory := informers.NewSharedInformerFactory(clientset, time.Minute)
+	podInformer := factory.Core().V1().Pods()
+
+	// 创建Lister
+	lister := podInformer.Lister()
+
+	// 等待Informer同步完成
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	factory.Start(stopCh)
+	cache.WaitForCacheSync(stopCh, podInformer.Informer().HasSynced)
+
+	// 获取namespace为"default"的Pod对象
+	podList, err := lister.Pods("default").List(labels.Everything())
+	if err != nil {
+		panic(err.Error())
+	}
+	// 打印Pod对象
+	for _, pod := range podList {
+		fmt.Printf("Pod name: %s, Namespace: %s\n", pod.Name, pod.Namespace)
+	}
+}
+
+/*
+Pod name: nginx-76d6c9b8c-m4g5l, Namespace: default
+Pod name: nginx, Namespace: default
+Pod name: ubuntu, Namespace: default
+Pod name: nginx-76d6c9b8c-kr9d2, Namespace: default
+Pod name: nginx-76d6c9b8c-n8st9, Namespace: default
+Pod name: nginx-76d6c9b8c-8ljkt, Namespace: default
+Pod name: nginx-76d6c9b8c-jqv9h, Namespace: default
+*/
+```
 
 ## Reference
 
