@@ -2,8 +2,13 @@
 title: "容器的三大技术--Namespace,Cgroup,UnionFS"
 date: 2022-10-29T20:54:04+08:00
 draft: false
-categories: [cloud]
-tags: [cloud,container,Namespace,Cgroup,UnionFS]
+categories: 
+  - cloud
+tags: 
+  - container
+  - Namespace
+  - Cgroup
+  - UnionFS
 authors:
     - haiyux
 ---

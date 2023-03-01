@@ -4,7 +4,7 @@ date: 2022-09-21T22:03:20+08:00
 draft: false
 toc: true
 categories: [cloud]
-tags: [cloud,kubernetes]
+tags: [kubernetes]
 authors:
     - haiyux
 ---

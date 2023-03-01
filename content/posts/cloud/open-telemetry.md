@@ -4,7 +4,7 @@ date: 2021-09-21T18:01:58+08:00
 draft: false
 toc: true
 categories: [cloud]
-tags: [cloud,traceing]
+tags: [traceing]
 authors:
     - haiyux
 ---

@@ -6,7 +6,7 @@ toc: true
 categories: 
     - cloud
 tags: 
-    - cloud
+    - client-go
     - kubernetes
 authors:
     - haiyux
