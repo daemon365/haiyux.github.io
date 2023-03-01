@@ -3,8 +3,10 @@ title: "Makefile"
 date: 2020-06-12T17:30:43+08:00
 draft: false
 toc: true
-categories: [operations]
-tags: [运维,makefile]
+categories: 
+  - operations
+tags: 
+  - makefile
 authors:
     - haiyux
 ---

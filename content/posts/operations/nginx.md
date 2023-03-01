@@ -3,8 +3,10 @@ title: "Nginx基础"
 date: 2020-06-13T18:30:43+08:00
 draft: false
 toc: true
-categories: [operations]
-tags: [运维,nginx]
+categories: 
+  - operations
+tags: 
+  - nginx
 authors:
     - haiyux
 ---
