@@ -37,7 +37,269 @@ func main() {
 
 ## NewControllerManagerCommand
 
-待更新
+```go
+func NewControllerManagerCommand() *cobra.Command {
+	s, err := options.NewKubeControllerManagerOptions()
+	if err != nil {
+		klog.Fatalf("unable to initialize command options: %v", err)
+	}
+
+	cmd := &cobra.Command{
+		Use: "kube-controller-manager",
+		Long: `The Kubernetes controller manager is a daemon that embeds
+the core control loops shipped with Kubernetes. In applications of robotics and
+automation, a control loop is a non-terminating loop that regulates the state of
+the system. In Kubernetes, a controller is a control loop that watches the shared
+state of the cluster through the apiserver and makes changes attempting to move the
+current state towards the desired state. Examples of controllers that ship with
+Kubernetes today are the replication controller, endpoints controller, namespace
+controller, and serviceaccounts controller.`,
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			// silence client-go warnings.
+			// kube-controller-manager generically watches APIs (including deprecated ones),
+			// and CI ensures it works properly against matching kube-apiserver versions.
+			restclient.SetDefaultWarningHandler(restclient.NoWarnings{})
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			verflag.PrintAndExitIfRequested()
+
+			// Activate logging as soon as possible, after that
+			// show flags with the final logging configuration.
+			if err := logsapi.ValidateAndApply(s.Logs, utilfeature.DefaultFeatureGate); err != nil {
+				return err
+			}
+			cliflag.PrintFlags(cmd.Flags())
+
+			c, err := s.Config(KnownControllers(), ControllersDisabledByDefault.List())
+			if err != nil {
+				return err
+			}
+			// add feature enablement metrics
+			utilfeature.DefaultMutableFeatureGate.AddMetrics()
+			return Run(c.Complete(), wait.NeverStop)
+		},
+		Args: func(cmd *cobra.Command, args []string) error {
+			for _, arg := range args {
+				if len(arg) > 0 {
+					return fmt.Errorf("%q does not take any arguments, got %q", cmd.CommandPath(), args)
+				}
+			}
+			return nil
+		},
+	}
+
+	fs := cmd.Flags()
+	namedFlagSets := s.Flags(KnownControllers(), ControllersDisabledByDefault.List())
+	verflag.AddFlags(namedFlagSets.FlagSet("global"))
+	globalflag.AddGlobalFlags(namedFlagSets.FlagSet("global"), cmd.Name(), logs.SkipLoggingConfigurationFlags())
+	registerLegacyGlobalFlags(namedFlagSets)
+	for _, f := range namedFlagSets.FlagSets {
+		fs.AddFlagSet(f)
+	}
+
+	cols, _, _ := term.TerminalSize(cmd.OutOrStdout())
+	cliflag.SetUsageAndHelpFunc(cmd, namedFlagSets, cols)
+
+	return cmd
+}
+```
+
+1. `options.NewKubeControllerManagerOptions()`： 创建一个`options` ,用来绑定命令行参数。如果出现错误，日志打印错误。
+2. `cobra.Command` : 创建一个command对象 用来启动
+3. `fs := cmd.Flags()`: 获取命令行参数，
+4. `namedFlagSets := s.Flags(KnownControllers(), ControllersDisabledByDefault.List())`: 获取选项对象的标志集
+5. `namedFlagSets := s.Flags(KnownControllers(), ControllersDisabledByDefault.List())`: 获取控制器管理器选项的命名 flag 集合，该命名 flag 集合用于特定的控制器
+6. `verflag.AddFlags(namedFlagSets.FlagSet("global"))`: 向全局 flag 集合中添加命名 flag 集合的 flag
+7. `globalflag.AddGlobalFlags(namedFlagSets.FlagSet("global"), cmd.Name(), logs.SkipLoggingConfigurationFlags())`: 向全局 flag 集合和命令名称、日志配置跳过标志添加全局 flag
+8. `registerLegacyGlobalFlags(namedFlagSets)`: 注册传统全局 flag
+9. `for _, f := range namedFlagSets.FlagSets {  fs.AddFlagSet(f) }`:  将命名 flag 集合中的 flag 集合添加到当前命令的 flag 集合中
+10. `cols, _, _ := term.TerminalSize(cmd.OutOrStdout()) `: 获取终端窗口的列数
+11. `cliflag.SetUsageAndHelpFunc(cmd, namedFlagSets, cols)`: 设置用法和帮助函数
+
+​	上述代码中和把flag相关的都省略说明了不是这篇文章的重点，k8s的flag绑定使用的是`github.com/spf13/pflag`库
+
+### options.NewKubeControllerManagerOptions()
+
+这个函数的主要作用是创建一个名为 `options` 的对象。该对象包含了各个 `controller` 的参数以及 `kube-controller-manager` 需要的 `kubeconfig` 参数等。这些参数是通过命令行输入的方式传递进来的。
+
+该函数首先会将这些参数绑定到一个字典对象 `options` 中，以便在后续的代码中使用。
+
+```go
+// KubeControllerManagerOptions is the main context object for the kube-controller manager.
+type KubeControllerManagerOptions struct {
+	Generic           *cmoptions.GenericControllerManagerConfigurationOptions
+	KubeCloudShared   *cpoptions.KubeCloudSharedOptions
+	ServiceController *cpoptions.ServiceControllerOptions
+
+	AttachDetachController           *AttachDetachControllerOptions
+	CSRSigningController             *CSRSigningControllerOptions
+	DaemonSetController              *DaemonSetControllerOptions
+	DeploymentController             *DeploymentControllerOptions
+	StatefulSetController            *StatefulSetControllerOptions
+	DeprecatedFlags                  *DeprecatedControllerOptions
+	EndpointController               *EndpointControllerOptions
+	EndpointSliceController          *EndpointSliceControllerOptions
+	EndpointSliceMirroringController *EndpointSliceMirroringControllerOptions
+	EphemeralVolumeController        *EphemeralVolumeControllerOptions
+	GarbageCollectorController       *GarbageCollectorControllerOptions
+	HPAController                    *HPAControllerOptions
+	JobController                    *JobControllerOptions
+	CronJobController                *CronJobControllerOptions
+	NamespaceController              *NamespaceControllerOptions
+	NodeIPAMController               *NodeIPAMControllerOptions
+	NodeLifecycleController          *NodeLifecycleControllerOptions
+	PersistentVolumeBinderController *PersistentVolumeBinderControllerOptions
+	PodGCController                  *PodGCControllerOptions
+	ReplicaSetController             *ReplicaSetControllerOptions
+	ReplicationController            *ReplicationControllerOptions
+	ResourceQuotaController          *ResourceQuotaControllerOptions
+	SAController                     *SAControllerOptions
+	TTLAfterFinishedController       *TTLAfterFinishedControllerOptions
+
+	SecureServing  *apiserveroptions.SecureServingOptionsWithLoopback
+	Authentication *apiserveroptions.DelegatingAuthenticationOptions
+	Authorization  *apiserveroptions.DelegatingAuthorizationOptions
+	Metrics        *metrics.Options
+	Logs           *logs.Options
+
+	Master                      string
+	Kubeconfig                  string
+	ShowHiddenMetricsForVersion string
+}
+
+// NewKubeControllerManagerOptions creates a new KubeControllerManagerOptions with a default config.
+func NewKubeControllerManagerOptions() (*KubeControllerManagerOptions, error) {
+	componentConfig, err := NewDefaultComponentConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	s := KubeControllerManagerOptions{
+		Generic:         cmoptions.NewGenericControllerManagerConfigurationOptions(&componentConfig.Generic),
+		KubeCloudShared: cpoptions.NewKubeCloudSharedOptions(&componentConfig.KubeCloudShared),
+		ServiceController: &cpoptions.ServiceControllerOptions{
+			ServiceControllerConfiguration: &componentConfig.ServiceController,
+		},
+		AttachDetachController: &AttachDetachControllerOptions{
+			&componentConfig.AttachDetachController,
+		},
+		CSRSigningController: &CSRSigningControllerOptions{
+			&componentConfig.CSRSigningController,
+		},
+		DaemonSetController: &DaemonSetControllerOptions{
+			&componentConfig.DaemonSetController,
+		},
+		DeploymentController: &DeploymentControllerOptions{
+			&componentConfig.DeploymentController,
+		},
+		StatefulSetController: &StatefulSetControllerOptions{
+			&componentConfig.StatefulSetController,
+		},
+		DeprecatedFlags: &DeprecatedControllerOptions{
+			&componentConfig.DeprecatedController,
+		},
+		EndpointController: &EndpointControllerOptions{
+			&componentConfig.EndpointController,
+		},
+		EndpointSliceController: &EndpointSliceControllerOptions{
+			&componentConfig.EndpointSliceController,
+		},
+		EndpointSliceMirroringController: &EndpointSliceMirroringControllerOptions{
+			&componentConfig.EndpointSliceMirroringController,
+		},
+		EphemeralVolumeController: &EphemeralVolumeControllerOptions{
+			&componentConfig.EphemeralVolumeController,
+		},
+		GarbageCollectorController: &GarbageCollectorControllerOptions{
+			&componentConfig.GarbageCollectorController,
+		},
+		HPAController: &HPAControllerOptions{
+			&componentConfig.HPAController,
+		},
+		JobController: &JobControllerOptions{
+			&componentConfig.JobController,
+		},
+		CronJobController: &CronJobControllerOptions{
+			&componentConfig.CronJobController,
+		},
+		NamespaceController: &NamespaceControllerOptions{
+			&componentConfig.NamespaceController,
+		},
+		NodeIPAMController: &NodeIPAMControllerOptions{
+			&componentConfig.NodeIPAMController,
+		},
+		NodeLifecycleController: &NodeLifecycleControllerOptions{
+			&componentConfig.NodeLifecycleController,
+		},
+		PersistentVolumeBinderController: &PersistentVolumeBinderControllerOptions{
+			&componentConfig.PersistentVolumeBinderController,
+		},
+		PodGCController: &PodGCControllerOptions{
+			&componentConfig.PodGCController,
+		},
+		ReplicaSetController: &ReplicaSetControllerOptions{
+			&componentConfig.ReplicaSetController,
+		},
+		ReplicationController: &ReplicationControllerOptions{
+			&componentConfig.ReplicationController,
+		},
+		ResourceQuotaController: &ResourceQuotaControllerOptions{
+			&componentConfig.ResourceQuotaController,
+		},
+		SAController: &SAControllerOptions{
+			&componentConfig.SAController,
+		},
+		TTLAfterFinishedController: &TTLAfterFinishedControllerOptions{
+			&componentConfig.TTLAfterFinishedController,
+		},
+		SecureServing:  apiserveroptions.NewSecureServingOptions().WithLoopback(),
+		Authentication: apiserveroptions.NewDelegatingAuthenticationOptions(),
+		Authorization:  apiserveroptions.NewDelegatingAuthorizationOptions(),
+		Metrics:        metrics.NewOptions(),
+		Logs:           logs.NewOptions(),
+	}
+
+	s.Authentication.RemoteKubeConfigFileOptional = true
+	s.Authorization.RemoteKubeConfigFileOptional = true
+
+	// Set the PairName but leave certificate directory blank to generate in-memory by default
+	s.SecureServing.ServerCert.CertDirectory = ""
+	s.SecureServing.ServerCert.PairName = "kube-controller-manager"
+	s.SecureServing.BindPort = ports.KubeControllerManagerPort
+
+	gcIgnoredResources := make([]garbagecollectorconfig.GroupResource, 0, len(garbagecollector.DefaultIgnoredResources()))
+	for r := range garbagecollector.DefaultIgnoredResources() {
+		gcIgnoredResources = append(gcIgnoredResources, garbagecollectorconfig.GroupResource{Group: r.Group, Resource: r.Resource})
+	}
+
+	s.GarbageCollectorController.GCIgnoredResources = gcIgnoredResources
+	s.Generic.LeaderElection.ResourceName = "kube-controller-manager"
+	s.Generic.LeaderElection.ResourceNamespace = "kube-system"
+
+	return &s, nil
+}
+```
+
+### cobra.Command
+
+`Args` 函数是检查是否有参数，有参数就报错
+
+`PersistentPreRunE` 是在run之前执行 `restclient.SetDefaultWarningHandler(restclient.NoWarnings{})` 此处设置了 REST 客户端的默认警告处理方式为不输出任何警告信息
+
+cobra.Command 中的 RunE
+
+1. 调用 verflag 包的 PrintAndExitIfRequested 函数，如果输出了版本信息则直接退出程序。
+2. 调用 logsapi 包的 ValidateAndApply 函数，对日志输出进行验证和应用。
+3. 调用 cliflag 包的 PrintFlags 函数，将所有命令行参数的信息输出到控制台。
+4. 调用 options 包的 Config 函数，获取控制器管理器的配置信息。
+5. 调用RUN函数
+
+## controllermanager中的Run
+
+
+
+## 待更新
 
 ## Run
 
