@@ -1,6 +1,6 @@
 ---
 title: "kube-controller-manager 代码走读"
-date: 2023-03-01T21:39:58+08:00
+date: 2023-03-03T21:39:58+08:00
 draft: false
 toc: true
 categories: 
@@ -297,9 +297,330 @@ cobra.Command 中的 RunE
 
 ## controllermanager中的Run
 
+```go
+// Run runs the KubeControllerManagerOptions.
+func Run(c *config.CompletedConfig, stopCh <-chan struct{}) error {
+	// 打印出当前的版本信息，以方便调试。
+	klog.Infof("Version: %+v", version.Get())
+	
+  // 打印出当前的Golang的一些配置信息，包括GOGC，GOMAXPROCS和GOTRACEBACK。
+	klog.InfoS("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
 
+	 // 开始事件处理流水线，并将事件广播器的输出与kubernetes集群中的Event资源相关联。
+	// defer语句在函数返回时会自动执行，用于确保事件广播器在函数结束时被关闭。
+	c.EventBroadcaster.StartStructuredLogging(0)
+	c.EventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: c.Client.CoreV1().Events("")})
+	defer c.EventBroadcaster.Shutdown()
+	
+  // 注册configz（配置信息）。
+	if cfgz, err := configz.New(ConfigzName); err == nil {
+		cfgz.Set(c.ComponentConfig)
+	} else {
+		klog.Errorf("unable to register configz: %v", err)
+	}
 
-## 待更新
+	// 设置一些健康检查的参数，LeaderElection等。
+	var checks []healthz.HealthChecker
+	var electionChecker *leaderelection.HealthzAdaptor
+	if c.ComponentConfig.Generic.LeaderElection.LeaderElect {
+		electionChecker = leaderelection.NewLeaderHealthzAdaptor(time.Second * 20)
+		checks = append(checks, electionChecker)
+	}
+	healthzHandler := controllerhealthz.NewMutableHealthzHandler(checks...)
+
+	// SecureServing 不为空 代表启动安全http server
+  // 通过调用 genericcontrollermanager.NewBaseHandler() 方法，将 healthzHandler 处理函数添加到路由器中，用于处理 Kubernetes 健康检查请求。
+  // 通过调用 genericcontrollermanager.NewBaseHandler() 方法，将 healthzHandler 处理函数添加到路由器中，用于处理 Kubernetes 健康检查请求。
+  // 调用 genericcontrollermanager.BuildHandlerChain() 方法，将授权（Authorization）和身份验证（Authentication）处理器添加到路由器中，用于进行身份验证和授权检查
+  // 通过serve启动
+	var unsecuredMux *mux.PathRecorderMux
+	if c.SecureServing != nil {
+		unsecuredMux = genericcontrollermanager.NewBaseHandler(&c.ComponentConfig.Generic.Debugging, healthzHandler)
+		if utilfeature.DefaultFeatureGate.Enabled(features.ComponentSLIs) {
+			slis.SLIMetricsWithReset{}.Install(unsecuredMux)
+		}
+		handler := genericcontrollermanager.BuildHandlerChain(unsecuredMux, &c.Authorization, &c.Authentication)
+		// TODO: handle stoppedCh and listenerStoppedCh returned by c.SecureServing.Serve
+		if _, _, err := c.SecureServing.Serve(handler, 0, stopCh); err != nil {
+			return err
+		}
+	}
+	
+  //  创建clientBuilder和rootClientBuilder用于与API server进行通信。
+	clientBuilder, rootClientBuilder := createClientBuilders(c)
+	
+  // 创建一个用于启动ServiceAccountTokenController的函数。
+	saTokenControllerInitFunc := serviceAccountTokenControllerStarter{rootClientBuilder: rootClientBuilder}.startServiceAccountTokenController
+	
+  // 
+	run := func(ctx context.Context, startSATokenController InitFunc, initializersFunc ControllerInitializersFunc) {
+    // 创建controllerContext 其中报错运行时的一些内容
+		controllerContext, err := CreateControllerContext(c, rootClientBuilder, clientBuilder, ctx.Done())
+		if err != nil {
+			klog.Fatalf("error building controller context: %v", err)
+		}
+		controllerInitializers := initializersFunc(controllerContext.LoopMode)
+    // 这个函数是启动的主要逻辑 之后会介绍
+		if err := StartControllers(ctx, controllerContext, startSATokenController, controllerInitializers, unsecuredMux, healthzHandler); err != nil {
+			klog.Fatalf("error starting controllers: %v", err)
+		}
+		
+    // 开启Informer  工厂
+		controllerContext.InformerFactory.Start(stopCh)
+		controllerContext.ObjectOrMetadataInformerFactory.Start(stopCh)
+    // 表示 informers 已经启动
+		close(controllerContext.InformersStarted)
+
+		<-ctx.Done()
+	}
+
+	// 如果没有启用领导选举，则直接运行控制器。
+	if !c.ComponentConfig.Generic.LeaderElection.LeaderElect {
+		ctx := wait.ContextForChannel(stopCh)
+		run(ctx, saTokenControllerInitFunc, NewControllerInitializers)
+		return nil
+	}
+	
+  // 获取主机名并为其添加唯一标识符，以避免两个进程在同一主机上意外成为活动状态。
+	id, err := os.Hostname()
+	if err != nil {
+		return err
+	}
+	id = id + "_" + string(uuid.NewUUID())
+
+	// leaderMigrator will be non-nil if and only if Leader Migration is enabled.
+	var leaderMigrator *leadermigration.LeaderMigrator = nil
+
+	// startSATokenController will be original saTokenControllerInitFunc if leader migration is not enabled.
+	startSATokenController := saTokenControllerInitFunc
+
+	// 如果启用了领导迁移，则创建LeaderMigrator并准备迁移。即开启了 c.ComponentConfig.Generic.LeaderMigration），则创建一个 leaderMigrator 变量，并将 startSATokenController 函数包装一下。
+	if leadermigration.Enabled(&c.ComponentConfig.Generic) {
+		klog.Infof("starting leader migration")
+
+		leaderMigrator = leadermigration.NewLeaderMigrator(&c.ComponentConfig.Generic.LeaderMigration,
+			"kube-controller-manager")
+
+		// Wrap saTokenControllerInitFunc to signal readiness for migration after starting
+		//  the controller.
+		startSATokenController = func(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {
+			defer close(leaderMigrator.MigrationReady)
+			return saTokenControllerInitFunc(ctx, controllerContext)
+		}
+	}
+
+	// 使用 leaderElectAndRun() 函数启动 leader election，并执行 OnStartedLeading 和 OnStoppedLeading 回调函数。如果	// 启用了 Leader Migration，会通过 leaderMigrator.FilterFunc 函数来筛选已迁移和未迁移的控制器，并只启动未迁移的控制器
+	go leaderElectAndRun(c, id, electionChecker,
+		c.ComponentConfig.Generic.LeaderElection.ResourceLock,
+		c.ComponentConfig.Generic.LeaderElection.ResourceName,
+		leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(ctx context.Context) {
+				initializersFunc := NewControllerInitializers
+				if leaderMigrator != nil {
+					// If leader migration is enabled, we should start only non-migrated controllers
+					//  for the main lock.
+					initializersFunc = createInitializersFunc(leaderMigrator.FilterFunc, leadermigration.ControllerNonMigrated)
+					klog.Info("leader migration: starting main controllers.")
+				}
+				run(ctx, startSATokenController, initializersFunc)
+			},
+			OnStoppedLeading: func() {
+				klog.ErrorS(nil, "leaderelection lost")
+				klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+			},
+		})
+
+	// 如果启用了 Leader Migration，会等待 leaderMigrator.MigrationReady 的通道关闭后，再启动一个 leader election，并启动已迁移的控制器。最后等待 stopCh 通道关闭后结束函数。
+	if leaderMigrator != nil {
+		// Wait for Service Account Token Controller to start before acquiring the migration lock.
+		// At this point, the main lock must have already been acquired, or the KCM process already exited.
+		// We wait for the main lock before acquiring the migration lock to prevent the situation
+		//  where KCM instance A holds the main lock while KCM instance B holds the migration lock.
+		<-leaderMigrator.MigrationReady
+
+		// Start the migration lock.
+		go leaderElectAndRun(c, id, electionChecker,
+			c.ComponentConfig.Generic.LeaderMigration.ResourceLock,
+			c.ComponentConfig.Generic.LeaderMigration.LeaderName,
+			leaderelection.LeaderCallbacks{
+				OnStartedLeading: func(ctx context.Context) {
+					klog.Info("leader migration: starting migrated controllers.")
+					// DO NOT start saTokenController under migration lock
+					run(ctx, nil, createInitializersFunc(leaderMigrator.FilterFunc, leadermigration.ControllerMigrated))
+				},
+				OnStoppedLeading: func() {
+					klog.ErrorS(nil, "migration leaderelection lost")
+					klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+				},
+			})
+	}
+
+	<-stopCh
+	return nil
+}
+
+```
+
+## StartControllers
+
+```go
+// StartControllers starts a set of controllers with a specified ControllerContext
+func StartControllers(ctx context.Context, controllerCtx ControllerContext, startSATokenController InitFunc, controllers map[string]InitFunc,
+	unsecuredMux *mux.PathRecorderMux, healthzHandler *controllerhealthz.MutableHealthzHandler) error {
+	// 如果 startSATokenController 不是空值，则启动它。startSATokenController 是一个函数，它接收一个 context.Context 对象和一个 ControllerContext 对象，并返回一个 Interface 对象、一个布尔值和一个错误对象。如果启动 startSATokenController 失败，则直接返回错误对象。
+	if startSATokenController != nil {
+		if _, _, err := startSATokenController(ctx, controllerCtx); err != nil {
+			return err
+		}
+	}
+
+	// 如果 controllerCtx.Cloud 不是空值，则初始化 controllerCtx.Cloud。controllerCtx.Cloud 是一个云服务提供商对象，它包含一个 Initialize 方法，接收一个 ClientBuilder 对象和一个 Done 方法。这里调用 Initialize 方法，并传入 controllerCtx.ClientBuilder 和 ctx.Done() 作为参数
+	if controllerCtx.Cloud != nil {
+		controllerCtx.Cloud.Initialize(controllerCtx.ClientBuilder, ctx.Done())
+	}
+
+	var controllerChecks []healthz.HealthChecker
+
+	for controllerName, initFn := range controllers {
+    // 如果这个控制器没有启用，则打印一个警告信息，并跳过这个控制器。
+		if !controllerCtx.IsControllerEnabled(controllerName) {
+			klog.Warningf("%q is disabled", controllerName)
+			continue
+		}
+	
+    // 等待一段随机时间。这里使用了 wait.Jitter 函数，它会对一个时间间隔添加一个随机的抖动，这样可以避免多个控制器同时启动，从而导致资源争夺的问题
+		time.Sleep(wait.Jitter(controllerCtx.ComponentConfig.Generic.ControllerStartInterval.Duration, ControllerStartJitter))
+
+		klog.V(1).Infof("Starting %q", controllerName)
+    // 初始化指定的 controller，并返回该 controller 对象、是否成功启动以及启动时的错误信息
+		ctrl, started, err := initFn(ctx, controllerCtx)
+		if err != nil {
+			klog.Errorf("Error starting %q", controllerName)
+			return err
+		}
+		if !started {
+			klog.Warningf("Skipping %q", controllerName)
+			continue
+		}
+    // 初始化成功并且返回了 controller 对象，会检查该 controller 是否实现了 Debuggable 和 HealthCheckable 接口，如果实现了，则进行相应的操作。
+		check := controllerhealthz.NamedPingChecker(controllerName)
+		if ctrl != nil {
+      // 如果 controller 实现了 Debuggable 接口，并且需要在调试时使用，会使用 http 包将调试处理函数绑定到指定的路由上，并且将这个路由注册到 unsecuredMux，用于提供调试服务。
+			if debuggable, ok := ctrl.(controller.Debuggable); ok && unsecuredMux != nil {
+				if debugHandler := debuggable.DebuggingHandler(); debugHandler != nil {
+					basePath := "/debug/controllers/" + controllerName
+					unsecuredMux.UnlistedHandle(basePath, http.StripPrefix(basePath, debugHandler))
+					unsecuredMux.UnlistedHandlePrefix(basePath+"/", http.StripPrefix(basePath, debugHandler))
+				}
+			}
+      // 如果 controller 实现了 HealthCheckable 接口，并且需要进行健康检查，会将健康检查函数封装成 NamedHealthChecker 类型的对象，并将它加入到 controllerChecks 列表中
+			if healthCheckable, ok := ctrl.(controller.HealthCheckable); ok {
+				if realCheck := healthCheckable.HealthChecker(); realCheck != nil {
+					check = controllerhealthz.NamedHealthChecker(controllerName, realCheck)
+				}
+			}
+		}
+		controllerChecks = append(controllerChecks, check)
+
+		klog.Infof("Started %q", controllerName)
+	}
+	
+  // 添加启动controller的健康检查
+	healthzHandler.AddHealthChecker(controllerChecks...)
+
+	return nil
+}
+
+```
+
+## StartControllers的controller参数 NewControllerInitializers
+
+简单来说就是把所有的controller 设置成map[string]InitFunc结构体
+
+```go
+// NewControllerInitializers is a public map of named controller groups (you can start more than one in an init func)
+// paired to their InitFunc.  This allows for structured downstream composition and subdivision.
+func NewControllerInitializers(loopMode ControllerLoopMode) map[string]InitFunc {
+	controllers := map[string]InitFunc{}
+
+	// All of the controllers must have unique names, or else we will explode.
+	register := func(name string, fn InitFunc) {
+		if _, found := controllers[name]; found {
+			panic(fmt.Sprintf("controller name %q was registered twice", name))
+		}
+		controllers[name] = fn
+	}
+
+	register("endpoint", startEndpointController)
+	register("endpointslice", startEndpointSliceController)
+	register("endpointslicemirroring", startEndpointSliceMirroringController)
+	register("replicationcontroller", startReplicationController)
+	register("podgc", startPodGCController)
+	register("resourcequota", startResourceQuotaController)
+	register("namespace", startNamespaceController)
+	register("serviceaccount", startServiceAccountController)
+	register("garbagecollector", startGarbageCollectorController)
+	register("daemonset", startDaemonSetController)
+	register("job", startJobController)
+	register("deployment", startDeploymentController)
+	register("replicaset", startReplicaSetController)
+	register("horizontalpodautoscaling", startHPAController)
+	register("disruption", startDisruptionController)
+	register("statefulset", startStatefulSetController)
+	register("cronjob", startCronJobController)
+	register("csrsigning", startCSRSigningController)
+	register("csrapproving", startCSRApprovingController)
+	register("csrcleaner", startCSRCleanerController)
+	register("ttl", startTTLController)
+	register("bootstrapsigner", startBootstrapSignerController)
+	register("tokencleaner", startTokenCleanerController)
+	register("nodeipam", startNodeIpamController)
+	register("nodelifecycle", startNodeLifecycleController)
+	if loopMode == IncludeCloudLoops {
+		register("service", startServiceController)
+		register("route", startRouteController)
+		register("cloud-node-lifecycle", startCloudNodeLifecycleController)
+		// TODO: volume controller into the IncludeCloudLoops only set.
+	}
+	register("persistentvolume-binder", startPersistentVolumeBinderController)
+	register("attachdetach", startAttachDetachController)
+	register("persistentvolume-expander", startVolumeExpandController)
+	register("clusterrole-aggregation", startClusterRoleAggregrationController)
+	register("pvc-protection", startPVCProtectionController)
+	register("pv-protection", startPVProtectionController)
+	register("ttl-after-finished", startTTLAfterFinishedController)
+	register("root-ca-cert-publisher", startRootCACertPublisher)
+	register("ephemeral-volume", startEphemeralVolumeController)
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerIdentity) &&
+		utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StorageVersionAPI) {
+		register("storage-version-gc", startStorageVersionGCController)
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DynamicResourceAllocation) {
+		controllers["resource-claim-controller"] = startResourceClaimController
+	}
+
+	return controllers
+}
+```
+
+## 具体执行
+
+这里的所有controller启动逻辑但是大差不差的，就用第一个endpoint举例说明了. 其他同理
+
+使用goroutine 调用 `pkg/controller/endpoint`包下的new函数创建一个controller 结构体 传入需要的参数。Run跑起来。
+
+```go
+func startEndpointController(ctx context.Context, controllerCtx ControllerContext) (controller.Interface, bool, error) {
+	go endpointcontroller.NewEndpointController(
+		controllerCtx.InformerFactory.Core().V1().Pods(),
+		controllerCtx.InformerFactory.Core().V1().Services(),
+		controllerCtx.InformerFactory.Core().V1().Endpoints(),
+		controllerCtx.ClientBuilder.ClientOrDie("endpoint-controller"),
+		controllerCtx.ComponentConfig.EndpointController.EndpointUpdatesBatchPeriod.Duration,
+	).Run(ctx, int(controllerCtx.ComponentConfig.EndpointController.ConcurrentEndpointSyncs))
+	return nil, true, nil
+}
+```
 
 ## Run
 
