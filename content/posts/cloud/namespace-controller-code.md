@@ -823,3 +823,166 @@ func (d *namespacedResourcesDeleter) listCollection(gvr schema.GroupVersionResou
 }
 ```
 
+## condition
+
+```go
+type namespaceConditionUpdater struct {
+	newConditions       []v1.NamespaceCondition
+	deleteContentErrors []error
+}
+// 添加一个GroupVersionParsingFailed的condition
+func (u *namespaceConditionUpdater) ProcessGroupVersionErr(err error) {
+	d := v1.NamespaceCondition{
+		Type:               v1.NamespaceDeletionGVParsingFailure,
+		Status:             v1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "GroupVersionParsingFailed",
+		Message:            err.Error(),
+	}
+	u.newConditions = append(u.newConditions, d)
+}
+// 添加一个DiscoveryFailed的condition
+func (u *namespaceConditionUpdater) ProcessDiscoverResourcesErr(err error) {
+	var msg string
+	if derr, ok := err.(*discovery.ErrGroupDiscoveryFailed); ok {
+		msg = fmt.Sprintf("Discovery failed for some groups, %d failing: %v", len(derr.Groups), err)
+	} else {
+		msg = err.Error()
+	}
+	d := v1.NamespaceCondition{
+		Type:               v1.NamespaceDeletionDiscoveryFailure,
+		Status:             v1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "DiscoveryFailed",
+		Message:            msg,
+	}
+	u.newConditions = append(u.newConditions, d)
+}
+// 处理还有gvrToNumRemaining和finalizersToNumRemaining 天津爱特定错误
+func (u *namespaceConditionUpdater) ProcessContentTotals(contentTotals allGVRDeletionMetadata) {
+	if len(contentTotals.gvrToNumRemaining) != 0 {
+		remainingResources := []string{}
+		for gvr, numRemaining := range contentTotals.gvrToNumRemaining {
+			if numRemaining == 0 {
+				continue
+			}
+			remainingResources = append(remainingResources, fmt.Sprintf("%s.%s has %d resource instances", gvr.Resource, gvr.Group, numRemaining))
+		}
+		// sort for stable updates
+		sort.Strings(remainingResources)
+		u.newConditions = append(u.newConditions, v1.NamespaceCondition{
+			Type:               v1.NamespaceContentRemaining,
+			Status:             v1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "SomeResourcesRemain",
+			Message:            fmt.Sprintf("Some resources are remaining: %s", strings.Join(remainingResources, ", ")),
+		})
+	}
+
+	if len(contentTotals.finalizersToNumRemaining) != 0 {
+		remainingByFinalizer := []string{}
+		for finalizer, numRemaining := range contentTotals.finalizersToNumRemaining {
+			if numRemaining == 0 {
+				continue
+			}
+			remainingByFinalizer = append(remainingByFinalizer, fmt.Sprintf("%s in %d resource instances", finalizer, numRemaining))
+		}
+		// sort for stable updates
+		sort.Strings(remainingByFinalizer)
+		u.newConditions = append(u.newConditions, v1.NamespaceCondition{
+			Type:               v1.NamespaceFinalizersRemaining,
+			Status:             v1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "SomeFinalizersRemain",
+			Message:            fmt.Sprintf("Some content in the namespace has finalizers remaining: %s", strings.Join(remainingByFinalizer, ", ")),
+		})
+	}
+}
+```
+
+**update**
+
+```go
+func (u *namespaceConditionUpdater) Update(ns *v1.Namespace) bool {
+  // 获取 type 是NamespaceDeletionContentFailure 的condition
+	if c := getCondition(u.newConditions, v1.NamespaceDeletionContentFailure); c == nil {
+    // 如果为空 创建一个
+		if c := makeDeleteContentCondition(u.deleteContentErrors); c != nil {
+			u.newConditions = append(u.newConditions, *c)
+		}
+	}
+  // 更新
+	return updateConditions(&ns.Status, u.newConditions)
+}
+
+// 创建一个  ContentDeletionFailed 的 Condition
+func makeDeleteContentCondition(err []error) *v1.NamespaceCondition {
+	if len(err) == 0 {
+		return nil
+	}
+	msgs := make([]string, 0, len(err))
+	for _, e := range err {
+		msgs = append(msgs, e.Error())
+	}
+	sort.Strings(msgs)
+	return &v1.NamespaceCondition{
+		Type:               v1.NamespaceDeletionContentFailure,
+		Status:             v1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "ContentDeletionFailed",
+		Message:            fmt.Sprintf("Failed to delete all resource types, %d remaining: %v", len(err), strings.Join(msgs, ", ")),
+	}
+}
+
+func updateConditions(status *v1.NamespaceStatus, newConditions []v1.NamespaceCondition) (hasChanged bool) {
+	for _, conditionType := range conditionTypes {
+    // 尝试从newConditions中获取对应类型的新条件。如果不存在，则创建一个新的成功条件
+		newCondition := getCondition(newConditions, conditionType)
+		if newCondition == nil {
+			newCondition = newSuccessfulCondition(conditionType)
+		}
+    // 尝试从status.Conditions中获取对应类型的旧条件。
+		oldCondition := getCondition(status.Conditions, conditionType)
+
+		if oldCondition == nil {
+      // 如果oldCondition是空 将新条件添加到状态的条件列表中，并将hasChanged设置为true，表示状态已经发生了改变。
+			status.Conditions = append(status.Conditions, *newCondition)
+			hasChanged = true
+
+		} else if oldCondition.Status != newCondition.Status || oldCondition.Message != newCondition.Message || oldCondition.Reason != newCondition.Reason {
+      // 如果oldCondition不为nil，则比较旧条件和新条件之间的状态、消息和原因。如果有任何一个值不同，则更新旧条件，并将hasChanged设置为true。
+			// old condition needs to be updated
+			if oldCondition.Status != newCondition.Status {
+				oldCondition.LastTransitionTime = metav1.Now()
+			}
+			oldCondition.Type = newCondition.Type
+			oldCondition.Status = newCondition.Status
+			oldCondition.Reason = newCondition.Reason
+			oldCondition.Message = newCondition.Message
+			hasChanged = true
+		}
+	}
+	return
+}
+
+func newSuccessfulCondition(conditionType v1.NamespaceConditionType) *v1.NamespaceCondition {
+	return &v1.NamespaceCondition{
+		Type:               conditionType,
+		Status:             v1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             okReasons[conditionType],
+		Message:            okMessages[conditionType],
+	}
+}
+
+func getCondition(conditions []v1.NamespaceCondition, conditionType v1.NamespaceConditionType) *v1.NamespaceCondition {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return &(conditions[i])
+		}
+	}
+	return nil
+}
+
+```
+
