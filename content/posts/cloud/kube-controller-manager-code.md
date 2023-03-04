@@ -10,7 +10,7 @@ tags:
   - controller
 authors:
     - haiyux
-
+featuredImagePreview: /img/k8s.webp
 ---
 
 ## 介绍

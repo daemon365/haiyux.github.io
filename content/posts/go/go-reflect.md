@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 ## 变量的内在机制

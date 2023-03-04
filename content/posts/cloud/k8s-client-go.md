@@ -10,6 +10,7 @@ tags:
     - kubernetes
 authors:
     - haiyux
+featuredImagePreview: /img/k8s.webp
 ---
 
 ## client-go是什么？

@@ -7,6 +7,7 @@ categories: [go,kratos]
 tags: [golang,http]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 ## 概念

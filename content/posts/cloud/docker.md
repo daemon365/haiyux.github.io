@@ -8,6 +8,7 @@ tags:
   - docker
 authors:
     - haiyux
+featuredImagePreview: /img/docker.webp
 ---
 
 ## docker的定义

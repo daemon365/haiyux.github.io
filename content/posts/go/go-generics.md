@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang,泛型]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 > 备注：这是一个 beta 版本的内容

@@ -10,7 +10,7 @@ tags:
   - cobra
 authors:
     - haiyux
-
+featuredImagePreview: /img/go.webp
 ---
 
 ## 关于

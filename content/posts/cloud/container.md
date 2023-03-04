@@ -11,6 +11,7 @@ tags:
   - UnionFS
 authors:
     - haiyux
+featuredImagePreview: /img/docker.webp
 ---
 
 ## Namespace

@@ -7,6 +7,7 @@ categories: [go,cache]
 tags: [golang,redis]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 

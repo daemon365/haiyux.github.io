@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 垃圾回收(Garbage Collection，简称GC)是编程语言中提供的自动的内存管理机制，自动释放不需要的对象，让出存储器资源，无需程序员手动执行。

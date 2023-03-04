@@ -7,6 +7,7 @@ categories: [go,network]
 tags: [golang,http]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 

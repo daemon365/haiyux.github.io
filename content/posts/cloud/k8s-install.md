@@ -7,6 +7,7 @@ categories: [cloud]
 tags: [kubernetes]
 authors:
     - haiyux
+featuredImagePreview: /img/k8s.webp
 ---
 
 ## 虚拟机准备

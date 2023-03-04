@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang,wire]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 我们在微服务框架[kratos v2](https://github.com/go-kratos/kratos)的默认项目模板中[kratos-layout](https://github.com/go-kratos/kratos-layout)使用了[google/wire](https://github.com/google/wire)进行依赖注入，也建议开发者在维护项目时使用该工具。

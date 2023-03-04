@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang,DDD]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 ## 什么是DDD？

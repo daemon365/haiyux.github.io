@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 ## go context标准库

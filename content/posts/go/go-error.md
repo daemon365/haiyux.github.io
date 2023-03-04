@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 ## error定义

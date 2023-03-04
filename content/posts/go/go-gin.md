@@ -7,6 +7,7 @@ categories: [go]
 tags: [golang,http]
 authors:
     - haiyux
+featuredImagePreview: /img/go.webp
 ---
 
 ## Gin框架介绍
