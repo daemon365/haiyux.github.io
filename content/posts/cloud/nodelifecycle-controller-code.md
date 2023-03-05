@@ -820,7 +820,7 @@ func TaintExists(taints []v1.Taint, taintToFind *v1.Taint) bool {
 }
 ```
 
-### doPodProcessingWorker
+## doPodProcessingWorker
 
 ```GO
 // 用于在 Node 出现故障或者节点调度变化时，重新调度 Pod 到其他可用的节点上。
@@ -901,7 +901,7 @@ func (nc *Controller) processPod(ctx context.Context, podItem podUpdateItem) {
 }
 ```
 
-#### processNoTaintBaseEviction
+### processNoTaintBaseEviction
 
 ```go
 // 用于处理没有 Taint 的情况下节点中的 Pod 被逐出的逻辑
@@ -960,7 +960,7 @@ func (nc *Controller) processNoTaintBaseEviction(ctx context.Context, node *v1.N
 }
 ```
 
-##### evictPods
+#### evictPods
 
 ```go
 func (nc *Controller) evictPods(ctx context.Context, node *v1.Node, pods []*v1.Pod) (bool, error) {
@@ -989,7 +989,7 @@ func (nc *Controller) evictPods(ctx context.Context, node *v1.Node, pods []*v1.P
 }
 ```
 
-###### DeletePods
+##### DeletePods
 
 ```GO
 func DeletePods(ctx context.Context, kubeClient clientset.Interface, pods []*v1.Pod, recorder record.EventRecorder, nodeName, nodeUID string, daemonStore appsv1listers.DaemonSetLister) (bool, error) {
@@ -1051,7 +1051,7 @@ func DeletePods(ctx context.Context, kubeClient clientset.Interface, pods []*v1.
 
 ```
 
-#### MarkPodsNotReady
+### MarkPodsNotReady
 
 ```go
 // 将指定节点上的所有Pod的Ready状态设置为False的功能
@@ -1097,7 +1097,7 @@ func MarkPodsNotReady(ctx context.Context, kubeClient clientset.Interface, recor
 }
 ```
 
-### doNoExecuteTaintingPass
+## doNoExecuteTaintingPass
 
 ```GO
 // 处理被标记为 noexecute 的 Pod
@@ -1279,7 +1279,7 @@ func (nc *Controller) doEvictionPass(ctx context.Context) {
 }
 ```
 
-### monitorNodeHealth
+## monitorNodeHealth
 
 ```GO
 func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
@@ -1421,7 +1421,7 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 }
 ```
 
-#### addPodEvictorForNewZone
+### addPodEvictorForNewZone
 
 ```go
 func (nc *Controller) addPodEvictorForNewZone(node *v1.Node) {
@@ -1721,3 +1721,4 @@ func RemoveTaint(node *v1.Node, taint *v1.Taint) (*v1.Node, bool, error) {
 }
 ```
 
+## taintManager  未更新
