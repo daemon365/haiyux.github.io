@@ -154,6 +154,11 @@ func (gcc *PodGCController) Run(ctx context.Context) {
 
 ## gc
 
+- gcTerminated 取出不是 PodPending，PodRunning，PodUnknown的状态 如果大于terminatedPodThreshold了 杀死一些 剩下terminatedPodThreshold个默认是不开启的 也就是terminatedPodThreshold=0
+- gcTerminating 回收Terminating状态的pod 默认是开启的
+- gcOrphaned 删除孤儿pod 也就是没有node的pod
+- gcUnscheduledTerminating 回收处于 `Unschedulable` 且正在被终止（`Terminating`）状态的 Pod
+
 ```go
 func (gcc *PodGCController) gc(ctx context.Context) {
     // 从 PodLister 中列出所有的 Pod：
