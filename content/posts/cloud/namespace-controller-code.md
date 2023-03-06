@@ -10,7 +10,7 @@ tags:
   - controller
 authors:
     - haiyux
-featuredImagePreview: /img/k8s.webp
+featuredImagePreview: /img/preview/controller/namespace-controller.jpg
 ---
 
 ## 介绍

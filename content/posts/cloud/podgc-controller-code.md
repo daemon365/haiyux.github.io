@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-featuredImagePreview: /img/k8s.webp
+featuredImagePreview: /img/preview/controller/podgc-controller.jpg
 ---
 
 ## 简介
