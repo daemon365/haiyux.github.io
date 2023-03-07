@@ -444,7 +444,7 @@ disableThemeInject = false
     keepStatic = false
     # whether to make the table of the contents in the sidebar automatically collapsed
     # 是否使侧边目录自动折叠展开
-    auto = false
+    auto = true
     # position of TOC ["left", "right"] since v0.2.13
     # 目录位置 ["left", "right"] since v0.2.13
     position = "right"

@@ -1747,6 +1747,139 @@ func (nc *Controller) markNodeForTainting(node *v1.Node, status v1.ConditionStat
 }
 ```
 
+### handleDisruption
+
+```GO
+func (nc *Controller) handleDisruption(ctx context.Context, zoneToNodeConditions map[string][]*v1.NodeCondition, nodes []*v1.Node) {
+	newZoneStates := map[string]ZoneState{}
+    // 获取状态 只要有一个不是stateFullDisruption 就是false 代表还是有可用的 是true就没用可用的了
+	allAreFullyDisrupted := true
+	for k, v := range zoneToNodeConditions {
+		zoneSize.WithLabelValues(k).Set(float64(len(v)))
+		unhealthy, newState := nc.computeZoneStateFunc(v)
+		zoneHealth.WithLabelValues(k).Set(float64(100*(len(v)-unhealthy)) / float64(len(v)))
+		unhealthyNodes.WithLabelValues(k).Set(float64(unhealthy))
+		if newState != stateFullDisruption {
+			allAreFullyDisrupted = false
+		}
+		newZoneStates[k] = newState
+		if _, had := nc.zoneStates[k]; !had {
+			klog.Errorf("Setting initial state for unseen zone: %v", k)
+			nc.zoneStates[k] = stateInitial
+		}
+	}
+	
+    // 获取上次记录状态 只要有一个不是stateFullDisruption 就是false 代表还是有可用的 是true就没用可用的了
+	allWasFullyDisrupted := true
+	for k, v := range nc.zoneStates {
+		if _, have := zoneToNodeConditions[k]; !have {
+			zoneSize.WithLabelValues(k).Set(0)
+			zoneHealth.WithLabelValues(k).Set(100)
+			unhealthyNodes.WithLabelValues(k).Set(0)
+			delete(nc.zoneStates, k)
+			continue
+		}
+		if v != stateFullDisruption {
+			allWasFullyDisrupted = false
+			break
+		}
+	}
+
+
+    // 判断是否需要更新 limiter。如果 allAreFullyDisrupted 或 allWasFullyDisrupted 为 false，
+    // 则表示之前的状态中至少有一个节点处于可用状态，此时需要更新 limiter。
+	if !allAreFullyDisrupted || !allWasFullyDisrupted {
+		// We're switching to full disruption mode
+		if allAreFullyDisrupted {
+			klog.Info("Controller detected that all Nodes are not-Ready. Entering master disruption mode.")
+			for i := range nodes {
+				if nc.runTaintManager {
+                    // 表示所有节点都不可用，此时进入全局驱逐模式，取消所有的 Pod 驱逐操作并停止所有的驱逐操作
+					_, err := nc.markNodeAsReachable(ctx, nodes[i])
+					if err != nil {
+						klog.Errorf("Failed to remove taints from Node %v", nodes[i].Name)
+					}
+				} else {
+					nc.cancelPodEviction(nodes[i])
+				}
+			}
+			// We stop all evictions.
+			for k := range nc.zoneStates {
+				if nc.runTaintManager {
+					nc.zoneNoExecuteTainter[k].SwapLimiter(0)
+				} else {
+					nc.zonePodEvictor[k].SwapLimiter(0)
+				}
+			}
+            // 将所有区域的状态更新为 stateFullDisruption。
+			for k := range nc.zoneStates {
+				nc.zoneStates[k] = stateFullDisruption
+			}
+			// All rate limiters are updated, so we can return early here.
+			return
+		}
+		// We're exiting full disruption mode
+		if allWasFullyDisrupted {
+            // 所有节点都之前都不可用，此时退出全局驱逐模式，更新节点健康状态，
+            // 并根据 newZoneStates 中相应区域的状态更新 limiter
+			klog.Info("Controller detected that some Nodes are Ready. Exiting master disruption mode.")
+			// When exiting disruption mode update probe timestamps on all Nodes.
+			now := nc.now()
+			for i := range nodes {
+				v := nc.nodeHealthMap.getDeepCopy(nodes[i].Name)
+				v.probeTimestamp = now
+				v.readyTransitionTimestamp = now
+				nc.nodeHealthMap.set(nodes[i].Name, v)
+			}
+			// We reset all rate limiters to settings appropriate for the given state.
+			for k := range nc.zoneStates {
+				nc.setLimiterInZone(k, len(zoneToNodeConditions[k]), newZoneStates[k])
+				nc.zoneStates[k] = newZoneStates[k]
+			}
+			return
+		}
+		// 如果 allAreFullyDisrupted 和 allWasFullyDisrupted 都为 false，
+        // 则需要根据 newZoneStates 中相应区域的状态更新 limiter
+		for k, v := range nc.zoneStates {
+			newState := newZoneStates[k]
+			if v == newState {
+				continue
+			}
+			klog.Infof("Controller detected that zone %v is now in state %v.", k, newState)
+			nc.setLimiterInZone(k, len(zoneToNodeConditions[k]), newState)
+			nc.zoneStates[k] = newState
+		}
+	}
+}
+
+const (
+	stateInitial           = ZoneState("Initial")
+	stateNormal            = ZoneState("Normal")
+	stateFullDisruption    = ZoneState("FullDisruption")
+	statePartialDisruption = ZoneState("PartialDisruption")
+)
+
+func (nc *Controller) ComputeZoneState(nodeReadyConditions []*v1.NodeCondition) (int, ZoneState) {
+	readyNodes := 0
+	notReadyNodes := 0
+	for i := range nodeReadyConditions {
+		if nodeReadyConditions[i] != nil && nodeReadyConditions[i].Status == v1.ConditionTrue {
+			readyNodes++
+		} else {
+			notReadyNodes++
+		}
+	}
+	switch {
+	case readyNodes == 0 && notReadyNodes > 0:
+		return notReadyNodes, stateFullDisruption
+	case notReadyNodes > 2 && float32(notReadyNodes)/float32(notReadyNodes+readyNodes) >= nc.unhealthyZoneThreshold:
+		return notReadyNodes, statePartialDisruption
+	default:
+		return notReadyNodes, stateNormal
+	}
+}
+```
+
 
 
 ## 处理node污点
@@ -2142,6 +2275,59 @@ func hash(val string, max int) int {
 }
 ```
 
+### taintEvictionQueue的赋值
+
+这段代码是延迟队列的函数 时间到了自动触发
+
+```go
+tm.taintEvictionQueue = CreateWorkerQueue(deletePodHandler(c, tm.emitPodDeletionEvent))
+
+func deletePodHandler(c clientset.Interface, emitEventFunc func(types.NamespacedName)) func(ctx context.Context, args *WorkArgs) error {
+	return func(ctx context.Context, args *WorkArgs) error {
+		ns := args.NamespacedName.Namespace
+		name := args.NamespacedName.Name
+		klog.InfoS("NoExecuteTaintManager is deleting pod", "pod", args.NamespacedName.String())
+		if emitEventFunc != nil {
+            // 发送Event
+			emitEventFunc(args.NamespacedName)
+		}
+		var err error
+		for i := 0; i < retries; i++ {
+			err = addConditionAndDeletePod(ctx, c, name, ns)
+			if err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return err
+	}
+}
+
+func addConditionAndDeletePod(ctx context.Context, c clientset.Interface, name, ns string) (err error) {
+    // 如果开启了PodDisruptionConditions 添加一个DisruptionTarget 文档可以打开看看
+    // https://kubernetes.io/zh-cn/docs/concepts/workloads/pods/disruptions/
+	if feature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) {
+		pod, err := c.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		podApply := corev1apply.Pod(pod.Name, pod.Namespace).WithStatus(corev1apply.PodStatus())
+		podApply.Status.WithConditions(corev1apply.PodCondition().
+			WithType(v1.DisruptionTarget).
+			WithStatus(v1.ConditionTrue).
+			WithReason("DeletionByTaintManager").
+			WithMessage("Taint manager: deleting due to NoExecute taint").
+			WithLastTransitionTime(metav1.Now()),
+		)
+		if _, err := c.CoreV1().Pods(pod.Namespace).ApplyStatus(ctx, podApply, metav1.ApplyOptions{FieldManager: fieldManager, Force: true}); err != nil {
+			return err
+		}
+	}
+    // 删除pod
+	return c.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
+}
+```
+
 ### worker
 
 ```go
@@ -2305,7 +2491,7 @@ func (q *TimedWorkerQueue) CancelWork(key string) bool {
 
 ```
 
-### processPodOnNode
+#### processPodOnNode
 
 ```GO
 func (tc *NoExecuteTaintManager) processPodOnNode(
@@ -2402,5 +2588,54 @@ func (q *TimedWorkerQueue) AddWork(ctx context.Context, args *WorkArgs, createdA
 	worker := createWorker(ctx, args, createdAt, fireAt, q.getWrappedWorkerFunc(key), q.clock)
 	q.workers[key] = worker
 }
+```
+
+### handlePodUpdate
+
+```go
+func (tc *NoExecuteTaintManager) handlePodUpdate(ctx context.Context, podUpdate podUpdateItem) {
+    // get pod
+	pod, err := tc.podLister.Pods(podUpdate.podNamespace).Get(podUpdate.podName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Delete
+			podNamespacedName := types.NamespacedName{Namespace: podUpdate.podNamespace, Name: podUpdate.podName}
+			klog.V(4).InfoS("Noticed pod deletion", "pod", podNamespacedName)
+			tc.cancelWorkWithEvent(podNamespacedName)
+			return
+		}
+		utilruntime.HandleError(fmt.Errorf("could not get pod %s/%s: %v", podUpdate.podName, podUpdate.podNamespace, err))
+		return
+	}
+
+	// 已经换了节点了 就不处理了
+	if pod.Spec.NodeName != podUpdate.nodeName {
+		return
+	}
+
+	// Create or Update
+	podNamespacedName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+	klog.V(4).InfoS("Noticed pod update", "pod", podNamespacedName)
+	nodeName := pod.Spec.NodeName
+	if nodeName == "" {
+		return
+	}
+    // get 污点
+	taints, ok := func() ([]v1.Taint, bool) {
+		tc.taintedNodesLock.Lock()
+		defer tc.taintedNodesLock.Unlock()
+		taints, ok := tc.taintedNodes[nodeName]
+		return taints, ok
+	}()
+	// It's possible that Node was deleted, or Taints were removed before, which triggered
+	// eviction cancelling if it was needed.
+	if !ok {
+        // 没有污点信息返回
+		return
+	}
+    // 处理node上的Pod
+	tc.processPodOnNode(ctx, podNamespacedName, nodeName, pod.Spec.Tolerations, taints, time.Now())
+}
+
 ```
 
