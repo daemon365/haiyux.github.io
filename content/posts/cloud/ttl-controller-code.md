@@ -16,7 +16,7 @@ featuredImagePreview: /img/preview/controller/ttl-controller.jpg
 
 ## 简介
 
-`TTL Controller` 的作用是根据集群大小动态向`node`对象的注释中（`metadata.annotations`）添加`node.alpha.kubernetes.io/ttl`，作用是一个调整参数，用于确定Kubelet可以缓存对象的时。
+`TTL Controller` 的作用是根据集群大小动态向`node`对象的注释中（`metadata.annotations`）添加`node.alpha.kubernetes.io/ttl`，作用是一个调整参数，用于确定Kubelet可以缓存对象的时间。
 
 ## 结构体
 
