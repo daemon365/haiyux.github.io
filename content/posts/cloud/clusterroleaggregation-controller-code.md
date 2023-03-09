@@ -136,6 +136,7 @@ func (c *ClusterRoleAggregationController) syncClusterRole(ctx context.Context, 
 
 			for j := range clusterRoles[i].Rules {
 				currRule := clusterRoles[i].Rules[j]
+                // 如果新的不存在这个 加进去
 				if !ruleExists(newPolicyRules, currRule) {
 					newPolicyRules = append(newPolicyRules, currRule)
 				}
@@ -155,6 +156,7 @@ func (c *ClusterRoleAggregationController) syncClusterRole(ctx context.Context, 
 		// 1.21 since api-server can be 1.20 during the upgrade/downgrade.
 		// Since Server Side Apply is enabled by default in Beta, this fallback only kicks in
 		// if the feature has been disabled using its feature flag.
+        // 如果apply出问题 update
 		err = c.updateClusterRoles(ctx, sharedClusterRole, newPolicyRules)
 	}
 	return err
@@ -167,6 +169,72 @@ type byName []*rbacv1.ClusterRole
 func (a byName) Len() int           { return len(a) }
 func (a byName) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a byName) Less(i, j int) bool { return a[i].Name < a[j].Name }
+```
+
+#### ruleExists
+
+```GO
+// 看needle在不在haystack中
+func ruleExists(haystack []rbacv1.PolicyRule, needle rbacv1.PolicyRule) bool {
+	for _, curr := range haystack {
+		if equality.Semantic.DeepEqual(curr, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+```
+
+#### applyClusterRoles
+
+```GO
+func (c *ClusterRoleAggregationController) applyClusterRoles(ctx context.Context, name string, newPolicyRules []rbacv1.PolicyRule) error {
+    // 把newPolicyRules转换成PolicyRuleApplyConfiguration对象 并加入到ClusterRole中
+	clusterRoleApply := rbacv1ac.ClusterRole(name).
+		WithRules(toApplyPolicyRules(newPolicyRules)...)
+	
+    // 设置opts 标识修改者并开启强制操作
+	opts := metav1.ApplyOptions{FieldManager: "clusterrole-aggregation-controller", Force: true}
+    // 执行apply
+	_, err := c.clusterRoleClient.ClusterRoles().Apply(ctx, clusterRoleApply, opts)
+	return err
+}
+
+// 把PolicyRules转换成PolicyRuleApplyConfigurations
+func toApplyPolicyRules(rules []rbacv1.PolicyRule) []*rbacv1ac.PolicyRuleApplyConfiguration {
+	var result []*rbacv1ac.PolicyRuleApplyConfiguration
+	for _, rule := range rules {
+		result = append(result, toApplyPolicyRule(rule))
+	}
+	return result
+}
+
+// 把PolicyRule转换成PolicyRuleApplyConfiguration
+func toApplyPolicyRule(rule rbacv1.PolicyRule) *rbacv1ac.PolicyRuleApplyConfiguration {
+	result := rbacv1ac.PolicyRule()
+	result.Resources = rule.Resources
+	result.ResourceNames = rule.ResourceNames
+	result.APIGroups = rule.APIGroups
+	result.NonResourceURLs = rule.NonResourceURLs
+	result.Verbs = rule.Verbs
+	return result
+}
+```
+
+#### updateClusterRoles
+
+```GO
+func (c *ClusterRoleAggregationController) updateClusterRoles(ctx context.Context, sharedClusterRole *rbacv1.ClusterRole, newPolicyRules []rbacv1.PolicyRule) error {
+    // 把newPolicyRules的rules加入到sharedClusterRole中 并更新
+	clusterRole := sharedClusterRole.DeepCopy()
+	clusterRole.Rules = nil
+	for _, rule := range newPolicyRules {
+		clusterRole.Rules = append(clusterRole.Rules, *rule.DeepCopy())
+	}
+	_, err := c.clusterRoleClient.ClusterRoles().Update(ctx, clusterRole, metav1.UpdateOptions{})
+	return err
+}
 ```
 
 ## Run
