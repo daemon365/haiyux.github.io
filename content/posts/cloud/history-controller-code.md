@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-featuredImagePreview: /img/preview/controller/resourceclaim-controller.jpg
+featuredImagePreview: /img/preview/controller/history-controller.jpg
 ---
 
 ## 简介
