@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-featuredImagePreview: /img/preview/controller/serviceaccount-token-controller.jpg
+featuredImagePreview: /img/preview/controller/endpoint-controller.jpg
 ---
 
 ## 简介
