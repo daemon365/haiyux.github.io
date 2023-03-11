@@ -256,11 +256,11 @@ func (r *reconciler) reconcile(service *corev1.Service, pods []*corev1.Pod, exis
 		if _, ok := serviceSupportedAddressesTypes[existingSlice.AddressType]; !ok {
             // 如果地址类型不被service支持了
 			if r.topologyCache != nil {
-                // 从拓扑中删除对应的提示
 				svcKey, err := serviceControllerKey(existingSlice)
 				if err != nil {
 					klog.Warningf("Couldn't get key to remove EndpointSlice from topology cache %+v: %v", existingSlice, err)
 				} else {
+                    // 从拓扑中删除对应的提示
 					r.topologyCache.RemoveHints(svcKey, existingSlice.AddressType)
 				}
 			}
