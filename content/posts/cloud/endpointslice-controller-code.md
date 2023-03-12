@@ -244,7 +244,8 @@ type reconciler struct {
 // 并将所有不再匹配的 EndpointSlice 删除。
 func (r *reconciler) reconcile(service *corev1.Service, pods []*corev1.Pod, existingSlices []*discovery.EndpointSlice, triggerTime time.Time) error {
 	slicesToDelete := []*discovery.EndpointSlice{}                                 
-	errs := []error{}                    
+	errs := []error{}      
+    // nap hey:serviceType value:EndpointSlice对象
 	slicesByAddressType := make(map[discovery.AddressType][]*discovery.EndpointSlice) 
 
 	// 获取该 Service 支持的所有地址类型
@@ -317,6 +318,7 @@ func (r *reconciler) reconcileByAddressType(service *corev1.Service, pods []*cor
     // 将该对象放入已有EndpointSlice切片或需要删除EndpointSlice切片中
 	existingSlicesByPortMap := map[endpointutil.PortMapKey][]*discovery.EndpointSlice{}
 	for _, existingSlice := range existingSlices {
+        // EndpointSlice对象输入这个service 加入map 不输入加入删除列表
 		if ownedBy(existingSlice, service) {
 			epHash := endpointutil.NewPortMapKey(existingSlice.Ports)
 			existingSlicesByPortMap[epHash] = append(existingSlicesByPortMap[epHash], existingSlice)
@@ -404,10 +406,10 @@ func (r *reconciler) reconcileByAddressType(service *corev1.Service, pods []*cor
 		}
 	}
 
-	// 如果不存在Endpoint Slices，则需要添加一个占位符，这里的占位符就是一个没有任何Endpoint的Endpoint Slice。
-    // 如果只有一个需要删除的Slice，并且它是一个占位符Slice，则将其删除。否则，将占位符Slice添加到slicesToCreate切片中
+	// 需要删除的 endpoint slice 的数量等于已存在的 endpoint slice 的数量，并且没有需要创建的 slice 的情况
 	if len(existingSlices) == len(slicesToDelete) && len(slicesToCreate) < 1 {
-		// Check for existing placeholder slice outside of the core control flow
+		// 检查是否存在一个称为 placeholderSlice 的占位符 endpoint slice。
+        // 如果存在，代码会比较它和需要删除的 endpoint slice 的第一个元素是否相等，如果相等，就会将需要删除的 slice 数组清空，否则就将占位符 slice 加入到需要创建的 slice 数组中
 		placeholderSlice := newEndpointSlice(service, &endpointMeta{Ports: []discovery.EndpointPort{}, AddressType: addressType})
 		if len(slicesToDelete) == 1 && placeholderSliceCompare.DeepEqual(slicesToDelete[0], placeholderSlice) {
 			// We are about to unnecessarily delete/recreate the placeholder, remove it now.
@@ -427,8 +429,6 @@ func (r *reconciler) reconcileByAddressType(service *corev1.Service, pods []*cor
 	serviceNN := types.NamespacedName{Name: service.Name, Namespace: service.Namespace}
 	r.metricsCache.UpdateServicePortCache(serviceNN, spMetrics)
 
-	// 检查是否启用了TopologyHints，并向topologyCache添加hints。如果未启用，则从slicesToUpdate中删除hints。
-    // 如果TopologyAwareHints注释已更改，则从topologyCache中删除hints，并记录事件。
 	si := &topologycache.SliceInfo{
 		ServiceKey:  fmt.Sprintf("%s/%s", service.Namespace, service.Name),
 		AddressType: addressType,
@@ -436,7 +436,9 @@ func (r *reconciler) reconcileByAddressType(service *corev1.Service, pods []*cor
 		ToUpdate:    slicesToUpdate,
 		Unchanged:   unchangedSlices(existingSlices, slicesToUpdate, slicesToDelete),
 	}
-
+	
+    // 检查是否启用了TopologyHints，并向topologyCache添加hints。如果未启用，则从slicesToUpdate中删除hints。
+    // 如果TopologyAwareHints注释已更改，则从topologyCache中删除hints，并记录事件。
 	if r.topologyCache != nil && hintsEnabled(service.Annotations) {
 		slicesToCreate, slicesToUpdate, events = r.topologyCache.AddHints(si)
 	} else {
@@ -579,26 +581,21 @@ func (r *reconciler) reconcileByPortMapping(
 	sliceNamesToDelete := sets.String{}
 	numRemoved := 0
 
-	// 将其中每个元素的Name属性作为key，existingSlice本身作为value存储到slicesByName这个map中。
-    // 接着对于每个existingSlice，遍历其中的Endpoints切片，对于每个元素，从desiredSet中获取相应的值（如果存在的话），
-    // 并将其添加到newEndpoints切片中。如果获取到了值，且其版本号与endpoint不同，则将endpointUpdated标记为true，
-    // 表示需要将这个修改持久化到存储介质中。最后，将这个endpoint从desiredSet中删除，表示这个endpoint已经处理完毕。
+	// 1. 遍历现有的 endpoint slice，删除不再需要的 endpoint 并更新已更改的 endpoint。
 	for _, existingSlice := range existingSlices {
 		slicesByName[existingSlice.Name] = existingSlice
 		newEndpoints := []discovery.Endpoint{}
 		endpointUpdated := false
 		for _, endpoint := range existingSlice.Endpoints {
 			got := desiredSet.Get(&endpoint)
-			// If endpoint is desired add it to list of endpoints to keep.
+			//  如果 endpoint 仍然需要，将其添加到要保留的 endpoint 列表中。
 			if got != nil {
 				newEndpoints = append(newEndpoints, *got)
-				// If existing version of endpoint doesn't match desired version
-				// set endpointUpdated to ensure endpoint changes are persisted.
+				// 如果现有的 endpoint 版本与期望的版本不同，则将 endpointUpdated 设置为 true，以确保将 endpoint 更改持久化。
 				if !endpointutil.EndpointsEqualBeyondHash(got, &endpoint) {
 					endpointUpdated = true
 				}
-				// once an endpoint has been placed/found in a slice, it no
-				// longer needs to be handled
+				//// 在 slice 中找到 endpoint 后，将其从 desiredSet 中删除。
 				desiredSet.Delete(&endpoint)
 			}
 		}
@@ -606,16 +603,16 @@ func (r *reconciler) reconcileByPortMapping(
 		// 生成切片标签并检查父标签是否已更改
 		labels, labelsChanged := setEndpointSliceLabels(existingSlice, service)
 
-		//如果端点已更新或删除，则标记为更新或删除
+		// 如果 endpoint 已更新或删除，则将其标记为更新或删除。
 		if endpointUpdated || len(existingSlice.Endpoints) != len(newEndpoints) {
 			if len(existingSlice.Endpoints) > len(newEndpoints) {
 				numRemoved += len(existingSlice.Endpoints) - len(newEndpoints)
 			}
 			if len(newEndpoints) == 0 {
-				// if no endpoints desired in this slice, mark for deletion
+				//  如果此 slice 中不需要 endpoint，则标记为删除。
 				sliceNamesToDelete.Insert(existingSlice.Name)
 			} else {
-				// otherwise, copy and mark for update
+				//  否则，复制 slice 并将其标记为更新。
 				epSlice := existingSlice.DeepCopy()
 				epSlice.Endpoints = newEndpoints
 				epSlice.Labels = labels
@@ -623,20 +620,20 @@ func (r *reconciler) reconcileByPortMapping(
 				sliceNamesToUpdate.Insert(epSlice.Name)
 			}
 		} else if labelsChanged {
-			// 如果有更新 则直接更新
+			//如果标签已更改，则复制 slice 并将其标记为更新。
 			epSlice := existingSlice.DeepCopy()
 			epSlice.Labels = labels
 			slicesByName[existingSlice.Name] = epSlice
 			sliceNamesToUpdate.Insert(epSlice.Name)
 		} else {
-			// 标记为更新或者删除
+			//  如果 slice 没有更改，则对后续处理留下一些有用的 slice。
 			sliceNamesUnchanged.Insert(existingSlice.Name)
 		}
 	}
 
 	numAdded := desiredSet.Len()
 
-	// 如果我们还有需要添加的端点和标记为要更新的切片，请遍历这些切片并用所需的端点填充它们。
+	// 2. 如果我们仍然有要添加的 endpoint 并且有已标记更新的 slice，则遍历这些 slice 并使用期望的 endpoint 填充它们。
 	if desiredSet.Len() > 0 && sliceNamesToUpdate.Len() > 0 {
 		slices := []*discovery.EndpointSlice{}
 		for _, sliceName := range sliceNamesToUpdate.UnsortedList() {
@@ -646,7 +643,7 @@ func (r *reconciler) reconcileByPortMapping(
 		// first.
 		sort.Sort(endpointSliceEndpointLen(slices))
 
-		// Iterate through slices and fill them up with desired endpoints.
+		// 遍历切片并用所需的endpoint填充它们
 		for _, slice := range slices {
 			for desiredSet.Len() > 0 && len(slice.Endpoints) < int(r.maxEndpointsPerSlice) {
 				endpoint, _ := desiredSet.PopAny()
@@ -655,13 +652,13 @@ func (r *reconciler) reconcileByPortMapping(
 		}
 	}
 
-	// 如果此时仍有所需的端点，我们将尝试在单个现有切片中拟合端点。如果没有具有该容量的切片，我们将为端点创建新的切片。
+	// 3.如果此时仍有所需的endpoint，我们将尝试在单个现有切片中拟合endpoint。如果没有具有该容量的切片，我们将为端点创建新的切片。
 	slicesToCreate := []*discovery.EndpointSlice{}
 
 	for desiredSet.Len() > 0 {
 		var sliceToFill *discovery.EndpointSlice
 
-		// 如果剩余的端点数量小于每个切片的最大端点数量，并且我们有尚未填充的切片，请尝试将它们放在一个切片中。
+		// 如果剩余的endpoint数量小于每个切片的最大端点数量，并且我们有尚未填充的切片，请尝试将它们放在一个切片中。
 		if desiredSet.Len() < int(r.maxEndpointsPerSlice) && sliceNamesUnchanged.Len() > 0 {
 			unchangedSlices := []*discovery.EndpointSlice{}
 			for _, sliceName := range sliceNamesUnchanged.UnsortedList() {
@@ -761,6 +758,15 @@ func getAddressTypesForService(service *v1.Service) map[discovery.AddressType]st
 	serviceSupportedAddresses[discovery.AddressTypeIPv6] = struct{}{}
 	klog.V(2).Infof("couldn't find ipfamilies for headless service: %v/%v likely because controller manager is likely connected to an old apiserver that does not support ip families yet. The service endpoint slice will use dual stack families until api-server default it correctly", service.Namespace, service.Name)
 	return serviceSupportedAddresses
+}
+
+func ownedBy(endpointSlice *discovery.EndpointSlice, svc *v1.Service) bool {
+	for _, o := range endpointSlice.OwnerReferences {
+		if o.UID == svc.UID && o.Kind == "Service" && o.APIVersion == "v1" {
+			return true
+		}
+	}
+	return false
 }
 ```
 
