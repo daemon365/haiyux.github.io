@@ -18,8 +18,6 @@ featuredImagePreview: /img/preview/controller/endpointslicemirroring-controller.
 
 负责将一个命名空间中的 Endpointslices 镜像到另一个命名空间中。它用于将源命名空间中的 Endpointslices 镜像到目标命名空间中。该控制器会监视源命名空间中 Endpoints 资源的更改，并在目标命名空间中创建或更新 Endpointslices。
 
-当拥有一个多租户集群并希望允许一个租户访问另一个租户命名空间中的服务时，这非常有用。
-
 ## 结构体
 
 ```GO
