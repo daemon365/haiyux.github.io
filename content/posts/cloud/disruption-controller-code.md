@@ -636,6 +636,11 @@ var (
 	controllerKindDep = v1beta1.SchemeGroupVersion.WithKind("Deployment")
 )
 
+type controllerAndScale struct {
+	types.UID
+	scale int32
+}
+
 func (dc *DisruptionController) getPodReplicationController(ctx context.Context, controllerRef *metav1.OwnerReference, namespace string) (*controllerAndScale, error) {
 	ok, err := verifyGroupKind(controllerRef, controllerKindRC.Kind, []string{""})
 	if !ok || err != nil {
