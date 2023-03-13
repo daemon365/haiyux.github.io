@@ -766,6 +766,26 @@ func (dc *DisruptionController) getScaleController(ctx context.Context, controll
 	}
 	return &controllerAndScale{scale.UID, scale.Spec.Replicas}, nil
 }
+
+
+func verifyGroupKind(controllerRef *metav1.OwnerReference, expectedKind string, expectedGroups []string) (bool, error) {
+	gv, err := schema.ParseGroupVersion(controllerRef.APIVersion)
+	if err != nil {
+		return false, err
+	}
+
+	if controllerRef.Kind != expectedKind {
+		return false, nil
+	}
+
+	for _, group := range expectedGroups {
+		if group == gv.Group {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
 ```
 
 ##### buildDisruptedPodMap
