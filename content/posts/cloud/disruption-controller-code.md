@@ -621,6 +621,148 @@ func (dc *DisruptionController) getExpectedScale(ctx context.Context, pdb *polic
 }
 ```
 
+###### finders
+
+```GO
+func (dc *DisruptionController) finders() []podControllerFinder {
+	return []podControllerFinder{dc.getPodReplicationController, dc.getPodDeployment, dc.getPodReplicaSet,
+		dc.getPodStatefulSet, dc.getScaleController}
+}
+
+var (
+	controllerKindRS  = v1beta1.SchemeGroupVersion.WithKind("ReplicaSet")
+	controllerKindSS  = apps.SchemeGroupVersion.WithKind("StatefulSet")
+	controllerKindRC  = v1.SchemeGroupVersion.WithKind("ReplicationController")
+	controllerKindDep = v1beta1.SchemeGroupVersion.WithKind("Deployment")
+)
+
+func (dc *DisruptionController) getPodReplicationController(ctx context.Context, controllerRef *metav1.OwnerReference, namespace string) (*controllerAndScale, error) {
+	ok, err := verifyGroupKind(controllerRef, controllerKindRC.Kind, []string{""})
+	if !ok || err != nil {
+		return nil, err
+	}
+	rc, err := dc.rcLister.ReplicationControllers(namespace).Get(controllerRef.Name)
+	if err != nil {
+		// The only possible error is NotFound, which is ok here.
+		return nil, nil
+	}
+	if rc.UID != controllerRef.UID {
+		return nil, nil
+	}
+	return &controllerAndScale{rc.UID, *(rc.Spec.Replicas)}, nil
+}
+
+func (dc *DisruptionController) getPodDeployment(ctx context.Context, controllerRef *metav1.OwnerReference, namespace string) (*controllerAndScale, error) {
+	ok, err := verifyGroupKind(controllerRef, controllerKindRS.Kind, []string{"apps", "extensions"})
+	if !ok || err != nil {
+		return nil, err
+	}
+	rs, err := dc.rsLister.ReplicaSets(namespace).Get(controllerRef.Name)
+	if err != nil {
+		// The only possible error is NotFound, which is ok here.
+		return nil, nil
+	}
+	if rs.UID != controllerRef.UID {
+		return nil, nil
+	}
+	controllerRef = metav1.GetControllerOf(rs)
+	if controllerRef == nil {
+		return nil, nil
+	}
+
+	ok, err = verifyGroupKind(controllerRef, controllerKindDep.Kind, []string{"apps", "extensions"})
+	if !ok || err != nil {
+		return nil, err
+	}
+	deployment, err := dc.dLister.Deployments(rs.Namespace).Get(controllerRef.Name)
+	if err != nil {
+		// The only possible error is NotFound, which is ok here.
+		return nil, nil
+	}
+	if deployment.UID != controllerRef.UID {
+		return nil, nil
+	}
+	return &controllerAndScale{deployment.UID, *(deployment.Spec.Replicas)}, nil
+}
+
+func (dc *DisruptionController) getPodReplicaSet(ctx context.Context, controllerRef *metav1.OwnerReference, namespace string) (*controllerAndScale, error) {
+	ok, err := verifyGroupKind(controllerRef, controllerKindRS.Kind, []string{"apps", "extensions"})
+	if !ok || err != nil {
+		return nil, err
+	}
+	rs, err := dc.rsLister.ReplicaSets(namespace).Get(controllerRef.Name)
+	if err != nil {
+		// The only possible error is NotFound, which is ok here.
+		return nil, nil
+	}
+	if rs.UID != controllerRef.UID {
+		return nil, nil
+	}
+	controllerRef = metav1.GetControllerOf(rs)
+	if controllerRef != nil && controllerRef.Kind == controllerKindDep.Kind {
+		// Skip RS if it's controlled by a Deployment.
+		return nil, nil
+	}
+	return &controllerAndScale{rs.UID, *(rs.Spec.Replicas)}, nil
+}
+
+func (dc *DisruptionController) getPodStatefulSet(ctx context.Context, controllerRef *metav1.OwnerReference, namespace string) (*controllerAndScale, error) {
+	ok, err := verifyGroupKind(controllerRef, controllerKindSS.Kind, []string{"apps"})
+	if !ok || err != nil {
+		return nil, err
+	}
+	ss, err := dc.ssLister.StatefulSets(namespace).Get(controllerRef.Name)
+	if err != nil {
+		// The only possible error is NotFound, which is ok here.
+		return nil, nil
+	}
+	if ss.UID != controllerRef.UID {
+		return nil, nil
+	}
+
+	return &controllerAndScale{ss.UID, *(ss.Spec.Replicas)}, nil
+}
+
+func (dc *DisruptionController) getScaleController(ctx context.Context, controllerRef *metav1.OwnerReference, namespace string) (*controllerAndScale, error) {
+	gv, err := schema.ParseGroupVersion(controllerRef.APIVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	gk := schema.GroupKind{
+		Group: gv.Group,
+		Kind:  controllerRef.Kind,
+	}
+
+	mapping, err := dc.mapper.RESTMapping(gk, gv.Version)
+	if err != nil {
+		return nil, err
+	}
+	gr := mapping.Resource.GroupResource()
+	scale, err := dc.scaleNamespacer.Scales(namespace).Get(ctx, gr, controllerRef.Name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// The IsNotFound error can mean either that the resource does not exist,
+			// or it exist but doesn't implement the scale subresource. We check which
+			// situation we are facing so we can give an appropriate error message.
+			isScale, err := dc.implementsScale(mapping.Resource)
+			if err != nil {
+				return nil, err
+			}
+			if !isScale {
+				return nil, fmt.Errorf("%s does not implement the scale subresource", gr.String())
+			}
+			return nil, nil
+		}
+		return nil, err
+	}
+	if scale.UID != controllerRef.UID {
+		return nil, nil
+	}
+	return &controllerAndScale{scale.UID, scale.Spec.Replicas}, nil
+}
+```
+
 ##### buildDisruptedPodMap
 
 ```GO
