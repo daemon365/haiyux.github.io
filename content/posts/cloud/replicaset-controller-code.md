@@ -538,150 +538,6 @@ func (rsc *ReplicaSetController) claimPods(ctx context.Context, rs *apps.Replica
 	cm := controller.NewPodControllerRefManager(rsc.podControl, rs, selector, rsc.GroupVersionKind, canAdoptFunc)
 	return cm.ClaimPods(ctx, filteredPods)
 }
-
-func NewPodControllerRefManager(
-	podControl PodControlInterface,
-	controller metav1.Object,
-	selector labels.Selector,
-	controllerKind schema.GroupVersionKind,
-	canAdopt func(ctx context.Context) error,
-	finalizers ...string,
-) *PodControllerRefManager {
-	return &PodControllerRefManager{
-		BaseControllerRefManager: BaseControllerRefManager{
-			Controller:   controller,
-			Selector:     selector,
-			CanAdoptFunc: canAdopt,
-		},
-		controllerKind: controllerKind,
-		podControl:     podControl,
-		finalizers:     finalizers,
-	}
-}
-
-func (m *PodControllerRefManager) ClaimPods(ctx context.Context, pods []*v1.Pod, filters ...func(*v1.Pod) bool) ([]*v1.Pod, error) {
-	var claimed []*v1.Pod
-	var errlist []error
-
-	match := func(obj metav1.Object) bool {
-		pod := obj.(*v1.Pod)
-		if !m.Selector.Matches(labels.Set(pod.Labels)) {
-			return false
-		}
-		for _, filter := range filters {
-			if !filter(pod) {
-				return false
-			}
-		}
-		return true
-	}
-	adopt := func(ctx context.Context, obj metav1.Object) error {
-		return m.AdoptPod(ctx, obj.(*v1.Pod))
-	}
-	release := func(ctx context.Context, obj metav1.Object) error {
-		return m.ReleasePod(ctx, obj.(*v1.Pod))
-	}
-
-	for _, pod := range pods {
-		ok, err := m.ClaimObject(ctx, pod, match, adopt, release)
-		if err != nil {
-			errlist = append(errlist, err)
-			continue
-		}
-		if ok {
-			claimed = append(claimed, pod)
-		}
-	}
-	return claimed, utilerrors.NewAggregate(errlist)
-}
-
-func (m *PodControllerRefManager) AdoptPod(ctx context.Context, pod *v1.Pod) error {
-	if err := m.CanAdopt(ctx); err != nil {
-		return fmt.Errorf("can't adopt Pod %v/%v (%v): %v", pod.Namespace, pod.Name, pod.UID, err)
-	}
-
-	patchBytes, err := ownerRefControllerPatch(m.Controller, m.controllerKind, pod.UID, m.finalizers...)
-	if err != nil {
-		return err
-	}
-	return m.podControl.PatchPod(ctx, pod.Namespace, pod.Name, patchBytes)
-}
-
-func (m *PodControllerRefManager) ReleasePod(ctx context.Context, pod *v1.Pod) error {
-	klog.V(2).Infof("patching pod %s_%s to remove its controllerRef to %s/%s:%s",
-		pod.Namespace, pod.Name, m.controllerKind.GroupVersion(), m.controllerKind.Kind, m.Controller.GetName())
-	patchBytes, err := GenerateDeleteOwnerRefStrategicMergeBytes(pod.UID, []types.UID{m.Controller.GetUID()}, m.finalizers...)
-	if err != nil {
-		return err
-	}
-	err = m.podControl.PatchPod(ctx, pod.Namespace, pod.Name, patchBytes)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		if errors.IsInvalid(err) {
-			return nil
-		}
-	}
-	return err
-}
-
-
-func (m *BaseControllerRefManager) ClaimObject(ctx context.Context, obj metav1.Object, match func(metav1.Object) bool, adopt, release func(context.Context, metav1.Object) error) (bool, error) {
-	controllerRef := metav1.GetControllerOfNoCopy(obj)
-	if controllerRef != nil {
-		if controllerRef.UID != m.Controller.GetUID() {
-			return false, nil
-		}
-		if match(obj) {
-			return true, nil
-		}
-		// Owned by us but selector doesn't match.
-		// Try to release, unless we're being deleted.
-		if m.Controller.GetDeletionTimestamp() != nil {
-			return false, nil
-		}
-		if err := release(ctx, obj); err != nil {
-			// If the pod no longer exists, ignore the error.
-			if errors.IsNotFound(err) {
-				return false, nil
-			}
-			// Either someone else released it, or there was a transient error.
-			// The controller should requeue and try again if it's still stale.
-			return false, err
-		}
-		// Successfully released.
-		return false, nil
-	}
-
-	// It's an orphan.
-	if m.Controller.GetDeletionTimestamp() != nil || !match(obj) {
-		// Ignore if we're being deleted or selector doesn't match.
-		return false, nil
-	}
-	if obj.GetDeletionTimestamp() != nil {
-		// Ignore if the object is being deleted
-		return false, nil
-	}
-
-	if len(m.Controller.GetNamespace()) > 0 && m.Controller.GetNamespace() != obj.GetNamespace() {
-		// Ignore if namespace not match
-		return false, nil
-	}
-
-	// Selector matches. Try to adopt.
-	if err := adopt(ctx, obj); err != nil {
-		// If the pod no longer exists, ignore the error.
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		// Either someone else claimed it first, or there was a transient error.
-		// The controller should requeue and try again if it's still orphaned.
-		return false, err
-	}
-	// Successfully adopted.
-	return true, nil
-}
 ```
 
 #### manageReplicas
@@ -1033,4 +889,489 @@ func updateReplicaSetStatus(logger klog.Logger, c appsclient.ReplicaSetInterface
 	return nil, updateErr
 }
 ```
+
+## PodControllerRefManager
+
+```GO
+type PodControllerRefManager struct {
+	BaseControllerRefManager
+	controllerKind schema.GroupVersionKind
+    // 控制 Pod 的接口
+	podControl     PodControlInterface
+	finalizers     []string
+}
+
+func NewPodControllerRefManager(
+	podControl PodControlInterface,
+	controller metav1.Object,
+	selector labels.Selector,
+	controllerKind schema.GroupVersionKind,
+	canAdopt func(ctx context.Context) error,
+	finalizers ...string,
+) *PodControllerRefManager {
+	return &PodControllerRefManager{
+		BaseControllerRefManager: BaseControllerRefManager{
+			Controller:   controller,
+			Selector:     selector,
+			CanAdoptFunc: canAdopt,
+		},
+		controllerKind: controllerKind,
+		podControl:     podControl,
+		finalizers:     finalizers,
+	}
+}
+
+```
+
+### ClaimPods
+
+```GO
+func (m *PodControllerRefManager) ClaimPods(ctx context.Context, pods []*v1.Pod, filters ...func(*v1.Pod) bool) ([]*v1.Pod, error) {
+    // 定义 claimed 和 errlist 两个变量 存储pod和err
+	var claimed []*v1.Pod
+	var errlist []error
+	// 定义 match 函数，用于判断 Pod 是否符合条件
+	match := func(obj metav1.Object) bool {
+		pod := obj.(*v1.Pod)
+		// 先检查选择器，以便筛选出可能匹配的 Pod，从而仅在可能匹配的 Pod 上运行过滤器
+		if !m.Selector.Matches(labels.Set(pod.Labels)) {
+			return false
+		}
+        // 遍历所有过滤器，如果有一个不符合条件则返回 false，否则返回 true
+		for _, filter := range filters {
+			if !filter(pod) {
+				return false
+			}
+		}
+		return true
+	}
+    // 定义 adopt 和 release 函数，用于将 Pod 的控制器引用设置为 m
+	adopt := func(ctx context.Context, obj metav1.Object) error {
+		return m.AdoptPod(ctx, obj.(*v1.Pod))
+	}
+	release := func(ctx context.Context, obj metav1.Object) error {
+		return m.ReleasePod(ctx, obj.(*v1.Pod))
+	}
+    // 遍历所有 Pod，调用 ClaimObject 函数，将符合条件的 Pod 的控制器引用设置为 m
+	for _, pod := range pods {
+		ok, err := m.ClaimObject(ctx, pod, match, adopt, release)
+		if err != nil {
+			errlist = append(errlist, err)
+			continue
+		}
+		if ok {
+			claimed = append(claimed, pod)
+		}
+	}
+    // 返回 claimed 和 errlist，errlist 使用 NewAggregate 函数将所有错误信息合并成一个错误
+	return claimed, utilerrors.NewAggregate(errlist)
+}
+
+```
+
+### AdoptPod
+
+```go
+func (m *PodControllerRefManager) AdoptPod(ctx context.Context, pod *v1.Pod) error {
+    // 检查是否能够接管该 Pod
+	if err := m.CanAdopt(ctx); err != nil {
+		return fmt.Errorf("can't adopt Pod %v/%v (%v): %v", pod.Namespace, pod.Name, pod.UID, err)
+	}
+	
+	// 构建控制器引用的补丁
+	patchBytes, err := ownerRefControllerPatch(m.Controller, m.controllerKind, pod.UID, m.finalizers...)
+	if err != nil {
+		return err
+	}
+    // 使用 podControl 客户端更新 Pod 的控制器引用
+	return m.podControl.PatchPod(ctx, pod.Namespace, pod.Name, patchBytes)
+}
+```
+
+#### ownerRefControllerPatch
+
+```go
+type objectForAddOwnerRefPatch struct {
+	Metadata objectMetaForPatch `json:"metadata"`
+}
+
+type objectMetaForPatch struct {
+	OwnerReferences []metav1.OwnerReference `json:"ownerReferences"`
+	UID             types.UID               `json:"uid"`
+	Finalizers      []string                `json:"finalizers,omitempty"`
+}
+
+func ownerRefControllerPatch(controller metav1.Object, controllerKind schema.GroupVersionKind, uid types.UID, finalizers ...string) ([]byte, error) {
+	blockOwnerDeletion := true
+	isController := true
+	addControllerPatch := objectForAddOwnerRefPatch{
+		Metadata: objectMetaForPatch{
+			UID: uid,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         controllerKind.GroupVersion().String(),
+					Kind:               controllerKind.Kind,
+					Name:               controller.GetName(),
+					UID:                controller.GetUID(),
+					Controller:         &isController,
+					BlockOwnerDeletion: &blockOwnerDeletion,
+				},
+			},
+			Finalizers: finalizers,
+		},
+	}
+	patchBytes, err := json.Marshal(&addControllerPatch)
+	if err != nil {
+		return nil, err
+	}
+	return patchBytes, nil
+}
+```
+
+### ReleasePod
+
+```go
+func (m *PodControllerRefManager) ReleasePod(ctx context.Context, pod *v1.Pod) error {
+	klog.V(2).Infof("patching pod %s_%s to remove its controllerRef to %s/%s:%s",
+		pod.Namespace, pod.Name, m.controllerKind.GroupVersion(), m.controllerKind.Kind, m.Controller.GetName())
+	patchBytes, err := GenerateDeleteOwnerRefStrategicMergeBytes(pod.UID, []types.UID{m.Controller.GetUID()}, m.finalizers...)
+	if err != nil {
+		return err
+	}
+    // 使用 podControl 客户端更新 Pod，删除其控制器引用
+	err = m.podControl.PatchPod(ctx, pod.Namespace, pod.Name, patchBytes)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// 如果 Pod 已经不存在，则忽略错误
+			return nil
+		}
+		if errors.IsInvalid(err) {
+			// 如果错误是 "invalid" 类型，则忽略错误，因为此错误有两种情况：
+			// 1. Pod 没有 OwnerReference；
+			// 2. Pod 的 UID 不匹配，这意味着 Pod 被删除后重新创建。
+			return nil
+		}
+	}
+	return err
+}
+```
+
+#### GenerateDeleteOwnerRefStrategicMergeBytes
+
+```go
+	Metadata objectMetaForMergePatch `json:"metadata"`
+}
+
+type objectMetaForMergePatch struct {
+	UID              types.UID           `json:"uid"`
+	OwnerReferences  []map[string]string `json:"ownerReferences"`
+	DeleteFinalizers []string            `json:"$deleteFromPrimitiveList/finalizers,omitempty"`
+}
+
+func GenerateDeleteOwnerRefStrategicMergeBytes(dependentUID types.UID, ownerUIDs []types.UID, finalizers ...string) ([]byte, error) {
+	var ownerReferences []map[string]string
+	for _, ownerUID := range ownerUIDs {
+		ownerReferences = append(ownerReferences, ownerReference(ownerUID, "delete"))
+	}
+	patch := objectForDeleteOwnerRefStrategicMergePatch{
+		Metadata: objectMetaForMergePatch{
+			UID:              dependentUID,
+			OwnerReferences:  ownerReferences,
+			DeleteFinalizers: finalizers,
+		},
+	}
+	patchBytes, err := json.Marshal(&patch)
+	if err != nil {
+		return nil, err
+	}
+	return patchBytes, nil
+}
+```
+
+### BaseControllerRefManager
+
+```GO
+type BaseControllerRefManager struct {
+    // 控制器对象
+	Controller metav1.Object
+    // 选择器，用于选择控制器对象的子集。
+	Selector   labels.Selector
+	
+    // 尝试采用控制器时发生的错误
+	canAdoptErr  error
+	canAdoptOnce sync.Once
+    // 控制器对象可以被采用时应该执行的函数
+	CanAdoptFunc func(ctx context.Context) error
+}
+
+func (m *BaseControllerRefManager) CanAdopt(ctx context.Context) error {
+	m.canAdoptOnce.Do(func() {
+		if m.CanAdoptFunc != nil {
+			m.canAdoptErr = m.CanAdoptFunc(ctx)
+		}
+	})
+	return m.canAdoptErr
+}
+
+func (m *BaseControllerRefManager) ClaimObject(ctx context.Context, obj metav1.Object, match func(metav1.Object) bool, adopt, release func(context.Context, metav1.Object) error) (bool, error) {
+    //获取对象的控制器引用
+	controllerRef := metav1.GetControllerOfNoCopy(obj)
+	if controllerRef != nil {
+     	// 如果有引用 判断是不是这个的
+		if controllerRef.UID != m.Controller.GetUID() {
+			return false, nil
+		}
+        // 匹配
+		if match(obj) {
+			return true, nil
+		}
+        // 如果该对象被删除了 不处理
+		if m.Controller.GetDeletionTimestamp() != nil {
+			return false, nil
+		}
+        // 和本对象不匹配 释放他
+		if err := release(ctx, obj); err != nil {
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return false, nil
+	}
+
+	// 符合选择器条件
+	if m.Controller.GetDeletionTimestamp() != nil || !match(obj) {
+		return false, nil
+	}
+	if obj.GetDeletionTimestamp() != nil {
+        // 该对象被删除了
+		return false, nil
+	}
+
+	if len(m.Controller.GetNamespace()) > 0 && m.Controller.GetNamespace() != obj.GetNamespace() {
+		// namespace不匹配
+		return false, nil
+	}
+
+	// 绑定
+	if err := adopt(ctx, obj); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	// Successfully adopted.
+	return true, nil
+}
+```
+
+## UIDTrackingControllerExpectations
+
+### struct
+
+```go
+type UIDTrackingControllerExpectations struct {
+	ControllerExpectationsInterface
+	uidStoreLock sync.Mutex
+	uidStore cache.Store
+}
+```
+
+### 方法
+
+```go
+// GetUIDs 返回给定控制器的 UID 集合。
+func (u *UIDTrackingControllerExpectations) GetUIDs(controllerKey string) sets.String {
+	if uid, exists, err := u.uidStore.GetByKey(controllerKey); err == nil && exists {
+		return uid.(*UIDSet).String
+	}
+	return nil
+}
+
+// ExpectDeletions 记录针对给定控制器和删除键的期望删除。
+func (u *UIDTrackingControllerExpectations) ExpectDeletions(rcKey string, deletedKeys []string) error {
+	expectedUIDs := sets.NewString()
+	for _, k := range deletedKeys {
+		expectedUIDs.Insert(k)
+	}
+	klog.V(4).Infof("Controller %v waiting on deletions for: %+v", rcKey, deletedKeys)
+    // 获取锁，更新 UID 集合
+	u.uidStoreLock.Lock()
+	defer u.uidStoreLock.Unlock()
+
+	if existing := u.GetUIDs(rcKey); existing != nil && existing.Len() != 0 {
+		klog.Errorf("Clobbering existing delete keys: %+v", existing)
+	}
+	if err := u.uidStore.Add(&UIDSet{expectedUIDs, rcKey}); err != nil {
+		return err
+	}
+    // 更新期望的删除计数
+	return u.ControllerExpectationsInterface.ExpectDeletions(rcKey, expectedUIDs.Len())
+}
+
+// DeletionObserved 记录给定控制器的给定删除键已被删除。
+func (u *UIDTrackingControllerExpectations) DeletionObserved(rcKey, deleteKey string) {
+    // 获取锁，更新 UID 集合
+	u.uidStoreLock.Lock()
+	defer u.uidStoreLock.Unlock()
+
+	uids := u.GetUIDs(rcKey)
+	if uids != nil && uids.Has(deleteKey) {
+		klog.V(4).Infof("Controller %v received delete for pod %v", rcKey, deleteKey)
+        // 更新删除计数并从 UID 集合中删除该 UID
+		u.ControllerExpectationsInterface.DeletionObserved(rcKey)
+		uids.Delete(deleteKey)
+	}
+}
+
+// DeleteExpectations 删除 UID 集并调用底层 ControllerExpectationsInterface 上的 DeleteExpectations。
+func (u *UIDTrackingControllerExpectations) DeleteExpectations(rcKey string) {
+	u.uidStoreLock.Lock()
+	defer u.uidStoreLock.Unlock()
+
+	u.ControllerExpectationsInterface.DeleteExpectations(rcKey)
+	if uidExp, exists, err := u.uidStore.GetByKey(rcKey); err == nil && exists {
+		if err := u.uidStore.Delete(uidExp); err != nil {
+			klog.V(2).Infof("Error deleting uid expectations for controller %v: %v", rcKey, err)
+		}
+	}
+}
+```
+
+## ControllerExpectationsInterface
+
+```go
+type ControllerExpectationsInterface interface {
+    // GetExpectations 返回与给定控制器键关联的 ControlleeExpectations 和一个布尔值，指示是否找到了此键的预期。
+	GetExpectations(controllerKey string) (*ControlleeExpectations, bool, error)
+	// SatisfiedExpectations 检查是否已满足与给定控制器键关联的预期。
+    SatisfiedExpectations(controllerKey string) bool
+    // DeleteExpectations 删除与给定控制器键关联的预期。
+    DeleteExpectations(controllerKey string)
+    // SetExpectations 设置与给定控制器键关联的预期，包括添加和删除计数。
+    SetExpectations(controllerKey string, add, del int) error
+    // ExpectCreations 增加与给定控制器键关联的添加计数。
+    ExpectCreations(controllerKey string, adds int) error
+    // ExpectDeletions 增加与给定控制器键关联的删除计数。
+    ExpectDeletions(controllerKey string, dels int) error
+    // CreationObserved 表示与给定控制器键关联的对象已创建。
+    CreationObserved(controllerKey string)
+    // DeletionObserved 表示与给定控制器键关联的对象已删除。
+    DeletionObserved(controllerKey string)
+    // RaiseExpectations 增加与给定控制器键关联的添加和删除计数。
+    RaiseExpectations(controllerKey string, add, del int)
+    // LowerExpectations 减少与给定控制器键关联的添加和删除计数。
+    LowerExpectations(controllerKey string, add, del int)
+}
+```
+
+### 结构体实现
+
+```GO
+type ControllerExpectations struct {
+	cache.Store
+}
+```
+
+### 方法
+
+```GO
+func (r *ControllerExpectations) GetExpectations(controllerKey string) (*ControlleeExpectations, bool, error) {
+    // 通过 controllerKey 获取 ControlleeExpectations
+    exp, exists, err := r.GetByKey(controllerKey)
+    if err == nil && exists {
+    	return exp.(*ControlleeExpectations), true, nil
+    }
+    return nil, false, err
+}
+
+func (r *ControllerExpectations) DeleteExpectations(controllerKey string) {
+   	//通过 controllerKey 获取 ControlleeExpectations，并从 TTLStore 中删除
+	if exp, exists, err := r.GetByKey(controllerKey); err == nil && exists {
+		if err := r.Delete(exp); err != nil {
+			klog.V(2).Infof("Error deleting expectations for controller %v: %v", controllerKey, err)
+		}
+	}
+}
+
+func (r *ControllerExpectations) SatisfiedExpectations(controllerKey string) bool {
+	if exp, exists, err := r.GetExpectations(controllerKey); exists {
+		if exp.Fulfilled() {
+            //  如果已经满足期望，则返回 true
+			klog.V(4).Infof("Controller expectations fulfilled %#v", exp)
+			return true
+		} else if exp.isExpired() {
+            // 如果期望已过期，则返回 true
+			klog.V(4).Infof("Controller expectations expired %#v", exp)
+			return true
+		} else {
+            // 如果还未满足期望，则返回 false
+			klog.V(4).Infof("Controller still waiting on expectations %#v", exp)
+			return false
+		}
+	} else if err != nil {
+		klog.V(2).Infof("Error encountered while checking expectations %#v, forcing sync", err)
+	} else {
+		// 当创建新控制器时，它没有期望。
+        // 当它未看到预期的观察事件 > TTL 时，期望会过期。
+        // - 在这种情况下，它会唤醒，创建/删除控制lee，并再次设置期望。
+        // 当它满足了期望并且没有需要创建/销毁的控制lee > TTL 时，期望过期。
+        // - 在这种情况下，它会继续而不设置期望，直到需要创建/删除控制lee。
+		klog.V(4).Infof("Controller %v either never recorded expectations, or the ttl expired.", controllerKey)
+	}
+	// 如果遇到错误（这不应该发生，因为我们从本地存储获取）或此控制器尚未建立期望，则触发同步。
+	return true
+}
+
+func (r *ControllerExpectations) SetExpectations(controllerKey string, add, del int) error {
+    // 创建 ControlleeExpectations 结构体，包含给定的 add 和 del 计数
+	exp := &ControlleeExpectations{add: int64(add), del: int64(del), key: controllerKey, timestamp: clock.RealClock{}.Now()}
+	klog.V(4).Infof("Setting expectations %#v", exp)
+    // 将 ControlleeExpectations 添加到 TTLStore 中
+	return r.Add(exp)
+}
+
+func (r *ControllerExpectations) ExpectCreations(controllerKey string, adds int) error {
+	return r.SetExpectations(controllerKey, adds, 0)
+}
+
+func (r *ControllerExpectations) ExpectDeletions(controllerKey string, dels int) error {
+	return r.SetExpectations(controllerKey, 0, dels)
+}
+
+func (r *ControllerExpectations) LowerExpectations(controllerKey string, add, del int) {
+	if exp, exists, err := r.GetExpectations(controllerKey); err == nil && exists {
+		exp.Add(int64(-add), int64(-del))
+		klog.V(4).Infof("Lowered expectations %#v", exp)
+	}
+}
+
+func (r *ControllerExpectations) RaiseExpectations(controllerKey string, add, del int) {
+	if exp, exists, err := r.GetExpectations(controllerKey); err == nil && exists {
+		exp.Add(int64(add), int64(del))
+		klog.V(4).Infof("Raised expectations %#v", exp)
+	}
+}
+
+func (r *ControllerExpectations) CreationObserved(controllerKey string) {
+	r.LowerExpectations(controllerKey, 1, 0)
+}
+
+func (r *ControllerExpectations) DeletionObserved(controllerKey string) {
+	r.LowerExpectations(controllerKey, 0, 1)
+}
+
+type ControlleeExpectations struct {
+	add       int64
+	del       int64
+	key       string
+	timestamp time.Time
+}
+
+func (exp *ControlleeExpectations) isExpired() bool {
+	return clock.RealClock{}.Since(exp.timestamp) > ExpectationsTimeout
+}
+```
+
+
 
