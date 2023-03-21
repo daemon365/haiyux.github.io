@@ -1236,6 +1236,11 @@ func (u *UIDTrackingControllerExpectations) DeleteExpectations(rcKey string) {
 		}
 	}
 }
+
+type UIDSet struct {
+	sets.String
+	key string
+}
 ```
 
 ## ControllerExpectationsInterface
@@ -1370,6 +1375,19 @@ type ControlleeExpectations struct {
 
 func (exp *ControlleeExpectations) isExpired() bool {
 	return clock.RealClock{}.Since(exp.timestamp) > ExpectationsTimeout
+}
+
+func (e *ControlleeExpectations) Add(add, del int64) {
+	atomic.AddInt64(&e.add, add)
+	atomic.AddInt64(&e.del, del)
+}
+
+func (e *ControlleeExpectations) Fulfilled() bool {
+	return atomic.LoadInt64(&e.add) <= 0 && atomic.LoadInt64(&e.del) <= 0
+}
+
+func (e *ControlleeExpectations) GetExpectations() (int64, int64) {
+	return atomic.LoadInt64(&e.add), atomic.LoadInt64(&e.del)
 }
 ```
 
