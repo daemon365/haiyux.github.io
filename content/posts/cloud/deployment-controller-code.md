@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/controller/deployment-controller.jpg
+featuredImagePreview: /img/preview/controller/deployment-controller.jpg
 ---
 
 ## 简介
@@ -1689,7 +1689,7 @@ func (dc *DeploymentController) checkPausedConditions(ctx context.Context, d *ap
 }
 ```
 
-#### sync
+### sync
 
 ```GO
 func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) error {
@@ -1715,7 +1715,7 @@ func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rs
 }
 ```
 
-##### scale
+#### scale
 
 ```go
 func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Deployment, newRS *apps.ReplicaSet, oldRSs []*apps.ReplicaSet) error {
@@ -1813,7 +1813,7 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 }
 ```
 
-###### scaleReplicaSetAndRecordEvent
+##### scaleReplicaSetAndRecordEvent
 
 ```GO
 func (dc *DeploymentController) scaleReplicaSetAndRecordEvent(ctx context.Context, rs *apps.ReplicaSet, newScale int32, deployment *apps.Deployment) (bool, *apps.ReplicaSet, error) {
@@ -1832,7 +1832,7 @@ func (dc *DeploymentController) scaleReplicaSetAndRecordEvent(ctx context.Contex
 }
 ```
 
-###### scaleReplicaSet
+##### scaleReplicaSet
 
 ```go
 func (dc *DeploymentController) scaleReplicaSet(ctx context.Context, rs *apps.ReplicaSet, newScale int32, deployment *apps.Deployment, scalingOperation string) (bool, *apps.ReplicaSet, error) {
@@ -1858,7 +1858,7 @@ func (dc *DeploymentController) scaleReplicaSet(ctx context.Context, rs *apps.Re
 }
 ```
 
-###### IsSaturated
+##### IsSaturated
 
 ```go
 // 是不是饱和了
@@ -1877,7 +1877,7 @@ func IsSaturated(deployment *apps.Deployment, rs *apps.ReplicaSet) bool {
 }
 ```
 
-###### FilterActiveReplicaSets
+##### FilterActiveReplicaSets
 
 ```go
 func FilterActiveReplicaSets(replicaSets []*apps.ReplicaSet) []*apps.ReplicaSet {
@@ -1898,7 +1898,7 @@ func FilterReplicaSets(RSes []*apps.ReplicaSet, filterFn filterRS) []*apps.Repli
 }
 ```
 
-###### ReplicaSetsBySizeNewer
+##### ReplicaSetsBySizeNewer
 
 ```go
 type ReplicaSetsBySizeNewer []*apps.ReplicaSet
@@ -1913,7 +1913,7 @@ func (o ReplicaSetsBySizeNewer) Less(i, j int) bool {
 }
 ```
 
-###### GetProportion
+##### GetProportion
 
 ```go
 // 获取新的 Deployment Replica 数量占当前 ReplicaSet 数量的比例
@@ -1962,7 +1962,7 @@ func getReplicaSetFraction(logger klog.Logger, rs apps.ReplicaSet, d apps.Deploy
 
 
 
-##### getRollbackTo
+#### getRollbackTo
 
 ```GO
 func getRollbackTo(d *apps.Deployment) *extensions.RollbackConfig {
@@ -1984,7 +1984,7 @@ func getRollbackTo(d *apps.Deployment) *extensions.RollbackConfig {
 const DeprecatedRollbackTo           = "deprecated.deployment.rollback.to"
 ```
 
-#### rollback
+### rollback
 
 ```go
 func (dc *DeploymentController) rollback(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) error {
@@ -2035,7 +2035,7 @@ func (dc *DeploymentController) rollback(ctx context.Context, d *apps.Deployment
 
 ```
 
-###### LastRevision
+#### LastRevision
 
 ```go
 func LastRevision(allRSs []*apps.ReplicaSet) int64 {
@@ -2061,7 +2061,7 @@ func LastRevision(allRSs []*apps.ReplicaSet) int64 {
 
 ```
 
-###### emitRollbackWarningEvent
+#### emitRollbackWarningEvent
 
 ```GO
 func (dc *DeploymentController) emitRollbackWarningEvent(d *apps.Deployment, reason, message string) {
@@ -2069,7 +2069,7 @@ func (dc *DeploymentController) emitRollbackWarningEvent(d *apps.Deployment, rea
 }
 ```
 
-###### updateDeploymentAndClearRollbackTo
+#### updateDeploymentAndClearRollbackTo
 
 ```GO
 func (dc *DeploymentController) updateDeploymentAndClearRollbackTo(ctx context.Context, d *apps.Deployment) error {
@@ -2082,7 +2082,7 @@ func (dc *DeploymentController) updateDeploymentAndClearRollbackTo(ctx context.C
 
 ```
 
-###### setRollbackTo
+#### setRollbackTo
 
 ```GO
 func setRollbackTo(d *apps.Deployment, rollbackTo *extensions.RollbackConfig) {
@@ -2097,7 +2097,7 @@ func setRollbackTo(d *apps.Deployment, rollbackTo *extensions.RollbackConfig) {
 }
 ```
 
-###### Revision
+#### Revision
 
 ```GO
 func Revision(obj runtime.Object) (int64, error) {
@@ -2114,7 +2114,7 @@ func Revision(obj runtime.Object) (int64, error) {
 
 ```
 
-###### rollbackToTemplate
+#### rollbackToTemplate
 
 ```GO
 func (dc *DeploymentController) rollbackToTemplate(ctx context.Context, d *apps.Deployment, rs *apps.ReplicaSet) (bool, error) {
@@ -2140,7 +2140,7 @@ func (dc *DeploymentController) rollbackToTemplate(ctx context.Context, d *apps.
 }
 ```
 
-###### SetFromReplicaSetTemplate
+#### SetFromReplicaSetTemplate
 
 ```GO
 func SetFromReplicaSetTemplate(deployment *apps.Deployment, template v1.PodTemplateSpec) *apps.Deployment {
@@ -2154,7 +2154,7 @@ func SetFromReplicaSetTemplate(deployment *apps.Deployment, template v1.PodTempl
 
 ```
 
-###### updateDeploymentAndClearRollbackTo
+#### updateDeploymentAndClearRollbackTo
 
 ```GO
 func SetDeploymentAnnotationsTo(deployment *apps.Deployment, rollbackToRS *apps.ReplicaSet) {
@@ -2171,7 +2171,7 @@ func skipCopyAnnotation(key string) bool {
 }
 ```
 
-###### emitRollbackNormalEvent
+#### emitRollbackNormalEvent
 
 ```GO
 func (dc *DeploymentController) emitRollbackNormalEvent(d *apps.Deployment, message string) {
@@ -2179,7 +2179,7 @@ func (dc *DeploymentController) emitRollbackNormalEvent(d *apps.Deployment, mess
 }
 ```
 
-#### isScalingEvent
+### isScalingEvent
 
 ```GO
 func (dc *DeploymentController) isScalingEvent(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) (bool, error) {
@@ -2208,7 +2208,7 @@ func (dc *DeploymentController) isScalingEvent(ctx context.Context, d *apps.Depl
 
 ```
 
-##### GetDesiredReplicasAnnotation
+#### GetDesiredReplicasAnnotation
 
 ```GO
 func GetDesiredReplicasAnnotation(logger klog.Logger, rs *apps.ReplicaSet) (int32, bool) {
@@ -2566,5 +2566,226 @@ func (dc *DeploymentController) requeueStuckDeployment(ctx context.Context, d *a
     return after
 }
 
+```
+
+### rolloutRolling
+
+```GO
+func (dc *DeploymentController) rolloutRolling(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) error {
+    // 获取所有的 ReplicaSet，并同步修订版本
+    newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, true)
+    if err != nil {
+        return err
+    }
+    allRSs := append(oldRSs, newRS)
+
+    // 如果可以，进行扩容
+    scaledUp, err := dc.reconcileNewReplicaSet(ctx, allRSs, newRS, d)
+    if err != nil {
+        return err
+    }
+    if scaledUp {
+        // 更新 DeploymentStatus
+        return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+    }
+
+    // 如果可以，进行缩容
+    scaledDown, err := dc.reconcileOldReplicaSets(ctx, allRSs, controller.FilterActiveReplicaSets(oldRSs), newRS, d)
+    if err != nil {
+        return err
+    }
+    if scaledDown {
+        // 更新 DeploymentStatus
+        return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+    }
+
+    // 如果 Deployment 完成，则清理旧的 ReplicaSet
+    if deploymentutil.DeploymentComplete(d, &d.Status) {
+        if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
+            return err
+        }
+    }
+
+    // 同步 Deployment 的状态
+    return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+}
+
+```
+
+#### reconcileNewReplicaSet
+
+```GO
+func (dc *DeploymentController) reconcileNewReplicaSet(ctx context.Context, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
+    // 如果新 ReplicaSet 的副本数量与 Deployment 的副本数量相等，则无需扩容
+    if *(newRS.Spec.Replicas) == *(deployment.Spec.Replicas) {
+        // 不需要扩容。
+        return false, nil
+    }
+    // 如果新 ReplicaSet 的副本数量大于 Deployment 的副本数量，则进行缩容
+    if *(newRS.Spec.Replicas) > *(deployment.Spec.Replicas) {
+        // 缩容。
+        scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, *(deployment.Spec.Replicas), deployment)
+        return scaled, err
+    }
+    // 否则，计算新 ReplicaSet 的副本数量，并进行扩容
+    newReplicasCount, err := deploymentutil.NewRSNewReplicas(deployment, allRSs, newRS)
+    if err != nil {
+        return false, err
+    }
+    scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, newReplicasCount, deployment)
+    return scaled, err
+}
+
+```
+
+##### NewRSNewReplicas
+
+```GO
+func NewRSNewReplicas(deployment *apps.Deployment, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet) (int32, error) {
+    switch deployment.Spec.Strategy.Type {
+    // 对于 RollingUpdate 策略
+    case apps.RollingUpdateDeploymentStrategyType:
+        // 检查是否可以扩容
+        maxSurge, err := intstrutil.GetScaledValueFromIntOrPercent(deployment.Spec.Strategy.RollingUpdate.MaxSurge, int(*(deployment.Spec.Replicas)), true)
+        if err != nil {
+            return 0, err
+        }
+        // 找到所有 ReplicaSet 中的 pod 总数
+        currentPodCount := GetReplicaCountForReplicaSets(allRSs)
+        maxTotalPods := *(deployment.Spec.Replicas) + int32(maxSurge)
+        if currentPodCount >= maxTotalPods {
+            // 无法扩容
+            return *(newRS.Spec.Replicas), nil
+        }
+        // 进行扩容
+        scaleUpCount := maxTotalPods - currentPodCount
+        // 不超过所需副本数量
+        scaleUpCount = int32(integer.IntMin(int(scaleUpCount), int(*(deployment.Spec.Replicas)-*(newRS.Spec.Replicas))))
+        return *(newRS.Spec.Replicas) + scaleUpCount, nil
+    // 对于 Recreate 策略
+    case apps.RecreateDeploymentStrategyType:
+        return *(deployment.Spec.Replicas), nil
+    default:
+        return 0, fmt.Errorf("deployment type %v isn't supported", deployment.Spec.Strategy.Type)
+    }
+}
+
+```
+
+#### reconcileOldReplicaSets
+
+```GO
+func (dc *DeploymentController) reconcileOldReplicaSets(ctx context.Context, allRSs []*apps.ReplicaSet, oldRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
+	logger := klog.FromContext(ctx)
+	oldPodsCount := deploymentutil.GetReplicaCountForReplicaSets(oldRSs)
+	if oldPodsCount == 0 {
+		// 无法再进行缩容
+		return false, nil
+	}
+	allPodsCount := deploymentutil.GetReplicaCountForReplicaSets(allRSs)
+	logger.V(4).Info("New replica set", "replicaSet", klog.KObj(newRS), "availableReplicas", newRS.Status.AvailableReplicas)
+	maxUnavailable := deploymentutil.MaxUnavailable(*deployment)
+
+	// 检查是否可以进行缩容。有两种情况可以进行缩容：
+    // * 一些旧的 ReplicaSet 中有不健康的 pod，我们可以安全地缩小这些不健康的 pod，因为这不会进一步增加不可用性。
+    // * 新 ReplicaSet 已经扩容，并且其 pod 已经准备就绪，那么我们可以进一步缩小旧的 ReplicaSet。
+    //
+    // maxScaledDown := allPodsCount - minAvailable - newReplicaSetPodsUnavailable
+    // 考虑到不仅要考虑 maxUnavailable 和已创建的任何 surge pod，还要考虑来自 newRS 的不可用 pod，以便 newRS 中的不可用 pod 不会让我们进一步缩小旧的 ReplicaSet（这会增加不可用性）。
+    //
+    // 具体例子：
+    //
+    // * 10 个副本
+    // * 2 maxUnavailable（绝对数，不是百分比）
+    // * 3 maxSurge（绝对数，不是百分比）
+    //
+    // 情况 1：
+    // * 更新 Deployment，创建新的 ReplicaSet，3 个副本，旧 ReplicaSet 缩小到 8，新 ReplicaSet 扩大到 5。
+    // * 新的 ReplicaSet 的 pod 崩溃，永远无法变为可用状态。
+    // * allPodsCount 是 13。minAvailable 是 8。newRSPodsUnavailable 是 5。
+    // * 节点故障，导致一个旧 ReplicaSet 的 pod 不可用。然而，13-8-5 = 0，因此旧的 ReplicaSet 不会缩小。
+    // * 用户注意到崩溃，并执行 kubectl rollout undo 进行回滚。
+    // * newRSPodsUnavailable 为 1，因为我们回滚到了好的 ReplicaSet，所以 maxScaledDown = 13-8-1 = 4。将关闭 4 个崩溃的 pod。
+    // * 然后总 pod 数将是 9，新 ReplicaSet 可以扩大到 10。
+    //
+    // 情况 2：
+    // 与上面相同的例子，但是推送了一个新的 pod 模板而不是回滚（称为“roll over”）：
+    // * 创建的新 ReplicaSet 必须从 0 个副本开始，因为 allPodsCount 已经是 13。
+    // * 然而，newRSPodsUnavailable 也将为 0，因此可以将 2 个旧 ReplicaSet 缩小 5（13-8-0），然后
+    // 可以将新的 ReplicaSet 扩大 5。
+	minAvailable := *(deployment.Spec.Replicas) - maxUnavailable
+	newRSUnavailablePodCount := *(newRS.Spec.Replicas) - newRS.Status.AvailableReplicas
+	maxScaledDown := allPodsCount - minAvailable - newRSUnavailablePodCount
+	if maxScaledDown <= 0 {
+		return false, nil
+	}
+
+	// 首先清理不健康的 pod，否则不健康的 pod 将阻塞部署并导致超时。请参阅 	
+    // https://github.com/kubernetes/kubernetes/issues/16737
+	oldRSs, cleanupCount, err := dc.cleanupUnhealthyReplicas(ctx, oldRSs, deployment, maxScaledDown)
+	if err != nil {
+		return false, nil
+	}
+	logger.V(4).Info("Cleaned up unhealthy replicas from old RSes", "count", cleanupCount)
+
+	// 缩小旧的 ReplicaSet，需要检查 maxUnavailable 以确保可以缩小
+	allRSs = append(oldRSs, newRS)
+	scaledDownCount, err := dc.scaleDownOldReplicaSetsForRollingUpdate(ctx, allRSs, oldRSs, deployment)
+	if err != nil {
+		return false, nil
+	}
+	logger.V(4).Info("Scaled down old RSes", "deployment", klog.KObj(deployment), "count", scaledDownCount)
+
+	totalScaledDown := cleanupCount + scaledDownCount
+	return totalScaledDown > 0, nil
+}
+```
+
+##### scaleDownOldReplicaSetsForRollingUpdate
+
+```go
+func (dc *DeploymentController) scaleDownOldReplicaSetsForRollingUpdate(ctx context.Context, allRSs []*apps.ReplicaSet, oldRSs []*apps.ReplicaSet, deployment *apps.Deployment) (int32, error) {
+	logger := klog.FromContext(ctx)
+	maxUnavailable := deploymentutil.MaxUnavailable(*deployment)
+
+	// 检查是否可以缩小。
+	minAvailable := *(deployment.Spec.Replicas) - maxUnavailable
+	// 查找可用 Pod 数量。
+	availablePodCount := deploymentutil.GetAvailableReplicaCountForReplicaSets(allRSs)
+	if availablePodCount <= minAvailable {
+		// 不能缩小。
+		return 0, nil
+	}
+	logger.V(4).Info("Found available pods in deployment, scaling down old RSes", "deployment", klog.KObj(deployment), "availableReplicas", availablePodCount)
+
+	sort.Sort(controller.ReplicaSetsByCreationTimestamp(oldRSs))
+
+	totalScaledDown := int32(0)
+	totalScaleDownCount := availablePodCount - minAvailable
+	for _, targetRS := range oldRSs {
+		if totalScaledDown >= totalScaleDownCount {
+			// 不需要进一步缩小。
+			break
+		}
+		if *(targetRS.Spec.Replicas) == 0 {
+			// 无法缩小该 ReplicaSet。
+			continue
+		}
+		// 缩小。
+		scaleDownCount := int32(integer.IntMin(int(*(targetRS.Spec.Replicas)), int(totalScaleDownCount-totalScaledDown)))
+		newReplicasCount := *(targetRS.Spec.Replicas) - scaleDownCount
+		if newReplicasCount > *(targetRS.Spec.Replicas) {
+			return 0, fmt.Errorf("when scaling down old RS, got invalid request to scale down %s/%s %d -> %d", targetRS.Namespace, targetRS.Name, *(targetRS.Spec.Replicas), newReplicasCount)
+		}
+		_, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, targetRS, newReplicasCount, deployment)
+		if err != nil {
+			return totalScaledDown, err
+		}
+
+		totalScaledDown += scaleDownCount
+	}
+
+	return totalScaledDown, nil
+}
 ```
 
