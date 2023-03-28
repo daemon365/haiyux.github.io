@@ -1,5 +1,5 @@
 ---
-title: Daemon Controller Code
+title: "daemon-controller 代码走读"
 subtitle:
 date: 2023-03-27T20:34:12+08:00
 draft: false
@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/controller/deployment-controller.jpg
+featuredImagePreview: /img/preview/controller/deployment-controller.jpg
 ---
 
 ## 简介
@@ -1369,6 +1369,992 @@ func (dsc *DaemonSetsController) dedupCurHistories(ctx context.Context, ds *apps
 
 	// 返回最新版本的 ControllerRevision
 	return keepCur, nil
+}
+```
+
+### updateDaemonSetStatus
+
+```GO
+func (dsc *DaemonSetsController) updateDaemonSetStatus(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, hash string, updateObservedGen bool) error {
+	logger := klog.FromContext(ctx)
+	logger.V(4).Info("Updating daemon set status")
+    // 获取所有节点与守护进程Pod的映射关系
+	nodeToDaemonPods, err := dsc.getNodesToDaemonPods(ctx, ds)
+	if err != nil {
+		return fmt.Errorf("couldn't get node to daemon pod mapping for daemon set %q: %v", ds.Name, err)
+	}
+
+	var desiredNumberScheduled, currentNumberScheduled, numberMisscheduled, numberReady, updatedNumberScheduled, numberAvailable int
+	now := dsc.failedPodsBackoff.Clock.Now()
+    // 遍历每一个节点
+	for _, node := range nodeList {
+        // 判断该节点是否应该运行守护进程Pod
+		shouldRun, _ := NodeShouldRunDaemonPod(node, ds)
+        // 获取该节点上是否有守护进程Pod
+		scheduled := len(nodeToDaemonPods[node.Name]) > 0
+
+		if shouldRun {
+            // 如果该节点上应该运行守护进程Pod，则增加期望的Pod数量
+			desiredNumberScheduled++
+			if !scheduled {
+				continue
+			}
+			// 如果该节点上有守护进程Pod，则增加当前的Pod数量
+			currentNumberScheduled++
+			// 将该节点上的守护进程Pod按创建时间排序，以最旧的Pod为准
+			daemonPods, _ := nodeToDaemonPods[node.Name]
+			sort.Sort(podByCreationTimestampAndPhase(daemonPods))
+			pod := daemonPods[0]
+			if podutil.IsPodReady(pod) {
+                // 如果Pod已经准备好，则增加已就绪Pod的数量
+				numberReady++
+				if podutil.IsPodAvailable(pod, ds.Spec.MinReadySeconds, metav1.Time{Time: now}) {
+                    // 如果Pod已经可用，则增加可用Pod的数量
+					numberAvailable++
+				}
+			}
+			// 获取模板的generation信息，并检查Pod是否已经更新
+			// 如果返回的错误为nil，则表示没有解析错误
+			// 控制器通过hash处理错误
+			generation, err := util.GetTemplateGeneration(ds)
+			if err != nil {
+				generation = nil
+			}
+			if util.IsPodUpdated(pod, hash, generation) {
+                // 如果Pod已经更新，则增加更新的Pod数量
+				updatedNumberScheduled++
+			}
+		} else {
+            // 如果该节点上不应该运行守护进程Pod，但却存在守护进程Pod，则增加错配的Pod的数量
+			if scheduled {
+				numberMisscheduled++
+			}
+		}
+	}
+    // 计算不可用的Pod的数量
+	numberUnavailable := desiredNumberScheduled - numberAvailable
+	// 将DaemonSet的状态信息存储到etcd中
+	err = storeDaemonSetStatus(ctx, dsc.kubeClient.AppsV1().DaemonSets(ds.Namespace), ds, desiredNumberScheduled, currentNumberScheduled, numberMisscheduled, numberReady, updatedNumberScheduled, numberAvailable, numberUnavailable, updateObservedGen)
+	if err != nil {
+		return fmt.Errorf("error storing status for daemon set %#v: %w", ds, err)
+	}
+
+	// 如果MinReadySeconds大于0且可用的Pod数量不等于已就绪Pod的数量，则将DaemonSet重新放入队列中
+	// 时间间隔为MinReadySeconds，以防止时钟偏差
+	if ds.Spec.MinReadySeconds > 0 && numberReady != numberAvailable {
+		dsc.enqueueDaemonSetAfter(ds, time.Duration(ds.Spec.MinReadySeconds)*time.Second)
+	}
+	return nil
+}
+```
+
+#### getNodesToDaemonPods
+
+```go
+func (dsc *DaemonSetsController) getNodesToDaemonPods(ctx context.Context, ds *apps.DaemonSet) (map[string][]*v1.Pod, error) {
+	claimedPods, err := dsc.getDaemonPods(ctx, ds)
+	if err != nil {
+		return nil, err
+	}
+	// Group Pods by Node name.
+	nodeToDaemonPods := make(map[string][]*v1.Pod)
+	logger := klog.FromContext(ctx)
+	for _, pod := range claimedPods {
+		nodeName, err := util.GetTargetNodeName(pod)
+		if err != nil {
+			logger.Info("Failed to get target node name of Pod in DaemonSet",
+				"pod", klog.KObj(pod), "daemonset", klog.KObj(ds))
+			continue
+		}
+
+		nodeToDaemonPods[nodeName] = append(nodeToDaemonPods[nodeName], pod)
+	}
+
+	return nodeToDaemonPods, nil
+}
+```
+
+##### getDaemonPods
+
+```go
+func (dsc *DaemonSetsController) getDaemonPods(ctx context.Context, ds *apps.DaemonSet) ([]*v1.Pod, error) {
+	selector, err := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
+	if err != nil {
+		return nil, err
+	}
+
+	// List all pods to include those that don't match the selector anymore but
+	// have a ControllerRef pointing to this controller.
+	pods, err := dsc.podLister.Pods(ds.Namespace).List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+	// If any adoptions are attempted, we should first recheck for deletion with
+	// an uncached quorum read sometime after listing Pods (see #42639).
+	dsNotDeleted := controller.RecheckDeletionTimestamp(func(ctx context.Context) (metav1.Object, error) {
+		fresh, err := dsc.kubeClient.AppsV1().DaemonSets(ds.Namespace).Get(ctx, ds.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if fresh.UID != ds.UID {
+			return nil, fmt.Errorf("original DaemonSet %v/%v is gone: got uid %v, wanted %v", ds.Namespace, ds.Name, fresh.UID, ds.UID)
+		}
+		return fresh, nil
+	})
+
+	// Use ControllerRefManager to adopt/orphan as needed.
+	cm := controller.NewPodControllerRefManager(dsc.podControl, ds, selector, controllerKind, dsNotDeleted)
+	return cm.ClaimPods(ctx, pods)
+}
+
+```
+
+#### IsPodReady
+
+```GO
+func IsPodReady(pod *v1.Pod) bool {
+	return IsPodReadyConditionTrue(pod.Status)
+}
+```
+
+#### IsPodAvailable
+
+```GO
+func IsPodAvailable(pod *v1.Pod, minReadySeconds int32, now metav1.Time) bool {
+	if !IsPodReady(pod) {
+		return false
+	}
+
+	c := GetPodReadyCondition(pod.Status)
+	minReadySecondsDuration := time.Duration(minReadySeconds) * time.Second
+	if minReadySeconds == 0 || (!c.LastTransitionTime.IsZero() && c.LastTransitionTime.Add(minReadySecondsDuration).Before(now.Time)) {
+		return true
+	}
+	return false
+}
+```
+
+##### GetPodReadyCondition
+
+```GO
+func GetPodReadyCondition(status v1.PodStatus) *v1.PodCondition {
+	_, condition := GetPodCondition(&status, v1.PodReady)
+	return condition
+}
+```
+
+##### GetPodCondition
+
+```GO
+func GetPodCondition(status *v1.PodStatus, conditionType v1.PodConditionType) (int, *v1.PodCondition) {
+	if status == nil {
+		return -1, nil
+	}
+	return GetPodConditionFromList(status.Conditions, conditionType)
+}
+```
+
+##### GetPodConditionFromList
+
+```GO
+func GetPodConditionFromList(conditions []v1.PodCondition, conditionType v1.PodConditionType) (int, *v1.PodCondition) {
+	if conditions == nil {
+		return -1, nil
+	}
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return i, &conditions[i]
+		}
+	}
+	return -1, nil
+}
+```
+
+#### GetTemplateGeneration
+
+```GO
+func GetTemplateGeneration(ds *apps.DaemonSet) (*int64, error) {
+	annotation, found := ds.Annotations[apps.DeprecatedTemplateGeneration]
+	if !found {
+		return nil, nil
+	}
+	generation, err := strconv.ParseInt(annotation, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &generation, nil
+}
+```
+
+#### IsPodUpdated
+
+```GO
+func IsPodUpdated(pod *v1.Pod, hash string, dsTemplateGeneration *int64) bool {
+	// Compare with hash to see if the pod is updated, need to maintain backward compatibility of templateGeneration
+	templateMatches := dsTemplateGeneration != nil &&
+		pod.Labels[extensions.DaemonSetTemplateGenerationKey] == fmt.Sprint(*dsTemplateGeneration)
+	hashMatches := len(hash) > 0 && pod.Labels[extensions.DefaultDaemonSetUniqueLabelKey] == hash
+	return hashMatches || templateMatches
+}
+```
+
+#### storeDaemonSetStatus
+
+```GO
+func storeDaemonSetStatus(
+	ctx context.Context,
+	dsClient unversionedapps.DaemonSetInterface,
+	ds *apps.DaemonSet, desiredNumberScheduled,
+	currentNumberScheduled,
+	numberMisscheduled,
+	numberReady,
+	updatedNumberScheduled,
+	numberAvailable,
+	numberUnavailable int,
+	updateObservedGen bool) error {
+    // 如果DaemonSet的状态信息没有发生变化，则直接返回
+	if int(ds.Status.DesiredNumberScheduled) == desiredNumberScheduled &&
+		int(ds.Status.CurrentNumberScheduled) == currentNumberScheduled &&
+		int(ds.Status.NumberMisscheduled) == numberMisscheduled &&
+		int(ds.Status.NumberReady) == numberReady &&
+		int(ds.Status.UpdatedNumberScheduled) == updatedNumberScheduled &&
+		int(ds.Status.NumberAvailable) == numberAvailable &&
+		int(ds.Status.NumberUnavailable) == numberUnavailable &&
+		ds.Status.ObservedGeneration >= ds.Generation {
+		return nil
+	}
+
+	toUpdate := ds.DeepCopy()
+
+	var updateErr, getErr error
+    // 使用for循环来更新状态信息
+	for i := 0; ; i++ {
+		if updateObservedGen {
+            // 如果需要更新Generation，则更新为当前Generation
+			toUpdate.Status.ObservedGeneration = ds.Generation
+		}
+        // 更新状态信息
+		toUpdate.Status.DesiredNumberScheduled = int32(desiredNumberScheduled)
+		toUpdate.Status.CurrentNumberScheduled = int32(currentNumberScheduled)
+		toUpdate.Status.NumberMisscheduled = int32(numberMisscheduled)
+		toUpdate.Status.NumberReady = int32(numberReady)
+		toUpdate.Status.UpdatedNumberScheduled = int32(updatedNumberScheduled)
+		toUpdate.Status.NumberAvailable = int32(numberAvailable)
+		toUpdate.Status.NumberUnavailable = int32(numberUnavailable)
+		// 使用UpdateStatus方法来更新状态信息
+		if _, updateErr = dsClient.UpdateStatus(ctx, toUpdate, metav1.UpdateOptions{}); updateErr == nil {
+			return nil
+		}
+
+		// 如果超过了最大的重试次数，则退出循环
+		if i >= StatusUpdateRetries {
+			break
+		}
+		// 如果更新失败，则重新获取最新的DaemonSet信息
+		if toUpdate, getErr = dsClient.Get(ctx, ds.Name, metav1.GetOptions{}); getErr != nil {
+			return getErr
+		}
+	}
+	return updateErr
+}
+```
+
+### updateDaemonSet
+
+```GO
+func (dsc *DaemonSetsController) updateDaemonSet(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, hash, key string, old []*apps.ControllerRevision) error {
+    // 调用manage方法来管理守护进程Pod
+	err := dsc.manage(ctx, ds, nodeList, hash)
+	if err != nil {
+		return err
+	}
+
+	// 如果满足预期，则进行滚动更新操作
+	if dsc.expectations.SatisfiedExpectations(key) {
+		switch ds.Spec.UpdateStrategy.Type {
+		case apps.OnDeleteDaemonSetStrategyType:
+            // 如果是OnDelete策略，则不需要进行滚动更新操作
+		case apps.RollingUpdateDaemonSetStrategyType:
+            // 如果是RollingUpdate策略，则进行滚动更新操作
+			err = dsc.rollingUpdate(ctx, ds, nodeList, hash)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	// 清理旧的ControllerRevision
+	err = dsc.cleanupHistory(ctx, ds, old)
+	if err != nil {
+		return fmt.Errorf("failed to clean up revisions of DaemonSet: %w", err)
+	}
+
+	return nil
+}
+```
+
+#### manage
+
+```GO
+func (dsc *DaemonSetsController) manage(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, hash string) error {
+	// 调用getNodesToDaemonPods方法来获取守护进程Pod映射到Node上的信息
+	nodeToDaemonPods, err := dsc.getNodesToDaemonPods(ctx, ds)
+	if err != nil {
+		return fmt.Errorf("couldn't get node to daemon pod mapping for daemon set %q: %v", ds.Name, err)
+	}
+
+	// 对于每个Node，如果Node运行了守护进程Pod但不应该运行，则删除守护进程Pod。
+	// 如果Node应该运行守护进程Pod，但不是，则在该Node上创建守护进程Pod。
+	logger := klog.FromContext(ctx)
+	var nodesNeedingDaemonPods, podsToDelete []string
+	for _, node := range nodeList {
+		nodesNeedingDaemonPodsOnNode, podsToDeleteOnNode := dsc.podsShouldBeOnNode(
+			logger, node, nodeToDaemonPods, ds, hash)
+
+		nodesNeedingDaemonPods = append(nodesNeedingDaemonPods, nodesNeedingDaemonPodsOnNode...)
+		podsToDelete = append(podsToDelete, podsToDeleteOnNode...)
+	}
+
+	// 当调度器将守护进程Pod调度到节点上时，删除分配给不存在节点的未调度Pod。
+	// 如果节点不存在，则永远不会调度Pod，也无法被PodGCController删除。
+	podsToDelete = append(podsToDelete, getUnscheduledPodsWithoutNode(nodeList, nodeToDaemonPods)...)
+
+	// 在创建新的Pod时，使用当前历史记录的哈希标签值来标记新的Pod
+	if err = dsc.syncNodes(ctx, ds, podsToDelete, nodesNeedingDaemonPods, hash); err != nil {
+		return err
+	}
+
+	return nil
+}
+```
+
+##### podsShouldBeOnNode
+
+```GO
+func (dsc *DaemonSetsController) podsShouldBeOnNode(
+	logger klog.Logger,
+	node *v1.Node,
+	nodeToDaemonPods map[string][]*v1.Pod,
+	ds *apps.DaemonSet,
+	hash string,
+) (nodesNeedingDaemonPods, podsToDelete []string) {
+	// 判断是否应该在节点上运行 daemon pod
+	shouldRun, shouldConti	nueRunning := NodeShouldRunDaemonPod(node, ds)
+    // 获取该节点上的 Daemon Pod，如果不存在则 exists = false
+	daemonPods, exists := nodeToDaemonPods[node.Name]
+
+	switch {
+        // 如果节点应该运行 Daemon Pod 但是不存在，创建 Daemon Pod
+	case shouldRun && !exists:
+		// If daemon pod is supposed to be running on node, but isn't, create daemon pod.
+		nodesNeedingDaemonPods = append(nodesNeedingDaemonPods, node.Name)
+	case shouldContinueRunning:
+		
+		var daemonPodsRunning []*v1.Pod
+		for _, pod := range daemonPods {
+            // 如果 Pod 正在被删除，跳过
+			if pod.DeletionTimestamp != nil {
+				continue
+			}
+            // 如果 Pod 处于 Failed 状态，处理 Pod 删除和回退逻辑
+			if pod.Status.Phase == v1.PodFailed {
+				// 处理回退逻辑
+				backoffKey := failedPodsBackoffKey(ds, node.Name)
+
+				now := dsc.failedPodsBackoff.Clock.Now()
+				inBackoff := dsc.failedPodsBackoff.IsInBackOffSinceUpdate(backoffKey, now)
+				if inBackoff {
+					delay := dsc.failedPodsBackoff.Get(backoffKey)
+					logger.V(4).Info("Deleting failed pod on node has been limited by backoff",
+						"pod", klog.KObj(pod), "node", klog.KObj(node), "currentDelay", delay)
+					dsc.enqueueDaemonSetAfter(ds, delay)
+					continue
+				}
+
+				dsc.failedPodsBackoff.Next(backoffKey, now)
+
+				msg := fmt.Sprintf("Found failed daemon pod %s/%s on node %s, will try to kill it", pod.Namespace, pod.Name, node.Name)
+				logger.V(2).Info("Found failed daemon pod on node, will try to kill it", "pod", klog.KObj(pod), "node", klog.KObj(node))
+				// Emit an event so that it's discoverable to users.
+				dsc.eventRecorder.Eventf(ds, v1.EventTypeWarning, FailedDaemonPodReason, msg)
+				podsToDelete = append(podsToDelete, pod.Name)
+			} else {
+                // 如果 Pod 正常运行，加入 running 数组
+				daemonPodsRunning = append(daemonPodsRunning, pod)
+			}
+		}
+
+		// 当 surge 不可用时，只保留最旧的 Pod
+		if !util.AllowsSurge(ds) {
+			if len(daemonPodsRunning) <= 1 {
+				// There are no excess pods to be pruned, and no pods to create
+				break
+			}
+
+			sort.Sort(podByCreationTimestampAndPhase(daemonPodsRunning))
+			for i := 1; i < len(daemonPodsRunning); i++ {
+				podsToDelete = append(podsToDelete, daemonPodsRunning[i].Name)
+			}
+			break
+		}
+		// 当 surge 可用时，只保留最旧的 Pod，并检查最旧的 Pod 是否准备就绪
+		if len(daemonPodsRunning) <= 1 {
+			// // There are no excess pods to be pruned
+			if len(daemonPodsRunning) == 0 && shouldRun {
+				// We are surging so we need to have at least one non-deleted pod on the node
+				nodesNeedingDaemonPods = append(nodesNeedingDaemonPods, node.Name)
+			}
+			break
+		}
+
+		// When surge is enabled, we allow 2 pods if and only if the oldest pod matching the current hash state
+		// is not ready AND the oldest pod that doesn't match the current hash state is ready. All other pods are
+		// deleted. If neither pod is ready, only the one matching the current hash revision is kept.
+		var oldestNewPod, oldestOldPod *v1.Pod
+		sort.Sort(podByCreationTimestampAndPhase(daemonPodsRunning))
+		for _, pod := range daemonPodsRunning {
+			if pod.Labels[apps.ControllerRevisionHashLabelKey] == hash {
+				if oldestNewPod == nil {
+					oldestNewPod = pod
+					continue
+				}
+			} else {
+				if oldestOldPod == nil {
+					oldestOldPod = pod
+					continue
+				}
+			}
+			podsToDelete = append(podsToDelete, pod.Name)
+		}
+		if oldestNewPod != nil && oldestOldPod != nil {
+			switch {
+                // 如果最旧的旧 Pod 不再准备就绪，将其标记为待删除
+			case !podutil.IsPodReady(oldestOldPod):
+				logger.V(5).Info("Pod from daemonset is no longer ready and will be replaced with newer pod", "oldPod", klog.KObj(oldestOldPod), "daemonset", klog.KObj(ds), "newPod", klog.KObj(oldestNewPod))
+				podsToDelete = append(podsToDelete, oldestOldPod.Name)
+                // 如果最旧的新 Pod 准备就绪，则标记旧 Pod 待删除
+			case podutil.IsPodAvailable(oldestNewPod, ds.Spec.MinReadySeconds, metav1.Time{Time: dsc.failedPodsBackoff.Clock.Now()}):
+				logger.V(5).Info("Pod from daemonset is now ready and will replace older pod", "newPod", klog.KObj(oldestNewPod), "daemonset", klog.KObj(ds), "oldPod", klog.KObj(oldestOldPod))
+				podsToDelete = append(podsToDelete, oldestOldPod.Name)
+			}
+		}
+	// 如果不需要运行 Daemon Pod 但是已经运行，删除该节点上所有的 Daemon Pod
+	case !shouldContinueRunning && exists:
+		// If daemon pod isn't supposed to run on node, but it is, delete all daemon pods on node.
+		for _, pod := range daemonPods {
+			if pod.DeletionTimestamp != nil {
+				continue
+			}
+			podsToDelete = append(podsToDelete, pod.Name)
+		}
+	}
+
+	return nodesNeedingDaemonPods, podsToDelete
+}
+```
+
+###### AllowsSurge
+
+```GO
+func AllowsSurge(ds *apps.DaemonSet) bool {
+	maxSurge, err := SurgeCount(ds, 1)
+	return err == nil && maxSurge > 0
+}
+```
+
+##### getUnscheduledPodsWithoutNode
+
+```GO
+// 获取没有被调度到任何节点上的 Pod 的名称
+func getUnscheduledPodsWithoutNode(runningNodesList []*v1.Node, nodeToDaemonPods map[string][]*v1.Pod) []string {
+	var results []string
+	isNodeRunning := make(map[string]bool)
+
+	// 标记正在运行的节点
+	for _, node := range runningNodesList {
+		isNodeRunning[node.Name] = true
+	}
+
+	// 获取未调度到任何节点的 Pod 名称
+	for n, pods := range nodeToDaemonPods {
+		if isNodeRunning[n] {
+			continue
+		}
+		for _, pod := range pods {
+			if len(pod.Spec.NodeName) == 0 {
+				results = append(results, pod.Name)
+			}
+		}
+	}
+
+	return results
+}
+```
+
+##### syncNodes
+
+```GO
+func (dsc *DaemonSetsController) syncNodes(ctx context.Context, ds *apps.DaemonSet, podsToDelete, nodesNeedingDaemonPods []string, hash string) error {
+	// We need to set expectations before creating/deleting pods to avoid race conditions.
+	logger := klog.FromContext(ctx)
+	dsKey, err := controller.KeyFunc(ds)
+	if err != nil {
+		return fmt.Errorf("couldn't get key for object %#v: %v", ds, err)
+	}
+	
+    // 设置期望值，以避免创建/删除 Pod 时出现竞争条件
+	createDiff := len(nodesNeedingDaemonPods)
+	deleteDiff := len(podsToDelete)
+
+	if createDiff > dsc.burstReplicas {
+		createDiff = dsc.burstReplicas
+	}
+	if deleteDiff > dsc.burstReplicas {
+		deleteDiff = dsc.burstReplicas
+	}
+
+	dsc.expectations.SetExpectations(dsKey, createDiff, deleteDiff)
+
+	// 创建/删除 Pod 的错误 channel，足够大以避免阻塞
+	errCh := make(chan error, createDiff+deleteDiff)
+
+	logger.V(4).Info("Nodes needing daemon pods for daemon set, creating", "daemonset", klog.KObj(ds), "needCount", nodesNeedingDaemonPods, "createCount", createDiff)
+	createWait := sync.WaitGroup{}
+	// 如果返回的错误不为 nil，则有一个解析错误。
+	// 控制器会通过哈希来处理这个问题。
+	generation, err := util.GetTemplateGeneration(ds)
+	if err != nil {
+		generation = nil
+	}
+	template := util.CreatePodTemplate(ds.Spec.Template, generation, hash)
+	// 批量创建 Pod。批量大小从 SlowStartInitialBatchSize 开始，
+	// 并且每个成功迭代都会加倍，以一种“慢启动”的方式逐渐增加。
+	// 这样处理试图启动大量可能都会失败的 Pod 的尝试，例如：
+	// 一个低配额的项目尝试创建大量的 Pod，这将被阻止因为一个 Pod 失败后防止该项目的 API 服务滥用 Pod 创建请求。
+	batchSize := integer.IntMin(createDiff, controller.SlowStartInitialBatchSize)
+	for pos := 0; createDiff > pos; batchSize, pos = integer.IntMin(2*batchSize, createDiff-(pos+batchSize)), pos+batchSize {
+		errorCount := len(errCh)
+		createWait.Add(batchSize)
+		for i := pos; i < pos+batchSize; i++ {
+			go func(ix int) {
+				defer createWait.Done()
+
+				podTemplate := template.DeepCopy()
+				// Pod 的 NodeAffinity 将被更新以确保该 Pod 默认绑定到目标节点。
+				// 这是安全的，因为目标节点应该没有冲突的节点亲和性。
+				podTemplate.Spec.Affinity = util.ReplaceDaemonSetPodNodeNameNodeAffinity(
+					podTemplate.Spec.Affinity, nodesNeedingDaemonPods[ix])
+
+				err := dsc.podControl.CreatePods(ctx, ds.Namespace, podTemplate,
+					ds, metav1.NewControllerRef(ds, controllerKind))
+
+				if err != nil {
+					if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+						// If the namespace is being torn down, we can safely ignore
+						// this error since all subsequent creations will fail.
+						return
+					}
+				}
+				if err != nil {
+					logger.V(2).Info("Failed creation, decrementing expectations for daemon set", "daemonset", klog.KObj(ds))
+					dsc.expectations.CreationObserved(dsKey)
+					errCh <- err
+					utilruntime.HandleError(err)
+				}
+			}(i)
+		}
+		createWait.Wait()
+		// any skipped pods that we never attempted to start shouldn't be expected.
+		skippedPods := createDiff - (batchSize + pos)
+		if errorCount < len(errCh) && skippedPods > 0 {
+			logger.V(2).Info("Slow-start failure. Skipping creation pods, decrementing expectations for daemon set", "skippedPods", skippedPods, "daemonset", klog.KObj(ds))
+			dsc.expectations.LowerExpectations(dsKey, skippedPods, 0)
+			// The skipped pods will be retried later. The next controller resync will
+			// retry the slow start process.
+			break
+		}
+	}
+
+	logger.V(4).Info("Pods to delete for daemon set, deleting", "daemonset", klog.KObj(ds), "toDeleteCount", podsToDelete, "deleteCount", deleteDiff)
+	deleteWait := sync.WaitGroup{}
+	deleteWait.Add(deleteDiff)
+	for i := 0; i < deleteDiff; i++ {
+		go func(ix int) {
+			defer deleteWait.Done()
+            // 删除pod
+			if err := dsc.podControl.DeletePod(ctx, ds.Namespace, podsToDelete[ix], ds); err != nil {
+				dsc.expectations.DeletionObserved(dsKey)
+				if !apierrors.IsNotFound(err) {
+					logger.V(2).Info("Failed deletion, decremented expectations for daemon set", "daemonset", klog.KObj(ds))
+					errCh <- err
+					utilruntime.HandleError(err)
+				}
+			}
+		}(i)
+	}
+	deleteWait.Wait()
+
+	// collect errors if any for proper reporting/retry logic in the controller
+	errors := []error{}
+	close(errCh)
+	for err := range errCh {
+		errors = append(errors, err)
+	}
+	return utilerrors.NewAggregate(errors)
+}
+```
+
+###### CreatePodTemplate
+
+```GO
+func CreatePodTemplate(template v1.PodTemplateSpec, generation *int64, hash string) v1.PodTemplateSpec {
+	newTemplate := *template.DeepCopy()
+
+	AddOrUpdateDaemonPodTolerations(&newTemplate.Spec)
+
+	if newTemplate.ObjectMeta.Labels == nil {
+		newTemplate.ObjectMeta.Labels = make(map[string]string)
+	}
+	if generation != nil {
+		newTemplate.ObjectMeta.Labels[extensions.DaemonSetTemplateGenerationKey] = fmt.Sprint(*generation)
+	}
+	// TODO: do we need to validate if the DaemonSet is RollingUpdate or not?
+	if len(hash) > 0 {
+		newTemplate.ObjectMeta.Labels[extensions.DefaultDaemonSetUniqueLabelKey] = hash
+	}
+	return newTemplate
+}
+
+```
+
+###### ReplaceDaemonSetPodNodeNameNodeAffinity
+
+```GO
+func ReplaceDaemonSetPodNodeNameNodeAffinity(affinity *v1.Affinity, nodename string) *v1.Affinity {
+	nodeSelReq := v1.NodeSelectorRequirement{
+		Key:      metav1.ObjectNameField,
+		Operator: v1.NodeSelectorOpIn,
+		Values:   []string{nodename},
+	}
+
+	nodeSelector := &v1.NodeSelector{
+		NodeSelectorTerms: []v1.NodeSelectorTerm{
+			{
+				MatchFields: []v1.NodeSelectorRequirement{nodeSelReq},
+			},
+		},
+	}
+
+	if affinity == nil {
+		return &v1.Affinity{
+			NodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: nodeSelector,
+			},
+		}
+	}
+
+	if affinity.NodeAffinity == nil {
+		affinity.NodeAffinity = &v1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: nodeSelector,
+		}
+		return affinity
+	}
+
+	nodeAffinity := affinity.NodeAffinity
+
+	if nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nodeSelector
+		return affinity
+	}
+
+	// Replace node selector with the new one.
+	nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = []v1.NodeSelectorTerm{
+		{
+			MatchFields: []v1.NodeSelectorRequirement{nodeSelReq},
+		},
+	}
+
+	return affinity
+}
+
+```
+
+#### rollingUpdate
+
+```GO
+func (dsc *DaemonSetsController) rollingUpdate(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, hash string) error {
+	logger := klog.FromContext(ctx)
+    // 获取节点和对应的 DaemonPod 映射关系
+	nodeToDaemonPods, err := dsc.getNodesToDaemonPods(ctx, ds)
+	if err != nil {
+		return fmt.Errorf("couldn't get node to daemon pod mapping for daemon set %q: %v", ds.Name, err)
+	}
+    // 获取新旧 pod 数量变化后的最大增长/减少数
+	maxSurge, maxUnavailable, err := dsc.updatedDesiredNodeCounts(ctx, ds, nodeList, nodeToDaemonPods)
+	if err != nil {
+		return fmt.Errorf("couldn't get unavailable numbers: %v", err)
+	}
+
+	now := dsc.failedPodsBackoff.Clock.Now()
+	// 当 maxSurge 为 0 时，仅删除足够数量的旧 pod，以保证 unavailable 数量不超过 maxUnavailable，让控制器循环逻辑去创建新 pod
+	// 需满足的条件：
+	// * 控制器循环逻辑在同一节点上最多创建一个 pod
+	// * 控制器循环逻辑将会创建新的 pod
+	// * 控制器循环逻辑将会处理失败的 pod
+	// * 已删除的 pod 不计入 unavailable 数量，以便在节点不可用时更新能够进行
+	// 不变量：
+	// * 不可用的新 pod 数量必须小于 maxUnavailable
+	// * 若节点上有可用的旧 pod，该节点是删除的候选节点（若不违反其他不变量）
+	//
+	if maxSurge == 0 {
+		var numUnavailable int
+		var allowedReplacementPods []string
+		var candidatePodsToDelete []string
+		for nodeName, pods := range nodeToDaemonPods {
+			newPod, oldPod, ok := findUpdatedPodsOnNode(ds, pods, hash)
+			if !ok {
+				// 让控制器循环逻辑去处理此节点，将其视为 unavailable 节点
+				logger.V(3).Info("DaemonSet has excess pods on node, skipping to allow the core loop to process", "daemonset", klog.KObj(ds), "node", klog.KRef("", nodeName))
+				numUnavailable++
+				continue
+			}
+			switch {
+			case oldPod == nil && newPod == nil, oldPod != nil && newPod != nil:
+				// 控制器循环逻辑将会创建或删除相应的 pod，将其视为 unavailable
+				numUnavailable++
+			case newPod != nil:
+				// 此 pod 是最新的，检查其可用性
+				if !podutil.IsPodAvailable(newPod, ds.Spec.MinReadySeconds, metav1.Time{Time: now}) {
+					// 不可用的新 pod 将计入 maxUnavailable
+					numUnavailable++
+				}
+			default:
+				// 此 pod 是旧的，是更新的候选节点
+				switch {
+				case !podutil.IsPodAvailable(oldPod, ds.Spec.MinReadySeconds, metav1.Time{Time: now}):
+					// 旧 pod 不可用，因此需要将其替换
+					logger.V(5).Info("DaemonSet pod on node is out of date and not available, allowing replacement", "daemonset", klog.KObj(ds), "pod", klog.KObj(oldPod), "node", klog.KRef("", nodeName))
+					// 记录替换 pod
+					if allowedReplacementPods == nil {
+						allowedReplacementPods = make([]string, 0, len(nodeToDaemonPods))
+					}
+					allowedReplacementPods = append(allowedReplacementPods, oldPod.Name)
+				case numUnavailable >= maxUnavailable:
+					// 不考虑其他候选节点
+					continue
+				default:
+					logger.V(5).Info("DaemonSet pod on node is out of date, this is a candidate to replace", "daemonset", klog.KObj(ds), "pod", klog.KObj(oldPod), "node", klog.KRef("", nodeName))
+					// 记录候选节点
+					if candidatePodsToDelete == nil {
+						candidatePodsToDelete = make([]string, 0, maxUnavailable)
+					}
+					candidatePodsToDelete = append(candidatePodsToDelete, oldPod.Name)
+				}
+			}
+		}
+
+		// 使用任何可用的候选节点，包括 allowedReplacementPods
+		logger.V(5).Info("DaemonSet allowing replacements", "daemonset", klog.KObj(ds), "replacements", len(allowedReplacementPods), "maxUnavailable", maxUnavailable, "numUnavailable", numUnavailable, "candidates", len(candidatePodsToDelete))
+		remainingUnavailable := maxUnavailable - numUnavailable
+		if remainingUnavailable < 0 {
+			remainingUnavailable = 0
+		}
+		if max := len(candidatePodsToDelete); remainingUnavailable > max {
+			remainingUnavailable = max
+		}
+		oldPodsToDelete := append(allowedReplacementPods, candidatePodsToDelete[:remainingUnavailable]...)
+
+		return dsc.syncNodes(ctx, ds, oldPodsToDelete, nil, hash)
+	}
+	
+    // 当 maxSurge 不为 0 时，当旧 pod 不可用时，创建新的 pod；每次最多创建 maxSurge 个新 pod
+    // 需满足的条件：
+    // * 控制器循环逻辑在同一节点上最多创建两个 pod，一个旧的，一个新的
+    // * 控制器循环逻辑在节点上没有 pod 时将会创建新的 pod
+    // * 控制器循环逻辑将会处理失败的 pod
+    // * 已删除的 pod 不计入 unavailable 数量，以便在节点不可用时更新能够进行
+    // 不变量：
+    // * 具有不可用的旧 pod 的节点是立即创建新 pod 的候选节点
+    // * 若有可用的新 pod，则删除旧的可用 pod
+    // * 任何时候旧可用 pod 上创建的新 pod 不超过 maxSurge 个
+    //
+	var oldPodsToDelete []string
+	var candidateNewNodes []string
+	var allowedNewNodes []string
+	var numSurge int
+
+	for nodeName, pods := range nodeToDaemonPods {
+		newPod, oldPod, ok := findUpdatedPodsOnNode(ds, pods, hash)
+		if !ok {
+			// 让控制器循环清理此节点，并将其视为 surge 节点
+			logger.V(3).Info("DaemonSet has excess pods on node, skipping to allow the core loop to process", "daemonset", klog.KObj(ds), "node", klog.KRef("", nodeName))
+			numSurge++
+			continue
+		}
+		switch {
+		case oldPod == nil:
+			// 不需要对此节点做任何操作，让控制器循环处理即可
+		case newPod == nil:
+			// 这是 surge 候选节点
+			switch {
+			case !podutil.IsPodAvailable(oldPod, ds.Spec.MinReadySeconds, metav1.Time{Time: now}):
+				// 旧 pod 不可用，因此允许其成为替换 pod
+				logger.V(5).Info("Pod on node is out of date and not available, allowing replacement", "daemonset", klog.KObj(ds), "pod", klog.KObj(oldPod), "node", klog.KRef("", nodeName))
+				// 记录替换节点
+				if allowedNewNodes == nil {
+					allowedNewNodes = make([]string, 0, len(nodeToDaemonPods))
+				}
+				allowedNewNodes = append(allowedNewNodes, nodeName)
+			case numSurge >= maxSurge:
+				// 不考虑其他候选节点
+				continue
+			default:
+				logger.V(5).Info("DaemonSet pod on node is out of date, this is a surge candidate", "daemonset", klog.KObj(ds), "pod", klog.KObj(oldPod), "node", klog.KRef("", nodeName))
+				// 记录候选节点
+				if candidateNewNodes == nil {
+					candidateNewNodes = make([]string, 0, maxSurge)
+				}
+				candidateNewNodes = append(candidateNewNodes, nodeName)
+			}
+		default:
+			// 已经在此节点上进行 surge，确定我们的状态
+			if !podutil.IsPodAvailable(newPod, ds.Spec.MinReadySeconds, metav1.Time{Time: now}) {
+				// 我们正在等待此处可用
+				numSurge++
+				continue
+			}
+			// 我们可用，删除旧 pod
+			logger.V(5).Info("DaemonSet pod on node is available, remove old pod", "daemonset", klog.KObj(ds), "newPod", klog.KObj(newPod), "node", nodeName, "oldPod", klog.KObj(oldPod))
+			oldPodsToDelete = append(oldPodsToDelete, oldPod.Name)
+		}
+	}
+
+	// 使用任何可用的候选节点，包括 allowedNewNodes
+	logger.V(5).Info("DaemonSet allowing replacements", "daemonset", klog.KObj(ds), "replacements", len(allowedNewNodes), "maxSurge", maxSurge, "numSurge", numSurge, "candidates", len(candidateNewNodes))
+	remainingSurge := maxSurge - numSurge
+	if remainingSurge < 0 {
+		remainingSurge = 0
+	}
+	if max := len(candidateNewNodes); remainingSurge > max {
+		remainingSurge = max
+	}
+	newNodesToCreate := append(allowedNewNodes, candidateNewNodes[:remainingSurge]...)
+
+	return dsc.syncNodes(ctx, ds, oldPodsToDelete, newNodesToCreate, hash)
+}
+```
+
+##### updatedDesiredNodeCounts
+
+```go
+// 更新期望的节点计数
+func (dsc *DaemonSetsController) updatedDesiredNodeCounts(ctx context.Context, ds *apps.DaemonSet, nodeList []*v1.Node, nodeToDaemonPods map[string][]*v1.Pod) (int, int, error) {
+	var desiredNumberScheduled int
+	logger := klog.FromContext(ctx)
+	for i := range nodeList {
+		node := nodeList[i]
+		wantToRun, _ := NodeShouldRunDaemonPod(node, ds)
+		if !wantToRun {
+			continue
+		}
+		desiredNumberScheduled++
+
+		if _, exists := nodeToDaemonPods[node.Name]; !exists {
+			nodeToDaemonPods[node.Name] = nil
+		}
+	}
+
+	maxUnavailable, err := util.UnavailableCount(ds, desiredNumberScheduled)
+	if err != nil {
+		return -1, -1, fmt.Errorf("invalid value for MaxUnavailable: %v", err)
+	}
+
+	maxSurge, err := util.SurgeCount(ds, desiredNumberScheduled)
+	if err != nil {
+		return -1, -1, fmt.Errorf("invalid value for MaxSurge: %v", err)
+	}
+
+	// 如果 DaemonSet 的配置不可能，遵守默认值，即 unavailable=1（当 API Server 对 Surge 和 Unavailable 均返回 0 时）
+	if desiredNumberScheduled > 0 && maxUnavailable == 0 && maxSurge == 0 {
+		logger.Info("DaemonSet is not configured for surge or unavailability, defaulting to accepting unavailability", "daemonset", klog.KObj(ds))
+		maxUnavailable = 1
+	}
+	logger.V(5).Info("DaemonSet with maxSurge and maxUnavailable", "daemonset", klog.KObj(ds), "maxSurge", maxSurge, "maxUnavailable", maxUnavailable)
+	return maxSurge, maxUnavailable, nil
+}
+```
+
+##### findUpdatedPodsOnNode
+
+```go
+// 在节点上查找更新的 Pod，返回新 Pod、旧 Pod 和是否存在更新的标志
+func findUpdatedPodsOnNode(ds *apps.DaemonSet, podsOnNode []*v1.Pod, hash string) (newPod, oldPod *v1.Pod, ok bool) {
+	for _, pod := range podsOnNode {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		generation, err := util.GetTemplateGeneration(ds)
+		if err != nil {
+			generation = nil
+		}
+		if util.IsPodUpdated(pod, hash, generation) {
+			if newPod != nil {
+				return nil, nil, false
+			}
+			newPod = pod
+		} else {
+			if oldPod != nil {
+				return nil, nil, false
+			}
+			oldPod = pod
+		}
+	}
+	return newPod, oldPod, true
+}
+```
+
+#### cleanupHistory
+
+```go
+// 清理旧的控制器修订记录
+func (dsc *DaemonSetsController) cleanupHistory(ctx context.Context, ds *apps.DaemonSet, old []*apps.ControllerRevision) error {
+	nodesToDaemonPods, err := dsc.getNodesToDaemonPods(ctx, ds)
+	if err != nil {
+		return fmt.Errorf("couldn't get node to daemon pod mapping for daemon set %q: %v", ds.Name, err)
+	}
+
+	toKeep := int(*ds.Spec.RevisionHistoryLimit)
+	toKill := len(old) - toKeep
+	if toKill <= 0 {
+		return nil
+	}
+
+	// Find all hashes of live pods
+	liveHashes := make(map[string]bool)
+	for _, pods := range nodesToDaemonPods {
+		for _, pod := range pods {
+			if hash := pod.Labels[apps.DefaultDaemonSetUniqueLabelKey]; len(hash) > 0 {
+				liveHashes[hash] = true
+			}
+		}
+	}
+
+	// Clean up old history from smallest to highest revision (from oldest to newest)
+	sort.Sort(historiesByRevision(old))
+	for _, history := range old {
+		if toKill <= 0 {
+			break
+		}
+		if hash := history.Labels[apps.DefaultDaemonSetUniqueLabelKey]; liveHashes[hash] {
+			continue
+		}
+		// Clean up
+		err := dsc.kubeClient.AppsV1().ControllerRevisions(ds.Namespace).Delete(ctx, history.Name, metav1.DeleteOptions{})
+		if err != nil {
+			return err
+		}
+		toKill--
+	}
+	return nil
 }
 ```
 
