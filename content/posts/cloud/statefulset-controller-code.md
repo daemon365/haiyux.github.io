@@ -964,12 +964,345 @@ func NewStatefulPodControl(
 }
 ````
 
+### CreateStatefulPod
+
 ````go
+func (spc *StatefulPodControl) CreateStatefulPod(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) error {
+	// 在创建Pod之前先创建Pod的PVCs
+	if err := spc.createPersistentVolumeClaims(set, pod); err != nil {
+        // 记录Pod创建事件，包括事件类型（create）、StatefulSet、Pod以及错误信息
+		spc.recordPodEvent("create", set, pod, err)
+		return err
+	}
+	// 如果我们已经创建了PVCs，则尝试创建Pod
+	err := spc.objectMgr.CreatePod(ctx, pod)
+	// sink already exists errors
+	if apierrors.IsAlreadyExists(err) {
+		return err
+	}
+    // 如果StatefulSetAutoDeletePVC功能已启用，则在此时尽可能设置PVC策略
+	if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetAutoDeletePVC) {
+		// Set PVC policy as much as is possible at this point.
+		if err := spc.UpdatePodClaimForRetentionPolicy(ctx, set, pod); err != nil {
+			spc.recordPodEvent("update", set, pod, err)
+			return err
+		}
+	}
+	spc.recordPodEvent("create", set, pod, err)
+	return err
+}
 ````
 
+### UpdateStatefulPod
 
+```go
+func (spc *StatefulPodControl) UpdateStatefulPod(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) error {
+	attemptedUpdate := false
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		// 假设Pod是一致的
+		consistent := true
+		// 如果Pod不符合其标识符，则更新标识符并污染Pod
+		if !identityMatches(set, pod) {
+			updateIdentity(set, pod)
+			consistent = false
+		}
+		// 如果Pod不符合StatefulSet的存储要求，则更新Pod的PVC，污染Pod，并创建任何丢失的PVC
+		if !storageMatches(set, pod) {
+			updateStorage(set, pod)
+			consistent = false
+			if err := spc.createPersistentVolumeClaims(set, pod); err != nil {
+                // 记录更新Pod的PVC的事件，包括事件类型（update）、StatefulSet、Pod以及错误信息
+				spc.recordPodEvent("update", set, pod, err)
+				return err
+			}
+		}
+		if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetAutoDeletePVC) {
+			// 如果StatefulSetAutoDeletePVC功能已启用，则检查Pod的PVC是否与StatefulSet的PVC删除策略一致
+			if match, err := spc.ClaimsMatchRetentionPolicy(ctx, set, pod); err != nil {
+				spc.recordPodEvent("update", set, pod, err)
+				return err
+			} else if !match {
+				if err := spc.UpdatePodClaimForRetentionPolicy(ctx, set, pod); err != nil {
+					spc.recordPodEvent("update", set, pod, err)
+					return err
+				}
+				consistent = false
+			}
+		}
 
+		// 如果Pod不是污染的，则不做任何操作
+		if consistent {
+			return nil
+		}
 
+		attemptedUpdate = true
+		// 提交更新，如果冲突则重试
+
+		updateErr := spc.objectMgr.UpdatePod(pod)
+		if updateErr == nil {
+			return nil
+		}
+
+		if updated, err := spc.objectMgr.GetPod(set.Namespace, pod.Name); err == nil {
+			// 复制Pod，以避免修改共享缓存
+			pod = updated.DeepCopy()
+		} else {
+			utilruntime.HandleError(fmt.Errorf("error getting updated Pod %s/%s: %w", set.Namespace, pod.Name, err))
+		}
+
+		return updateErr
+	})
+	if attemptedUpdate {
+        // 记录更新Pod的事件，包括事件类型（update）、StatefulSet、Pod以及错误信息
+		spc.recordPodEvent("update", set, pod, err)
+	}
+	return err
+}
+```
+
+### DeleteStatefulPod
+
+```go
+func (spc *StatefulPodControl) DeleteStatefulPod(set *apps.StatefulSet, pod *v1.Pod) error {
+	err := spc.objectMgr.DeletePod(pod)
+	spc.recordPodEvent("delete", set, pod, err)
+	return err
+}
+```
+
+### ClaimsMatchRetentionPolicy
+
+```go
+func (spc *StatefulPodControl) ClaimsMatchRetentionPolicy(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) (bool, error) {
+	ordinal := getOrdinal(pod) // 获取 Pod 的序号，用于确定其 PVC 名称
+	templates := set.Spec.VolumeClaimTemplates // 获取 StatefulSet 中声明的 PVC 模板
+	for i := range templates { // 遍历 PVC 模板
+		claimName := getPersistentVolumeClaimName(set, &templates[i], ordinal) // 获取当前 PVC 的名称
+		claim, err := spc.objectMgr.GetClaim(set.Namespace, claimName) // 获取当前 PVC 对应的 PersistentVolumeClaim 对象
+		switch {
+		case apierrors.IsNotFound(err): // 如果当前 PVC 不存在
+			klog.FromContext(ctx).V(4).Info("Expected claim missing, continuing to pick up in next iteration", "PVC", klog.KObj(claim))
+		case err != nil: // 如果出现其他错误
+			return false, fmt.Errorf("Could not retrieve claim %s for %s when checking PVC deletion policy", claimName, pod.Name)
+		default: // 如果成功获取当前 PVC 对应的 PersistentVolumeClaim 对象
+			if !claimOwnerMatchesSetAndPod(claim, set, pod) { // 检查 PVC 的所有者是否与 StatefulSet 和 Pod 匹配
+				return false, nil
+			}
+		}
+	}
+	return true, nil // 如果所有 PVC 都满足保留策略，返回 true
+}
+```
+
+### UpdatePodClaimForRetentionPolicy
+
+```GO
+func (spc *StatefulPodControl) UpdatePodClaimForRetentionPolicy(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) error {
+	logger := klog.FromContext(ctx)
+	ordinal := getOrdinal(pod) // 获取 Pod 的序号，用于确定其 PVC 名称
+	templates := set.Spec.VolumeClaimTemplates // 获取 StatefulSet 中声明的 PVC 模板
+	for i := range templates { // 遍历 PVC 模板
+		claimName := getPersistentVolumeClaimName(set, &templates[i], ordinal) // 获取当前 PVC 的名称
+		claim, err := spc.objectMgr.GetClaim(set.Namespace, claimName) // 获取当前 PVC 对应的 PersistentVolumeClaim 对象
+		switch {
+		case apierrors.IsNotFound(err): // 如果当前 PVC 不存在
+			logger.V(4).Info("Expected claim missing, continuing to pick up in next iteration", "PVC", klog.KObj(claim))
+		case err != nil: // 如果出现其他错误
+			return fmt.Errorf("Could not retrieve claim %s not found for %s when checking PVC deletion policy: %w", claimName, pod.Name, err)
+		default: // 如果成功获取当前 PVC 对应的 PersistentVolumeClaim 对象
+			if !claimOwnerMatchesSetAndPod(claim, set, pod) { // 检查 PVC 的所有者是否与 StatefulSet 和 Pod 匹配
+				claim = claim.DeepCopy() // 复制一份 PVC 对象，避免修改共享的缓存
+				needsUpdate := updateClaimOwnerRefForSetAndPod(claim, set, pod) // 更新 PVC 的所有者引用
+				if needsUpdate { // 如果需要更新
+					err := spc.objectMgr.UpdateClaim(claim) // 更新 PVC 对象
+					if err != nil { // 如果更新失败
+						return fmt.Errorf("Could not update claim %s for delete policy ownerRefs: %w", claimName, err)
+					}
+				}
+			}
+		}
+	}
+	return nil // 更新成功，返回 nil
+}
+```
+
+### PodClaimIsStale
+
+```GO
+func (spc *StatefulPodControl) PodClaimIsStale(set *apps.StatefulSet, pod *v1.Pod) (bool, error) {
+	policy := getPersistentVolumeClaimRetentionPolicy(set) // 获取 StatefulSet 中定义的 PVC 保留策略
+	if policy.WhenScaled == apps.RetainPersistentVolumeClaimRetentionPolicyType {
+		// 如果 PVC 保留策略为 Retain，则 PVC 不会过时，直接返回 false
+		return false, nil
+	}
+	for _, claim := range getPersistentVolumeClaims(set, pod) { // 获取与 Pod 关联的 PVC
+		pvc, err := spc.objectMgr.GetClaim(claim.Namespace, claim.Name) // 获取当前 PVC 对应的 PersistentVolumeClaim 对象
+		switch {
+		case apierrors.IsNotFound(err):
+			// 如果当前 PVC 不存在，则不会过时，继续检查下一个 PVC
+			continue
+		case err != nil:
+			return false, err
+		case err == nil:
+			// 如果 Pod 的 UID 与 PVC 的所有者引用不匹配，则 PVC 过时
+			if hasStaleOwnerRef(pvc, pod) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil // 所有 PVC 都不过时，返回 false
+}
+```
+
+### recordPodEvent
+
+```GO
+func (spc *StatefulPodControl) recordPodEvent(verb string, set *apps.StatefulSet, pod *v1.Pod, err error) {
+	if err == nil { // 如果没有错误
+		reason := fmt.Sprintf("Successful%s", strings.Title(verb)) // 设置事件的原因
+		message := fmt.Sprintf("%s Pod %s in StatefulSet %s successful",
+			strings.ToLower(verb), pod.Name, set.Name) // 设置事件的消息
+		spc.recorder.Event(set, v1.EventTypeNormal, reason, message) // 记录事件（类型为 Normal）
+	} else { // 如果有错误
+		reason := fmt.Sprintf("Failed%s", strings.Title(verb)) // 设置事件的原因
+		message := fmt.Sprintf("%s Pod %s in StatefulSet %s failed error: %s",
+			strings.ToLower(verb), pod.Name, set.Name, err) // 设置事件的消息
+		spc.recorder.Event(set, v1.EventTypeWarning, reason, message) // 记录事件（类型为 Warning）
+	}
+}
+```
+
+### recordClaimEvent
+
+```GO
+func (spc *StatefulPodControl) recordPodEvent(verb string, set *apps.StatefulSet, pod *v1.Pod, err error) {
+	if err == nil { // 如果没有错误
+		reason := fmt.Sprintf("Successful%s", strings.Title(verb)) // 设置事件的原因
+		message := fmt.Sprintf("%s Pod %s in StatefulSet %s successful",
+			strings.ToLower(verb), pod.Name, set.Name) // 设置事件的消息
+		spc.recorder.Event(set, v1.EventTypeNormal, reason, message) // 记录事件（类型为 Normal）
+	} else { // 如果有错误
+		reason := fmt.Sprintf("Failed%s", strings.Title(verb)) // 设置事件的原因
+		message := fmt.Sprintf("%s Pod %s in StatefulSet %s failed error: %s",
+			strings.ToLower(verb), pod.Name, set.Name, err) // 设置事件的消息
+		spc.recorder.Event(set, v1.EventTypeWarning, reason, message) // 记录事件（类型为 Warning）
+	}
+}
+```
+
+### createMissingPersistentVolumeClaims
+
+```GO
+func (spc *StatefulPodControl) createMissingPersistentVolumeClaims(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) error {
+	if err := spc.createPersistentVolumeClaims(set, pod); err != nil { // 调用 spc.createPersistentVolumeClaims() 方法创建 PVC，如果出错则返回错误
+		return err
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetAutoDeletePVC) { // 如果 StatefulSetAutoDeletePVC 特性门户启用
+		// Set PVC policy as much as is possible at this point.
+		if err := spc.UpdatePodClaimForRetentionPolicy(ctx, set, pod); err != nil { // 更新 PVC 的保留策略
+			spc.recordPodEvent("update", set, pod, err) // 记录事件
+			return err
+		}
+	}
+	return nil // 创建 PVC 成功，返回 nil
+}
+
+```
+
+### createPersistentVolumeClaims
+
+```GO
+func (spc *StatefulPodControl) createPersistentVolumeClaims(set *apps.StatefulSet, pod *v1.Pod) error {
+	var errs []error // 用于保存所有错误
+	for _, claim := range getPersistentVolumeClaims(set, pod) { // 获取与 Pod 关联的 PVC
+		pvc, err := spc.objectMgr.GetClaim(claim.Namespace, claim.Name) // 获取当前 PVC 对应的 PersistentVolumeClaim 对象
+		switch {
+		case apierrors.IsNotFound(err): // 如果对象不存在
+			err := spc.objectMgr.CreateClaim(&claim) // 创建 PVC
+			if err != nil { // 如果创建失败，则记录错误
+				errs = append(errs, fmt.Errorf("failed to create PVC %s: %s", claim.Name, err))
+			}
+			if err == nil || !apierrors.IsAlreadyExists(err) { // 如果创建成功或者 PVC 已存在，则记录事件
+				spc.recordClaimEvent("create", set, pod, &claim, err)
+			}
+		case err != nil: // 如果出现其他错误，则记录错误和事件
+			errs = append(errs, fmt.Errorf("failed to retrieve PVC %s: %s", claim.Name, err))
+			spc.recordClaimEvent("create", set, pod, &claim, err)
+		default: // 如果 PVC 已存在
+			if pvc.DeletionTimestamp != nil { // 如果 PVC 正在被删除，则记录错误
+				errs = append(errs, fmt.Errorf("pvc %s is being deleted", claim.Name))
+			}
+		}
+		// TODO: Check resource requirements and accessmodes, update if necessary
+	}
+	return errorutils.NewAggregate(errs) // 如果有错误，则返回一个 AggregateError，否则返回 nil
+}
+```
+
+## StatefulPodControlObjectManager
+
+```GO
+type StatefulPodControlObjectManager interface {
+	CreatePod(ctx context.Context, pod *v1.Pod) error
+	GetPod(namespace, podName string) (*v1.Pod, error)
+	UpdatePod(pod *v1.Pod) error
+	DeletePod(pod *v1.Pod) error
+	CreateClaim(claim *v1.PersistentVolumeClaim) error
+	GetClaim(namespace, claimName string) (*v1.PersistentVolumeClaim, error)
+	UpdateClaim(claim *v1.PersistentVolumeClaim) error
+}
+```
+
+```GO
+// NewStatefulPodControlFromManager creates a StatefulPodControl using the given StatefulPodControlObjectManager and recorder.
+func NewStatefulPodControlFromManager(om StatefulPodControlObjectManager, recorder record.EventRecorder) *StatefulPodControl {
+	return &StatefulPodControl{om, recorder}
+}
+
+// realStatefulPodControlObjectManager uses a clientset.Interface and listers.
+type realStatefulPodControlObjectManager struct {
+	client      clientset.Interface
+	podLister   corelisters.PodLister
+	claimLister corelisters.PersistentVolumeClaimLister
+}
+```
+
+### 方法
+
+```GO
+func (om *realStatefulPodControlObjectManager) CreatePod(ctx context.Context, pod *v1.Pod) error {
+	_, err := om.client.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	return err
+}
+
+func (om *realStatefulPodControlObjectManager) GetPod(namespace, podName string) (*v1.Pod, error) {
+	return om.podLister.Pods(namespace).Get(podName)
+}
+
+func (om *realStatefulPodControlObjectManager) UpdatePod(pod *v1.Pod) error {
+	_, err := om.client.CoreV1().Pods(pod.Namespace).Update(context.TODO(), pod, metav1.UpdateOptions{})
+	return err
+}
+
+func (om *realStatefulPodControlObjectManager) DeletePod(pod *v1.Pod) error {
+	return om.client.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+}
+
+func (om *realStatefulPodControlObjectManager) CreateClaim(claim *v1.PersistentVolumeClaim) error {
+	_, err := om.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Create(context.TODO(), claim, metav1.CreateOptions{})
+	return err
+}
+
+func (om *realStatefulPodControlObjectManager) GetClaim(namespace, claimName string) (*v1.PersistentVolumeClaim, error) {
+	return om.claimLister.PersistentVolumeClaims(namespace).Get(claimName)
+}
+
+func (om *realStatefulPodControlObjectManager) UpdateClaim(claim *v1.PersistentVolumeClaim) error {
+	_, err := om.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Update(context.TODO(), claim, metav1.UpdateOptions{})
+	return err
+}
+```
 
 ## New
 
