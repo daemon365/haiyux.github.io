@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/controller/deployment-controller.jpg
+featuredImagePreview: /img/preview/controller/statefulset-controller.jpg
 ---
 
 ## 简介
@@ -1657,5 +1657,100 @@ func (ssc *StatefulSetController) sync(ctx context.Context, key string) error {
 #### adoptOrphanRevisions
 
 ```go
+// adoptOrphanRevisions 会检查给定 StatefulSet 的所有修订版本，如果某个修订版本没有被其他控制器控制，则将该修订版本转换为当前控制器的控制下。
+func (ssc *StatefulSetController) adoptOrphanRevisions(ctx context.Context, set *apps.StatefulSet) error {
+    // ListRevisions 方法返回给定 StatefulSet 的所有修订版本
+    revisions, err := ssc.control.ListRevisions(set)
+    if err != nil {
+        return err
+    }
+    // 用于存储孤立的修订版本
+    orphanRevisions := make([]*apps.ControllerRevision, 0)
+    for i := range revisions {
+        // 如果当前修订版本没有被其他控制器控制，则将该修订版本添加到 orphanRevisions 列表中
+        if metav1.GetControllerOf(revisions[i]) == nil {
+            orphanRevisions = append(orphanRevisions, revisions[i])
+        }
+    }
+    // 如果存在孤立的修订版本，则检查当前控制器是否能够接管它们
+    if len(orphanRevisions) > 0 {
+        canAdoptErr := ssc.canAdoptFunc(ctx, set)(ctx)
+        if canAdoptErr != nil {
+            return fmt.Errorf("can't adopt ControllerRevisions: %v", canAdoptErr)
+        }
+        // AdoptOrphanRevisions 方法将孤立的修订版本转换为当前控制器的控制下
+        return ssc.control.AdoptOrphanRevisions(set, orphanRevisions)
+    }
+    return nil
+}
+```
+
+##### canAdoptFunc
+
+```GO
+// canAdoptFunc 返回一个函数，用于检查给定 StatefulSet 是否可以被当前控制器接管。
+func (ssc *StatefulSetController) canAdoptFunc(ctx context.Context, set *apps.StatefulSet) func(ctx2 context.Context) error {
+    // 返回一个函数，该函数使用 RecheckDeletionTimestamp 函数封装，用于检查给定 StatefulSet 是否可以被当前控制器接管。
+    return controller.RecheckDeletionTimestamp(func(ctx context.Context) (metav1.Object, error) {
+        // 获取最新的 StatefulSet 对象
+        fresh, err := ssc.kubeClient.AppsV1().StatefulSets(set.Namespace).Get(ctx, set.Name, metav1.GetOptions{})
+        if err != nil {
+            return nil, err
+        }
+        // 检查最新的 StatefulSet 对象是否与原始的 StatefulSet 对象具有相同的 UID
+        if fresh.UID != set.UID {
+            return nil, fmt.Errorf("original StatefulSet %v/%v is gone: got uid %v, wanted %v", set.Namespace, set.Name, fresh.UID, set.UID)
+        }
+        return fresh, nil
+    })
+}
+```
+
+#### getPodsForStatefulSet
+
+```GO
+// getPodsForStatefulSet 返回与给定 StatefulSet 相关联的 Pod 对象列表。
+func (ssc *StatefulSetController) getPodsForStatefulSet(ctx context.Context, set *apps.StatefulSet, selector labels.Selector) ([]*v1.Pod, error) {
+    // 获取给定 Namespace 中的所有 Pod 对象
+    pods, err := ssc.podLister.Pods(set.Namespace).List(labels.Everything())
+    if err != nil {
+        return nil, err
+    }
+
+    // 定义一个过滤函数，用于过滤出与给定 StatefulSet 相关联的 Pod 对象
+    filter := func(pod *v1.Pod) bool {
+        // 只有 Pod 的 OwnerReference 包含当前 StatefulSet 的信息时才返回 true
+        return isMemberOf(set, pod)
+    }
+
+    // 创建一个 PodControllerRefManager 对象，用于管理 Pod 对象的 OwnerReference
+    cm := controller.NewPodControllerRefManager(ssc.podControl, set, selector, controllerKind, ssc.canAdoptFunc(ctx, set))
+    // ClaimPods 方法将 Pod 对象的 OwnerReference 设置为当前 StatefulSet，同时过滤出与 StatefulSet 相关联的 Pod 对象并返回它们的列表
+    return cm.ClaimPods(ctx, pods, filter)
+}
+```
+
+#### syncStatefulSet
+
+```GO
+// syncStatefulSet 用于同步 StatefulSet 对象和与之相关联的 Pod 对象。
+func (ssc *StatefulSetController) syncStatefulSet(ctx context.Context, set *apps.StatefulSet, pods []*v1.Pod) error {
+    logger := klog.FromContext(ctx)
+    logger.V(4).Info("Syncing StatefulSet with pods", "statefulSet", klog.KObj(set), "pods", len(pods))
+    var status *apps.StatefulSetStatus
+    var err error
+    // 调用 control 包中的 UpdateStatefulSet 方法更新 StatefulSet 对象和与之相关联的 Pod 对象
+    status, err = ssc.control.UpdateStatefulSet(ctx, set, pods)
+    if err != nil {
+        return err
+    }
+    logger.V(4).Info("Successfully synced StatefulSet", "statefulSet", klog.KObj(set))
+    // 处理时钟偏差，如果 set.Spec.MinReadySeconds 大于 0 且 status.AvailableReplicas 不等于 set.Spec.Replicas，则再次同步 StatefulSet
+    if set.Spec.MinReadySeconds > 0 && status != nil && status.AvailableReplicas != *set.Spec.Replicas {
+        ssc.enqueueSSAfter(set, time.Duration(set.Spec.MinReadySeconds)*time.Second)
+    }
+
+    return nil
+}
 ```
 
