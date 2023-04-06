@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/controller/podautoscaler-controller.jpg
+featuredImagePreview: /img/preview/controller/podautoscaler-controller.jpg
 ---
 
 ## 简介
@@ -75,6 +75,16 @@ type HorizontalController struct {
 	containerResourceMetricsEnabled bool
 }
 
+type timestampedRecommendation struct {
+	recommendation int32
+	timestamp      time.Time
+}
+
+type timestampedScaleEvent struct {
+	replicaChange int32 // absolute value, non-negative
+	timestamp     time.Time
+	outdated      bool
+}
 ```
 
 ## MetricsClient
@@ -1061,6 +1071,1199 @@ func registerMetrics(extraMetrics ...metrics.Registerable) {
 	for _, metric := range extraMetrics {
 		legacyregistry.MustRegister(metric)
 	}
+}
+```
+
+## New
+
+```GO
+func NewHorizontalController(
+	evtNamespacer v1core.EventsGetter,
+	scaleNamespacer scaleclient.ScalesGetter,
+	hpaNamespacer autoscalingclient.HorizontalPodAutoscalersGetter,
+	mapper apimeta.RESTMapper,
+	metricsClient metricsclient.MetricsClient,
+	hpaInformer autoscalinginformers.HorizontalPodAutoscalerInformer,
+	podInformer coreinformers.PodInformer,
+	resyncPeriod time.Duration,
+	downscaleStabilisationWindow time.Duration,
+	tolerance float64,
+	cpuInitializationPeriod,
+	delayOfInitialReadinessStatus time.Duration,
+	containerResourceMetricsEnabled bool,
+) *HorizontalController {
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartStructuredLogging(0)
+	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: evtNamespacer.Events("")})
+	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "horizontal-pod-autoscaler"})
+
+	hpaController := &HorizontalController{
+		eventRecorder:                   recorder,
+		scaleNamespacer:                 scaleNamespacer,
+		hpaNamespacer:                   hpaNamespacer,
+		downscaleStabilisationWindow:    downscaleStabilisationWindow,
+		monitor:                         monitor.New(),
+		queue:                           workqueue.NewNamedRateLimitingQueue(NewDefaultHPARateLimiter(resyncPeriod), "horizontalpodautoscaler"),
+		mapper:                          mapper,
+		recommendations:                 map[string][]timestampedRecommendation{},
+		recommendationsLock:             sync.Mutex{},
+		scaleUpEvents:                   map[string][]timestampedScaleEvent{},
+		scaleUpEventsLock:               sync.RWMutex{},
+		scaleDownEvents:                 map[string][]timestampedScaleEvent{},
+		scaleDownEventsLock:             sync.RWMutex{},
+		hpaSelectors:                    selectors.NewBiMultimap(),
+		containerResourceMetricsEnabled: containerResourceMetricsEnabled,
+	}
+	// 监控hoa对象
+	hpaInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    hpaController.enqueueHPA,
+			UpdateFunc: hpaController.updateHPA,
+			DeleteFunc: hpaController.deleteHPA,
+		},
+		resyncPeriod,
+	)
+	hpaController.hpaLister = hpaInformer.Lister()
+	hpaController.hpaListerSynced = hpaInformer.Informer().HasSynced
+
+	hpaController.podLister = podInformer.Lister()
+	hpaController.podListerSynced = podInformer.Informer().HasSynced
+
+	replicaCalc := NewReplicaCalculator(
+		metricsClient,
+		hpaController.podLister,
+		tolerance,
+		cpuInitializationPeriod,
+		delayOfInitialReadinessStatus,
+	)
+	hpaController.replicaCalc = replicaCalc
+
+	monitor.Register()
+
+	return hpaController
+}
+```
+
+### hpa
+
+```GO
+func (a *HorizontalController) enqueueHPA(obj interface{}) {
+	// 将 HPA 对象添加到队列中等待处理
+
+	key, err := controller.KeyFunc(obj) // 获取对象的键值
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err)) // 处理获取键值错误
+		return
+	}
+
+	// 请求总是以 resyncPeriod 延迟添加到队列中。如果队列中已经存在相同的 HPA 请求，则新的请求会被丢弃。
+	// 请求在队列中等待 resyncPeriod 的时间，因此 HPAs 每个 resyncPeriod 都会被处理。
+	a.queue.AddRateLimited(key)
+
+	// 如果 hpaSelectors map 中不存在当前 HPA 对象的键值，则将其注册到 hpaSelectors map 中。
+	// 将 Nothing 选择器附加到注册的键值，该选择器不会选择任何对象。
+	// 实际的选择器会在 autoscaler 调谐过程中更新。
+	a.hpaSelectorsMux.Lock()
+	defer a.hpaSelectorsMux.Unlock()
+	if hpaKey := selectors.Parse(key); !a.hpaSelectors.SelectorExists(hpaKey) {
+		a.hpaSelectors.PutSelector(hpaKey, labels.Nothing())
+	}
+}
+
+func (a *HorizontalController) updateHPA(old, cur interface{}) {
+	a.enqueueHPA(cur)
+}
+
+
+func (a *HorizontalController) deleteHPA(obj interface{}) {
+	// 删除 HPA 对象及其关联的选择器
+
+	key, err := controller.KeyFunc(obj) // 获取对象的键值
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err)) // 处理获取键值错误
+		return
+	}
+
+	// 从队列中移除 HPA 对象的键值
+	// TODO: 如果获取键值失败，是否会导致资源泄漏？
+	a.queue.Forget(key)
+
+	// 从 hpaSelectors map 中删除 HPA 对象的键值及其关联的选择器
+	a.hpaSelectorsMux.Lock()
+	defer a.hpaSelectorsMux.Unlock()
+	a.hpaSelectors.DeleteSelector(selectors.Parse(key))
+}
+```
+
+### hpaSelectors
+
+```GO
+type BiMultimap struct {
+	mux sync.RWMutex // 读写锁，用于保护该结构体的并发访问
+
+	// 对象
+	labeledObjects   map[Key]*labeledObject           // 存储按标签标记的对象的映射，键为 Key 类型，值为 labeledObject 指针类型
+	selectingObjects map[Key]*selectingObject         // 存储按选择器标记的对象的映射，键为 Key 类型，值为 selectingObject 指针类型
+
+	// 关联
+	labeledBySelecting map[selectorKey]*labeledObjects // 存储按选择器关联的标签标记的对象的映射，键为 selectorKey 类型，值为 labeledObjects 指针类型
+	selectingByLabeled map[labelsKey]*selectingObjects // 存储按标签关联的选择器标记的对象的映射，键为 labelsKey 类型，值为 selectingObjects 指针类型
+}
+
+func NewBiMultimap() *BiMultimap {
+	return &BiMultimap{
+		labeledObjects:     make(map[Key]*labeledObject),
+		selectingObjects:   make(map[Key]*selectingObject),
+		labeledBySelecting: make(map[selectorKey]*labeledObjects),
+		selectingByLabeled: make(map[labelsKey]*selectingObjects),
+	}
+}
+```
+
+#### KeyValue
+
+```go
+type selectorKey struct {
+	key       string      // 选择器的键
+	namespace string      // 选择器的命名空间
+}
+
+type selectingObject struct {
+	key         Key               // 选择器标记的对象的键
+	selector    pkglabels.Selector // 选择器
+	selectorKey selectorKey        // selectorKey 是选择器的稳定序列化形式，用于关联缓存
+}
+
+type selectingObjects struct {
+	objects  map[Key]*selectingObject // 选择器标记的对象的映射，键为 Key 类型，值为 selectingObject 指针类型
+	refCount int                      // 引用计数，用于记录该选择器标记的对象的引用数
+}
+
+type labelsKey struct {
+	key       string      // 标签的键
+	namespace string      // 标签的命名空间
+}
+
+type labeledObject struct {
+	key       Key              // 标签标记的对象的键
+	labels    map[string]string // 标签
+	labelsKey labelsKey         // labelsKey 是标签的稳定序列化形式，用于关联缓存
+}
+
+type labeledObjects struct {
+	objects  map[Key]*labeledObject // 标签标记的对象的映射，键为 Key 类型，值为 labeledObject 指针类型
+	refCount int                   // 引用计数，用于记录该标签标记的对象的引用数
+}
+```
+
+#### Put
+
+```go
+func (m *BiMultimap) Put(key Key, labels map[string]string) {
+	m.mux.Lock() // 获取互斥锁，确保数据一致性
+	defer m.mux.Unlock() // 在函数执行完毕后释放互斥锁
+
+	labelsKey := labelsKey{
+		key:       pkglabels.Set(labels).String(), // 生成 labels 的稳定序列化形式
+		namespace: key.Namespace, // 使用传入的 key 参数的命名空间
+	}
+	if l, ok := m.labeledObjects[key]; ok { // 检查是否已存在对应的 labeledObject
+		// 更新 labeled object。
+		if labelsKey == l.labelsKey { // 检查 labels 是否有变化
+			// 标签没有变化，无需更新
+			return
+		}
+		// 在重新添加之前删除原有的 labeledObject
+		m.delete(key)
+	}
+	// 添加 labeled object。
+	labels = copyLabels(labels) // 复制 labels，以防止对原始 map 的修改影响到其他地方
+	labeledObject := &labeledObject{
+		key:       key,
+		labels:    labels,
+		labelsKey: labelsKey,
+	}
+	m.labeledObjects[key] = labeledObject // 将 labeledObject 添加到 labeledObjects map 中
+
+	// 添加关联。
+	if _, ok := m.selectingByLabeled[labelsKey]; !ok {
+		// 缓存未命中，扫描 selecting objects。
+		selecting := &selectingObjects{
+			objects: make(map[Key]*selectingObject),
+		}
+		set := pkglabels.Set(labels) // 将 labels 转换为 pkglabels.Set 对象
+		for _, s := range m.selectingObjects {
+			if s.key.Namespace != key.Namespace { // 检查命名空间是否匹配
+				continue
+			}
+			if s.selector.Matches(set) { // 检查 selector 是否匹配 labels
+				selecting.objects[s.key] = s
+			}
+		}
+		// 将 selectingObjects 与 labeledObjects 关联起来
+		m.selectingByLabeled[labelsKey] = selecting
+	}
+	selecting := m.selectingByLabeled[labelsKey]
+	selecting.refCount++
+	for _, sObject := range selecting.objects {
+		// 将 labeledObject 与 selectingObject 关联起来
+		labeled := m.labeledBySelecting[sObject.selectorKey]
+		labeled.objects[labeledObject.key] = labeledObject
+	}
+}
+```
+
+##### delete
+
+```go
+func (m *BiMultimap) delete(key Key) {
+	if _, ok := m.labeledObjects[key]; !ok {
+		// 不存在，无需删除
+		return
+	}
+	labeledObject := m.labeledObjects[key]
+	labelsKey := labeledObject.labelsKey
+	defer delete(m.labeledObjects, key)  // 在函数结束时删除 key 对应的 labeledObject
+	if _, ok := m.selectingByLabeled[labelsKey]; !ok {
+		// 没有关联的 selectingObjects，无需删除
+		return
+	}
+	// 移除关联
+	for _, selectingObject := range m.selectingByLabeled[labelsKey].objects {
+		selectorKey := selectingObject.selectorKey
+		// 删除 selectingObject 到 labeledObject 的关联
+		delete(m.labeledBySelecting[selectorKey].objects, key)
+	}
+	m.selectingByLabeled[labelsKey].refCount--
+	// 回收 labeledObject 到 selectingObject 的关联
+	if m.selectingByLabeled[labelsKey].refCount == 0 {
+		delete(m.selectingByLabeled, labelsKey)
+	}
+}
+```
+
+##### copyLabels
+
+```go
+func copyLabels(labels map[string]string) map[string]string {
+	l := make(map[string]string)
+	for k, v := range labels {
+		l[k] = v
+	}
+	return l
+}
+```
+
+#### Delete
+
+```go
+func (m *BiMultimap) Delete(key Key) {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+	m.delete(key)
+}
+```
+
+#### Exists
+
+```go
+func (m *BiMultimap) Exists(key Key) bool {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	_, exists := m.labeledObjects[key]
+	return exists
+}
+```
+
+#### PutSelector
+
+```go
+func (m *BiMultimap) PutSelector(key Key, selector pkglabels.Selector) {
+	m.mux.Lock()  // 加锁，保证并发安全
+	defer m.mux.Unlock()  // 函数结束时解锁
+
+	selectorKey := selectorKey{
+		key:       selector.String(),
+		namespace: key.Namespace,
+	}
+	if s, ok := m.selectingObjects[key]; ok {
+		// 更新已存在的 selecting object。
+		if selectorKey == s.selectorKey {
+			// selector 没有改变，无需操作。
+			return
+		}
+		// 先删除再添加。
+		m.deleteSelector(key)
+	}
+	// 添加 selecting object。
+	selectingObject := &selectingObject{
+		key:         key,
+		selector:    selector,
+		selectorKey: selectorKey,
+	}
+	m.selectingObjects[key] = selectingObject
+	// 添加关联。
+	if _, ok := m.labeledBySelecting[selectorKey]; !ok {
+		// 缓存未命中，扫描 labeled objects。
+		labeled := &labeledObjects{
+			objects: make(map[Key]*labeledObject),
+		}
+		for _, l := range m.labeledObjects {
+			if l.key.Namespace != key.Namespace {
+				continue
+			}
+			set := pkglabels.Set(l.labels)
+			if selector.Matches(set) {
+				labeled.objects[l.key] = l
+			}
+		}
+		// 将 labeled 与 selecting 关联。
+		m.labeledBySelecting[selectorKey] = labeled
+	}
+	labeled := m.labeledBySelecting[selectorKey]
+	labeled.refCount++
+	for _, labeledObject := range labeled.objects {
+		// 将 selecting 与 labeled 关联。
+		selecting := m.selectingByLabeled[labeledObject.labelsKey]
+		selecting.objects[selectingObject.key] = selectingObject
+	}
+}
+```
+
+##### deleteSelector
+
+```go
+func (m *BiMultimap) deleteSelector(key Key) {
+	// 删除选择对象
+	if _, ok := m.selectingObjects[key]; !ok {
+		// 选择对象不存在，直接返回
+		return
+	}
+	selectingObject := m.selectingObjects[key] // 获取选择对象
+	selectorKey := selectingObject.selectorKey // 获取选择对象的选择器键
+
+	defer delete(m.selectingObjects, key) // 在函数结束时从选择对象中删除对应的键值对
+
+	if _, ok := m.labeledBySelecting[selectorKey]; !ok {
+		// 没有关联的对象
+		return
+	}
+
+	// 移除关联
+	for _, labeledObject := range m.labeledBySelecting[selectorKey].objects {
+		labelsKey := labeledObject.labelsKey // 获取标记对象的标签键
+		// 删除标记对象到选择对象的关联
+		delete(m.selectingByLabeled[labelsKey].objects, key)
+	}
+
+	m.labeledBySelecting[selectorKey].refCount-- // 减少标记对象对选择对象的引用计数
+
+	// 垃圾回收，删除无引用的关联
+	if m.labeledBySelecting[selectorKey].refCount == 0 {
+		delete(m.labeledBySelecting, selectorKey)
+	}
+}
+```
+
+#### DeleteSelector
+
+```go
+func (m *BiMultimap) DeleteSelector(key Key) {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+	m.deleteSelector(key)
+}
+```
+
+#### SelectorExists
+
+```go
+func (m *BiMultimap) SelectorExists(key Key) bool {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	_, exists := m.selectingObjects[key]
+	return exists
+}
+```
+
+#### KeepOnly
+
+```go
+func (m *BiMultimap) KeepOnly(keys []Key) {
+	m.mux.Lock() // 对 m 进行加锁，保证并发安全
+	defer m.mux.Unlock() // 在函数结束时解锁 m
+
+	keyMap := make(map[Key]bool) // 创建一个用于存储传入的 keys 的 map
+	for _, k := range keys {
+		keyMap[k] = true // 将 keys 中的每个键添加到 map 中，并设置对应的值为 true
+	}
+	for k := range m.labeledObjects { // 遍历 labeledObjects 中的每个键
+		if !keyMap[k] { // 如果键 k 不在 keyMap 中，即不在传入的 keys 中
+			m.delete(k) // 则调用 delete 方法删除该键对应的关联关系
+		}
+	}
+}
+```
+
+#### KeepOnlySelectors
+
+```go
+func (m *BiMultimap) KeepOnlySelectors(keys []Key) {
+	m.mux.Lock() // 对 m 进行加锁，保证并发安全
+	defer m.mux.Unlock() // 在函数结束时解锁 m
+
+	keyMap := make(map[Key]bool) // 创建一个用于存储传入的 keys 的 map
+	for _, k := range keys {
+		keyMap[k] = true // 将 keys 中的每个键添加到 map 中，并设置对应的值为 true
+	}
+	for k := range m.selectingObjects { // 遍历 selectingObjects 中的每个键
+		if !keyMap[k] { // 如果键 k 不在 keyMap 中，即不在传入的 keys 中
+			m.deleteSelector(k) // 则调用 deleteSelector 方法删除该键对应的关联关系
+		}
+	}
+}
+```
+
+#### Select
+
+```go
+func (m *BiMultimap) Select(key Key) (keys []Key, ok bool) {
+	m.mux.RLock() // 对 m 进行读锁，保证并发安全
+	defer m.mux.RUnlock() // 在函数结束时解锁 m
+
+	selectingObject, ok := m.selectingObjects[key] // 获取 key 对应的 selectingObject，并判断是否存在
+	if !ok { // 如果 selectingObject 不存在
+		// 不存在关联关系
+		return nil, false // 返回空切片和 false
+	}
+
+	keys = make([]Key, 0) // 创建一个空切片用于存储关联的 keys
+	if labeled, ok := m.labeledBySelecting[selectingObject.selectorKey]; ok { // 获取 selectingObject 对应的 labeledObject，并判断是否存在
+		for _, labeledObject := range labeled.objects { // 遍历 labeledObject 列表
+			keys = append(keys, labeledObject.key) // 将每个 labeledObject 对应的 key 添加到 keys 切片中
+		}
+	}
+	return keys, true // 返回关联的 keys 切片和 true，表示关联关系存在
+}
+```
+
+#### ReverseSelect
+
+```go
+func (m *BiMultimap) ReverseSelect(key Key) (keys []Key, ok bool) {
+	m.mux.RLock() // 对 m 进行读锁，保证并发安全
+	defer m.mux.RUnlock() // 解锁 m
+
+	labeledObject, ok := m.labeledObjects[key] // 根据 key 在 labeledObjects 中查找 labeledObject
+	if !ok {
+		// 不存在
+		return []Key{}, false
+	}
+	keys = make([]Key, 0)
+	if selecting, ok := m.selectingByLabeled[labeledObject.labelsKey]; ok {
+		// 如果 labeledObject.labelsKey 在 selectingByLabeled 中存在
+		for _, selectingObject := range selecting.objects {
+			// 遍历 selectingObject，将其 key 添加到 keys 中
+			keys = append(keys, selectingObject.key)
+		}
+	}
+	return keys, true // 返回 keys 和 true 表示找到了匹配的 keys
+}
+```
+
+## Run
+
+```go
+func (a *HorizontalController) Run(ctx context.Context, workers int) {
+	defer utilruntime.HandleCrash()
+	defer a.queue.ShutDown()
+
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting HPA controller")
+	defer logger.Info("Shutting down HPA controller")
+
+	if !cache.WaitForNamedCacheSync("HPA", ctx.Done(), a.hpaListerSynced, a.podListerSynced) {
+		return
+	}
+
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, a.worker, time.Second)
+	}
+
+	<-ctx.Done()
+}
+```
+
+## worker
+
+```go
+func (a *HorizontalController) worker(ctx context.Context) {
+	for a.processNextWorkItem(ctx) {
+	}
+	logger := klog.FromContext(ctx)
+	logger.Info("Horizontal Pod Autoscaler controller worker shutting down")
+}
+
+func (a *HorizontalController) processNextWorkItem(ctx context.Context) bool {
+	key, quit := a.queue.Get() // 从队列中获取下一个工作项
+	if quit {
+		return false // 如果获取到的是 quit 信号，则返回 false 表示处理结束
+	}
+	defer a.queue.Done(key) // 在函数结束前标记 key 为已处理
+
+	deleted, err := a.reconcileKey(ctx, key.(string)) // 调用 reconcileKey 方法处理 key，并返回是否删除成功以及可能的错误
+	if err != nil {
+		utilruntime.HandleError(err) // 如果处理过程中出现错误，则处理错误
+	}
+
+	// 将新的请求加入队列，以在 resyncPeriod 后再次处理
+	// 请求总是会以 resyncPeriod 的延迟加入队列。如果队列中已经存在 HPA 的请求，则新的请求会被丢弃。
+	// 请求在队列中等待 resyncPeriod 的时间，以保证每个 resyncPeriod 都会处理 HPAs。
+	// 在这里添加请求，是为了防止上一个 resyncPeriod 没有将请求插入队列。
+	// 这种情况经常发生，因为在 resyncPeriod 后添加请求和从队列中移除请求之间存在竞争条件。
+	// 请求可能在上一个请求从队列中移除之前被 resyncPeriod 添加。如果我们不在这里添加请求，
+	// 那么在这种情况下会丢失一个请求，导致 HPA 在 2 倍的 resyncPeriod 后才被处理。
+	if !deleted {
+		a.queue.AddRateLimited(key)
+	}
+
+	return true // 返回 true 表示继续处理下一个工作项
+}
+
+```
+
+### reconcileKey
+
+```go
+func (a *HorizontalController) reconcileKey(ctx context.Context, key string) (deleted bool, err error) {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key) // 从 key 中解析出 namespace 和 name
+	if err != nil {
+		return true, err // 如果解析出错，则返回 deleted 为 true，同时返回错误
+	}
+
+	logger := klog.FromContext(ctx) // 从 context 中获取 logger
+
+	hpa, err := a.hpaLister.HorizontalPodAutoscalers(namespace).Get(name) // 通过 namespace 和 name 获取 HorizontalPodAutoscaler 对象
+	if k8serrors.IsNotFound(err) { // 如果获取到的错误是 NotFound，则表示 HPA 已经被删除
+		logger.Info("Horizontal Pod Autoscaler has been deleted", "HPA", klog.KRef(namespace, name)) // 记录日志，标记 HPA 已被删除
+
+		a.recommendationsLock.Lock()
+		delete(a.recommendations, key) // 从 recommendations 中删除对应的 key
+		a.recommendationsLock.Unlock()
+
+		a.scaleUpEventsLock.Lock()
+		delete(a.scaleUpEvents, key) // 从 scaleUpEvents 中删除对应的 key
+		a.scaleUpEventsLock.Unlock()
+
+		a.scaleDownEventsLock.Lock()
+		delete(a.scaleDownEvents, key) // 从 scaleDownEvents 中删除对应的 key
+		a.scaleDownEventsLock.Unlock()
+
+		return true, nil // 返回 deleted 为 true，表示 HPA 已被删除，同时返回 nil 错误
+	}
+	if err != nil {
+		return false, err // 如果获取 HPA 对象时出现其他错误，则返回 deleted 为 false，同时返回错误
+	}
+
+	return false, a.reconcileAutoscaler(ctx, hpa, key) // 调用 reconcileAutoscaler 方法处理 HPA 对象，并返回 deleted 为 false，同时返回可能的错误
+}
+```
+
+### reconcileAutoscaler
+
+```go
+func (a *HorizontalController) reconcileAutoscaler(ctx context.Context, hpaShared *autoscalingv2.HorizontalPodAutoscaler, key string) (retErr error) {
+	// actionLabel is used to report which actions this reconciliation has taken.
+	actionLabel := monitor.ActionLabelNone // actionLabel 用于报告此次调谐所采取的操作。
+	start := time.Now() // 记录当前时间作为调谐开始时间。
+	defer func() {
+		errorLabel := monitor.ErrorLabelNone
+		if retErr != nil {
+			// In case of error, set "internal" as default.
+			errorLabel = monitor.ErrorLabelInternal // 在发生错误的情况下，将错误标签设置为 "internal"。
+		}
+		if errors.Is(retErr, errSpec) {
+			errorLabel = monitor.ErrorLabelSpec // 如果错误是 errSpec，则将错误标签设置为 "spec"。
+		}
+
+		a.monitor.ObserveReconciliationResult(actionLabel, errorLabel, time.Since(start)) // 调用监控器记录调谐结果。
+	}()
+
+	// make a copy so that we never mutate the shared informer cache (conversion can mutate the object)
+	hpa := hpaShared.DeepCopy() // 复制传入的 hpaShared 对象，以便不对共享的 informer 缓存进行更改（转换可能会更改对象）。
+	hpaStatusOriginal := hpa.Status.DeepCopy() // 复制 hpa 对象的状态，以便后续对比。
+
+	reference := fmt.Sprintf("%s/%s/%s", hpa.Spec.ScaleTargetRef.Kind, hpa.Namespace, hpa.Spec.ScaleTargetRef.Name) // 根据 hpa 对象的 ScaleTargetRef 字段的值生成引用字符串。
+
+	targetGV, err := schema.ParseGroupVersion(hpa.Spec.ScaleTargetRef.APIVersion) // 解析 hpa 对象的 APIVersion 字段的值，生成 GroupVersion 对象。
+	if err != nil {
+		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "FailedGetScale", err.Error()) // 记录事件，标记错误类型为 "FailedGetScale"，错误消息为 err.Error()。
+		setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionFalse, "FailedGetScale", "the HPA controller was unable to get the target's current scale: %v", err) // 设置 HPA 对象的 AbleToScale 条件为 false，并设置错误消息。
+		if err := a.updateStatusIfNeeded(ctx, hpaStatusOriginal, hpa); err != nil { // 如果需要更新 HPA 对象的状态，调用 updateStatusIfNeeded 方法进行更新。
+			utilruntime.HandleError(err) // 处理可能出现的错误。
+		}
+		return fmt.Errorf("invalid API version in scale target reference: %v%w", err, errSpec) // 返回错误信息，包括错误类型和错误对象。
+	}
+
+	targetGK := schema.GroupKind{
+		Group: targetGV.Group, // 将 GroupVersion 对象的 Group 字段赋值给 targetGK 的 Group 字段。
+		Kind:  hpa.Spec.ScaleTargetRef.Kind, // 将 hpa 对象的 ScaleTargetRef 字段的 Kind 字段赋值给 targetGK 的 Kind 字段。
+	}
+	
+    // 获取资源的映射关系
+	mappings, err := a.mapper.RESTMappings(targetGK)
+	if err != nil {
+		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "FailedGetScale", err.Error())
+		setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionFalse, "FailedGetScale", "the HPA controller was unable to get the target's current scale: %v", err)
+		if err := a.updateStatusIfNeeded(ctx, hpaStatusOriginal, hpa); err != nil {
+			utilruntime.HandleError(err)
+		}
+		return fmt.Errorf("unable to determine resource for scale target reference: %v", err)
+	}
+	
+    // 使用scaleForResourceMappings函数获取scale资源的对象，并设置HPA状态为可缩放
+	scale, targetGR, err := a.scaleForResourceMappings(ctx, hpa.Namespace, hpa.Spec.ScaleTargetRef.Name, mappings)
+	if err != nil {
+		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "FailedGetScale", err.Error())
+		setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionFalse, "FailedGetScale", "the HPA controller was unable to get the target's current scale: %v", err)
+		if err := a.updateStatusIfNeeded(ctx, hpaStatusOriginal, hpa); err != nil {
+			utilruntime.HandleError(err)
+		}
+		return fmt.Errorf("failed to query scale subresource for %s: %v", reference, err)
+	}
+    // 设置HPA状态为可缩放，记录当前Pod的数量。
+	setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "SucceededGetScale", "the HPA controller was able to get the target's current scale")
+	currentReplicas := scale.Spec.Replicas
+	a.recordInitialRecommendation(currentReplicas, key)
+
+	var (
+		metricStatuses        []autoscalingv2.MetricStatus
+		metricDesiredReplicas int32
+		metricName            string
+	)
+
+	desiredReplicas := int32(0)
+	rescaleReason := ""
+
+	var minReplicas int32
+	
+    // 如果hpa.spec.minReplicas不为空，则将其值分配给变量minReplicas，否则将其设置为默认值1。
+	if hpa.Spec.MinReplicas != nil {
+		minReplicas = *hpa.Spec.MinReplicas
+	} else {
+		// Default value
+		minReplicas = 1
+	}
+	
+    // 定义变量 rescale，表示是否需要扩缩容，默认为 true
+	rescale := true
+    // 从上下文中获取 logger
+	logger := klog.FromContext(ctx)
+	
+    // 如果指定资源的副本数为 0，但最小副本数不为 0，则表示不对该资源进行自动扩缩容
+	if scale.Spec.Replicas == 0 && minReplicas != 0 {
+		// 禁用自动扩缩容
+		desiredReplicas = 0
+		rescale = false
+        // 设置 HPA 的条件 ScalingActive 为 False，表示自动扩缩容已禁用
+		setCondition(hpa, autoscalingv2.ScalingActive, v1.ConditionFalse, "ScalingDisabled", "scaling is disabled since the replica count of the target is zero")
+	} else if currentReplicas > hpa.Spec.MaxReplicas {
+        // 如果当前副本数大于 HPA 中指定的最大副本数，则缩容到最大副本数
+		rescaleReason = "Current number of replicas above Spec.MaxReplicas"
+		desiredReplicas = hpa.Spec.MaxReplicas
+	} else if currentReplicas < minReplicas {
+        // 如果当前副本数小于 HPA 中指定的最小副本数，则扩容到最小副本数
+		rescaleReason = "Current number of replicas below Spec.MinReplicas"
+		desiredReplicas = minReplicas
+	} else {
+        // 计算指标对应的期望副本数
+		var metricTimestamp time.Time
+		metricDesiredReplicas, metricName, metricStatuses, metricTimestamp, err = a.computeReplicasForMetrics(ctx, hpa, scale, hpa.Spec.Metrics)
+		// computeReplicasForMetrics 可能返回非零的 metricDesiredReplicas 和错误 err。
+    	// 这意味着一些指标仍在工作，HPA 应该根据它们进行扩缩容。
+		if err != nil && metricDesiredReplicas == -1 {
+            // 计算期望副本数时出错，但不能完全依赖该错误，仍需要继续扩缩容
+			a.setCurrentReplicasInStatus(hpa, currentReplicas)
+			if err := a.updateStatusIfNeeded(ctx, hpaStatusOriginal, hpa); err != nil {
+				utilruntime.HandleError(err)
+			}
+            // 在事件中记录该错误
+			a.eventRecorder.Event(hpa, v1.EventTypeWarning, "FailedComputeMetricsReplicas", err.Error())
+			return fmt.Errorf("failed to compute desired number of replicas based on listed metrics for %s: %v", reference, err)
+		}
+		if err != nil {
+            // 我们继续进行缩放，但最终从reconcileAutoscaler()返回此错误。
+			retErr = err
+		}
+
+		logger.V(4).Info("Proposing desired replicas",
+			"desiredReplicas", metricDesiredReplicas,
+			"metric", metricName,
+			"timestamp", metricTimestamp,
+			"scaleTarget", reference)
+
+		rescaleMetric := ""
+		if metricDesiredReplicas > desiredReplicas { // 如果指标期望的Pod数量大于当前期望的Pod数量
+			desiredReplicas = metricDesiredReplicas // 更新当前期望的Pod数量
+			rescaleMetric = metricName // 将该指标的名称赋给“rescaleMetric”
+		}
+		if desiredReplicas > currentReplicas {  // 如果当前期望的Pod数量大于当前Pod数量
+			rescaleReason = fmt.Sprintf("%s above target", rescaleMetric) // 更新“rescaleReason”以表明是该指标的Pod数量超过了期望的Pod数量
+		}
+		if desiredReplicas < currentReplicas { // 如果当前期望的Pod数量小于当前Pod数量
+			rescaleReason = "All metrics below target" // 更新“rescaleReason”以表明所有指标的Pod数量都低于期望的Pod数量
+		}
+		if hpa.Spec.Behavior == nil { // 如果没有指定行为，即使用默认的扩展策略
+			desiredReplicas = a.normalizeDesiredReplicas(hpa, key, currentReplicas, desiredReplicas, minReplicas) // 根据默认的扩展策略规则来计算期望的Pod数量
+		} else { // 如果指定了行为，即使用指定的扩展策略
+			desiredReplicas = a.normalizeDesiredReplicasWithBehaviors(hpa, key, currentReplicas, desiredReplicas, minReplicas) // 根据指定的扩展策略规则来计算期望的Pod数量
+		}
+		rescale = desiredReplicas != currentReplicas // 如果期望的Pod数量不等于当前Pod数量，则需要进行扩展或收缩
+	}
+
+	if rescale { // 如果需要进行扩展或收缩
+		scale.Spec.Replicas = desiredReplicas
+		_, err = a.scaleNamespacer.Scales(hpa.Namespace).Update(ctx, targetGR, scale, metav1.UpdateOptions{})
+		if err != nil { // 如果更新失败
+			a.eventRecorder.Eventf(hpa, v1.EventTypeWarning, "FailedRescale", "New size: %d; reason: %s; error: %v", desiredReplicas, rescaleReason, err.Error())
+			setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionFalse, "FailedUpdateScale", "the HPA controller was unable to update the target scale: %v", err)
+			a.setCurrentReplicasInStatus(hpa, currentReplicas) // 更新HPA的状态以反映当前Pod的数量
+			if err := a.updateStatusIfNeeded(ctx, hpaStatusOriginal, hpa); err != nil { // 如果更新状态失败
+				utilruntime.HandleError(err)
+			}
+			return fmt.Errorf("failed to rescale %s: %v", reference, err)
+		}
+		// 设置 HPA 的条件为 AbleToScale，设置状态为 v1.ConditionTrue，设置原因为 "SucceededRescale"，并且打印带格式的日志信息。
+        setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "SucceededRescale", "the HPA controller was able to update the target scale to %d", desiredReplicas)
+
+        // 在 HPA 对象上记录一个事件，类型为 v1.EventTypeNormal，原因为 "SuccessfulRescale"，并且打印带格式的日志信息。
+        a.eventRecorder.Eventf(hpa, v1.EventTypeNormal, "SuccessfulRescale", "New size: %d; reason: %s", desiredReplicas, rescaleReason)
+
+        // 将 HPA 的当前状态信息保存到事件存储中。
+        a.storeScaleEvent(hpa.Spec.Behavior, key, currentReplicas, desiredReplicas)
+
+        // 打印带有多个键值对的日志信息，记录成功缩放的相关信息。
+        logger.Info("Successfully rescaled",
+            "HPA", klog.KObj(hpa),
+            "currentReplicas", currentReplicas,
+            "desiredReplicas", desiredReplicas,
+            "reason", rescaleReason)
+
+        // 根据当前副本数和期望副本数判断应该执行哪种操作，记录操作标签。
+        if desiredReplicas > currentReplicas {
+            actionLabel = monitor.ActionLabelScaleUp
+        } else {
+            actionLabel = monitor.ActionLabelScaleDown
+        }
+
+        // 如果不需要缩放，则记录日志信息，并将期望副本数设为当前副本数。
+        } else {
+            logger.V(4).Info("Decided not to scale",
+                "scaleTarget", reference,
+                "desiredReplicas", desiredReplicas,
+                "lastScaleTime", hpa.Status.LastScaleTime)
+            desiredReplicas = currentReplicas
+        }
+
+        // 设置 HPA 的状态信息，并保存监控指标的状态信息。
+        a.setStatus(hpa, currentReplicas, desiredReplicas, metricStatuses, rescale)
+
+        // 如果需要，更新 HPA 的状态信息，并返回错误信息。
+        err = a.updateStatusIfNeeded(ctx, hpaStatusOriginal, hpa)
+        if err != nil {
+            // we can overwrite retErr in this case because it's an internal error.
+            return err
+        }
+
+        return retErr
+}
+```
+
+#### setCondition
+
+```GO
+func setCondition(hpa *autoscalingv2.HorizontalPodAutoscaler, conditionType autoscalingv2.HorizontalPodAutoscalerConditionType, status v1.ConditionStatus, reason, message string, args ...interface{}) {
+	hpa.Status.Conditions = setConditionInList(hpa.Status.Conditions, conditionType, status, reason, message, args...)
+}
+```
+
+##### setConditionInList
+
+```GO
+func setConditionInList(inputList []autoscalingv2.HorizontalPodAutoscalerCondition, conditionType autoscalingv2.HorizontalPodAutoscalerConditionType, status v1.ConditionStatus, reason, message string, args ...interface{}) []autoscalingv2.HorizontalPodAutoscalerCondition {
+	resList := inputList // 将输入的切片赋值给 resList
+    var existingCond *autoscalingv2.HorizontalPodAutoscalerCondition // 定义一个指针 existingCond，指向 autoscalingv2.HorizontalPodAutoscalerCondition 结构体类型
+
+    // 遍历切片 resList 中的元素
+    for i, condition := range resList {
+        if condition.Type == conditionType { // 如果 condition 的 Type 等于 conditionType
+            // can't take a pointer to an iteration variable，不能对循环变量取地址，因此需要定义一个中间变量 existingCond
+            existingCond = &resList[i] // 将 resList 中第 i 个元素的地址赋值给 existingCond
+            break // 跳出 for 循环
+        }
+    }
+
+    if existingCond == nil { // 如果 existingCond 指针为空
+        resList = append(resList, autoscalingv2.HorizontalPodAutoscalerCondition{ // 向 resList 中追加一个 autoscalingv2.HorizontalPodAutoscalerCondition 结构体
+            Type: conditionType, // 指定 Type 为 conditionType
+        })
+        existingCond = &resList[len(resList)-1] // 将新追加的元素的地址赋值给 existingCond
+    }
+
+    if existingCond.Status != status { // 如果 existingCond 的 Status 不等于 status
+        existingCond.LastTransitionTime = metav1.Now() // 更新 existingCond 的 LastTransitionTime 字段
+    }
+
+    existingCond.Status = status // 更新 existingCond 的 Status 字段
+    existingCond.Reason = reason // 更新 existingCond 的 Reason 字段
+    existingCond.Message = fmt.Sprintf(message, args...) // 更新 existingCond 的 Message 字段
+
+    return resList // 返回更新后的 resList
+}
+```
+
+#### updateStatusIfNeeded
+
+```GO
+func (a *HorizontalController) updateStatusIfNeeded(ctx context.Context, oldStatus *autoscalingv2.HorizontalPodAutoscalerStatus, newHPA *autoscalingv2.HorizontalPodAutoscaler) error {
+	// skip a write if we wouldn't need to update
+	if apiequality.Semantic.DeepEqual(oldStatus, &newHPA.Status) {
+		return nil
+	}
+	return a.updateStatus(ctx, newHPA)
+}
+```
+
+#### scaleForResourceMappings
+
+```GO
+// 根据给定的资源映射信息，查询指定名称的 Scale 对象，返回 Scale 对象、GroupResource 以及可能的错误。
+func (a *HorizontalController) scaleForResourceMappings(ctx context.Context, namespace, name string, mappings []*apimeta.RESTMapping) (*autoscalingv1.Scale, schema.GroupResource, error) {
+	var firstErr error
+	for i, mapping := range mappings {
+		// 获取 GroupResource 对象。
+		targetGR := mapping.Resource.GroupResource()
+		// 查询指定名称的 Scale 对象。
+		scale, err := a.scaleNamespacer.Scales(namespace).Get(ctx, targetGR, name, metav1.GetOptions{})
+		// 如果没有出现错误，直接返回 Scale 对象和 GroupResource。
+		if err == nil {
+			return scale, targetGR, nil
+		}
+
+		// 如果出现了错误，则判断是否为第一个错误。
+		// 如果是第一个错误，则记录下来，继续查询其他映射资源，直到找到正确的 Scale 对象。
+		if i == 0 {
+			firstErr = err
+		}
+	}
+
+	// 处理映射资源集合为空的情况。
+	// 如果第一个错误为空，则表示没有任何资源映射与查询匹配。
+	if firstErr == nil {
+		firstErr = fmt.Errorf("unrecognized resource")
+	}
+
+	return nil, schema.GroupResource{}, firstErr
+}
+```
+
+#### recordInitialRecommendation
+
+````GO
+func (a *HorizontalController) recordInitialRecommendation(currentReplicas int32, key string) {
+	a.recommendationsLock.Lock()
+	defer a.recommendationsLock.Unlock()
+	if a.recommendations[key] == nil {
+		a.recommendations[key] = []timestampedRecommendation{{currentReplicas, time.Now()}}
+	}
+}
+````
+
+#### setCurrentReplicasInStatus
+
+```GO
+func (a *HorizontalController) setCurrentReplicasInStatus(hpa *autoscalingv2.HorizontalPodAutoscaler, currentReplicas int32) {
+	a.setStatus(hpa, currentReplicas, hpa.Status.DesiredReplicas, hpa.Status.CurrentMetrics, false)
+}
+```
+
+##### setStatus
+
+```GO
+func (a *HorizontalController) setStatus(hpa *autoscalingv2.HorizontalPodAutoscaler, currentReplicas, desiredReplicas int32, metricStatuses []autoscalingv2.MetricStatus, rescale bool) {
+	hpa.Status = autoscalingv2.HorizontalPodAutoscalerStatus{
+		CurrentReplicas: currentReplicas,
+		DesiredReplicas: desiredReplicas,
+		LastScaleTime:   hpa.Status.LastScaleTime,
+		CurrentMetrics:  metricStatuses,
+		Conditions:      hpa.Status.Conditions,
+	}
+
+	if rescale {
+		now := metav1.NewTime(time.Now())
+		hpa.Status.LastScaleTime = &now
+	}
+}
+```
+
+#### normalizeDesiredReplicas
+
+```GO
+func (a *HorizontalController) normalizeDesiredReplicas(hpa *autoscalingv2.HorizontalPodAutoscaler, key string, currentReplicas int32, prenormalizedDesiredReplicas int32, minReplicas int32) int32 {
+	// stabilizedRecommendation 函数调用，返回经过稳定化处理后的建议副本数
+    stabilizedRecommendation := a.stabilizeRecommendation(key, prenormalizedDesiredReplicas)
+
+    // 如果经过稳定化处理后的建议副本数与之前的不同，表示有变化，则设置相应的 condition 和 reason
+    if stabilizedRecommendation != prenormalizedDesiredReplicas {
+        setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "ScaleDownStabilized", "recent recommendations were higher than current one, applying the highest recent recommendation")
+    } else {
+        // 如果经过稳定化处理后的建议副本数与之前相同，则设置另一组 condition 和 reason
+        setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "ReadyForNewScale", "recommended size matches current size")
+    }
+
+    // convertDesiredReplicasWithRules 函数调用，返回经过规则处理后的期望副本数、condition 和 reason
+    desiredReplicas, condition, reason := convertDesiredReplicasWithRules(currentReplicas, stabilizedRecommendation, minReplicas, hpa.Spec.MaxReplicas)
+
+    // 如果经过规则处理后的期望副本数与经过稳定化处理后的建议副本数相同，则设置相应的 condition 和 reason
+    if desiredReplicas == stabilizedRecommendation {
+        setCondition(hpa, autoscalingv2.ScalingLimited, v1.ConditionFalse, condition, reason)
+    } else {
+        // 如果经过规则处理后的期望副本数与经过稳定化处理后的建议副本数不同，则设置相应的 condition 和 reason
+        setCondition(hpa, autoscalingv2.ScalingLimited, v1.ConditionTrue, condition, reason)
+    }
+
+    // 返回经过规则处理后的期望副本数
+    return desiredReplicas
+}
+```
+
+##### stabilizeRecommendation
+
+```GO
+func (a *HorizontalController) stabilizeRecommendation(key string, prenormalizedDesiredReplicas int32) int32 {
+	// 将 prenormalizedDesiredReplicas 设为最大值
+    maxRecommendation := prenormalizedDesiredReplicas
+
+    // foundOldSample 和 oldSampleIndex 用于记录是否找到旧的样本及其位置
+    foundOldSample := false
+    oldSampleIndex := 0
+
+    // cutoff 用于计算当前时间往前推 a.downscaleStabilisationWindow 后的时间
+    cutoff := time.Now().Add(-a.downscaleStabilisationWindow)
+
+    // 加锁保护 recommendations
+    a.recommendationsLock.Lock()
+    defer a.recommendationsLock.Unlock()
+
+    // 遍历 recommendations[key]
+    for i, rec := range a.recommendations[key] {
+        // 如果当前记录的时间早于 cutoff，则认为是旧的样本
+        if rec.timestamp.Before(cutoff) {
+            foundOldSample = true
+            oldSampleIndex = i
+        // 否则，如果当前建议副本数大于最大值，则更新最大值
+        } else if rec.recommendation > maxRecommendation {
+            maxRecommendation = rec.recommendation
+        }
+    }
+
+    // 如果找到了旧的样本，则用新的样本替换旧的样本
+    if foundOldSample {
+        a.recommendations[key][oldSampleIndex] = timestampedRecommendation{prenormalizedDesiredReplicas, time.Now()}
+    } else {
+        // 否则，将新的样本追加到 recommendations[key] 中
+        a.recommendations[key] = append(a.recommendations[key], timestampedRecommendation{prenormalizedDesiredReplicas, time.Now()})
+    }
+
+    // 返回经过稳定化处理后的最大建议副本数
+    return maxRecommendation
+}
+```
+
+#### normalizeDesiredReplicasWithBehaviors
+
+```GO
+func (a *HorizontalController) normalizeDesiredReplicasWithBehaviors(hpa *autoscalingv2.HorizontalPodAutoscaler, key string, currentReplicas, prenormalizedDesiredReplicas, minReplicas int32) int32 {
+	// 如果需要，初始化下降缩放稳定化窗口
+	a.maybeInitScaleDownStabilizationWindow(hpa)
+
+	// 初始化归一化参数结构体
+	normalizationArg := NormalizationArg{
+		Key:               key,
+		ScaleUpBehavior:   hpa.Spec.Behavior.ScaleUp,
+		ScaleDownBehavior: hpa.Spec.Behavior.ScaleDown,
+		MinReplicas:       minReplicas,
+		MaxReplicas:       hpa.Spec.MaxReplicas,
+		CurrentReplicas:   currentReplicas,
+		DesiredReplicas:   prenormalizedDesiredReplicas,
+	}
+
+	// 调用 stabilizeRecommendationWithBehaviors 方法获取经过扩缩容行为修正后的归一化推荐值
+	stabilizedRecommendation, reason, message := a.stabilizeRecommendationWithBehaviors(normalizationArg)
+
+	// 如果 stabilizeRecommendationWithBehaviors 返回的归一化推荐值与传入的 prenormalizedDesiredReplicas 不同，则设置 AbleToScale 条件
+	if stabilizedRecommendation != prenormalizedDesiredReplicas {
+		// AbleToScale 条件类型取决于 scale up/down 行为修正的结果
+		setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, reason, message)
+	} else {
+		// 如果归一化推荐值与当前副本数相同，也设置 AbleToScale 条件，表示 ready for new scale
+		setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "ReadyForNewScale", "recommended size matches current size")
+	}
+
+	// 调用 convertDesiredReplicasWithBehaviorRate 方法获取最终的归一化推荐值，并返回
+	desiredReplicas, reason, message := a.convertDesiredReplicasWithBehaviorRate(normalizationArg)
+
+	// 设置 ScalingLimited 条件类型
+	if desiredReplicas == stabilizedRecommendation {
+		setCondition(hpa, autoscalingv2.ScalingLimited, v1.ConditionFalse, reason, message)
+	} else {
+		setCondition(hpa, autoscalingv2.ScalingLimited, v1.ConditionTrue, reason, message)
+	}
+
+	return desiredReplicas
+}
+
+type NormalizationArg struct {
+	Key               string
+	ScaleUpBehavior   *autoscalingv2.HPAScalingRules
+	ScaleDownBehavior *autoscalingv2.HPAScalingRules
+	MinReplicas       int32
+	MaxReplicas       int32
+	CurrentReplicas   int32
+	DesiredReplicas   int32
+}
+```
+
+##### maybeInitScaleDownStabilizationWindow
+
+```GO
+func (a *HorizontalController) maybeInitScaleDownStabilizationWindow(hpa *autoscalingv2.HorizontalPodAutoscaler) {
+	behavior := hpa.Spec.Behavior
+	if behavior != nil && behavior.ScaleDown != nil && behavior.ScaleDown.StabilizationWindowSeconds == nil {
+        // 计算当前水平控制器的 downscaleStabilisationWindow 时间长度（秒），并将其赋值给 
+		stabilizationWindowSeconds := (int32)(a.downscaleStabilisationWindow.Seconds())
+		hpa.Spec.Behavior.ScaleDown.StabilizationWindowSeconds = &stabilizationWindowSeconds
+	}
+}
+```
+
+##### stabilizeRecommendationWithBehaviors
+
+```GO
+func (a *HorizontalController) stabilizeRecommendationWithBehaviors(args NormalizationArg) (int32, string, string) {
+	now := time.Now() // 获取当前时间
+
+	foundOldSample := false // 定义变量，表示是否找到旧的样本
+	oldSampleIndex := 0 // 定义变量，表示旧样本的索引位置
+
+	upRecommendation := args.DesiredReplicas // 设置初始上限推荐值为期望的副本数
+	upDelaySeconds := *args.ScaleUpBehavior.StabilizationWindowSeconds // 获取上升行为的稳定窗口时间
+	upCutoff := now.Add(-time.Second * time.Duration(upDelaySeconds)) // 计算上限时间截止值
+
+	downRecommendation := args.DesiredReplicas // 设置初始下限推荐值为期望的副本数
+	downDelaySeconds := *args.ScaleDownBehavior.StabilizationWindowSeconds // 获取下降行为的稳定窗口时间
+	downCutoff := now.Add(-time.Second * time.Duration(downDelaySeconds)) // 计算下限时间截止值
+
+	// 计算上下限推荐值
+	a.recommendationsLock.Lock() // 加锁
+	defer a.recommendationsLock.Unlock() // 最后解锁
+	for i, rec := range a.recommendations[args.Key] { // 遍历每个时间戳推荐值
+		if rec.timestamp.After(upCutoff) { // 如果时间戳在上限时间截止值之后
+			upRecommendation = min(rec.recommendation, upRecommendation) // 记录最小推荐值
+		}
+		if rec.timestamp.After(downCutoff) { // 如果时间戳在下限时间截止值之后
+			downRecommendation = max(rec.recommendation, downRecommendation) // 记录最大推荐值
+		}
+		if rec.timestamp.Before(upCutoff) && rec.timestamp.Before(downCutoff) { // 如果时间戳在上限和下限时间截止值之前
+			foundOldSample = true // 标记找到旧的样本
+			oldSampleIndex = i // 记录旧样本的索引位置
+		}
+	}
+
+	// 将推荐值限制在上下限范围内（稳定）
+	recommendation := args.CurrentReplicas // 将推荐值设置为当前副本数
+	if recommendation < upRecommendation { // 如果推荐值小于上限推荐值
+		recommendation = upRecommendation // 推荐值设置为上限推荐值
+	}
+	if recommendation > downRecommendation { // 如果推荐值大于下限推荐值
+		recommendation = downRecommendation // 推荐值设置为下限推荐值
+	}
+
+	// 记录未稳定的推荐值
+	if foundOldSample { // 如果找到了旧的样本
+        a.recommendations[args.Key][oldSampleIndex] = timestampedRecommendation{args.DesiredReplicas, time.Now()} // 更新旧的样本
+    } else {
+        a.recommendations[args.Key] = append(a.recommendations[args.Key], timestampedRecommendation{args.DesiredReplicas, time.Now()}) // 添加新的样本
+    }
+
+    // 确定一个人性化的消息
+    var reason, message string
+    if args.DesiredReplicas >= args.CurrentReplicas { // 如果期望副本数大于等于当前副本数
+        reason = "ScaleUpStabilized" // 则将原因标记为 "ScaleUpStabilized"，即稳定地增加副本数
+        message = "recent recommendations were lower than current one, applying the lowest recent recommendation" // 将消息标记为最近的建议低于当前建议，应用最低的最近建议
+    } else {
+        reason = "ScaleDownStabilized" // 否则将原因标记为 "ScaleDownStabilized"，即稳定地减少副本数
+        message = "recent recommendations were higher than current one, applying the highest recent recommendation" // 将消息标记为最近的建议高于当前建议，应用最高的最近建议
+    }
+    return recommendation, reason, message // 返回建议、原因和消息
+}
+```
+
+##### convertDesiredReplicasWithBehaviorRate
+
+```GO
+func (a *HorizontalController) convertDesiredReplicasWithBehaviorRate(args NormalizationArg) (int32, string, string) {
+	var possibleLimitingReason, possibleLimitingMessage string
+
+	if args.DesiredReplicas > args.CurrentReplicas { // 如果期望的副本数大于当前的副本数
+		a.scaleUpEventsLock.RLock() // 读锁定scaleUpEvents
+		defer a.scaleUpEventsLock.RUnlock()
+		a.scaleDownEventsLock.RLock() // 读锁定scaleDownEvents
+		defer a.scaleDownEventsLock.RUnlock()
+		scaleUpLimit := calculateScaleUpLimitWithScalingRules(args.CurrentReplicas, a.scaleUpEvents[args.Key], a.scaleDownEvents[args.Key], args.ScaleUpBehavior) // 计算上限
+
+		if scaleUpLimit < args.CurrentReplicas { // 如果上限小于当前副本数，不应继续扩容直到清理scaleUpEvents
+			scaleUpLimit = args.CurrentReplicas
+		}
+		maximumAllowedReplicas := args.MaxReplicas // 允许的最大副本数
+		if maximumAllowedReplicas > scaleUpLimit { // 如果最大副本数大于上限，则按上限调整最大副本数
+			maximumAllowedReplicas = scaleUpLimit
+			possibleLimitingReason = "ScaleUpLimit" // 潜在的限制原因是上限
+			possibleLimitingMessage = "the desired replica count is increasing faster than the maximum scale rate" // 潜在的限制消息是期望的副本数增加速度快于最大扩容速率
+		} else {
+			possibleLimitingReason = "TooManyReplicas" // 潜在的限制原因是副本数过多
+			possibleLimitingMessage = "the desired replica count is more than the maximum replica count" // 潜在的限制消息是期望的副本数超过最大副本数
+		}
+		if args.DesiredReplicas > maximumAllowedReplicas { // 如果期望的副本数大于最大允许的副本数，则返回最大允许的副本数
+			return maximumAllowedReplicas, possibleLimitingReason, possibleLimitingMessage
+		}
+	} else if args.DesiredReplicas < args.CurrentReplicas { // 如果期望的副本数小于当前的副本数
+		a.scaleUpEventsLock.RLock() // 读锁定scaleUpEvents
+		defer a.scaleUpEventsLock.RUnlock()
+		a.scaleDownEventsLock.RLock() // 读锁定scaleDownEvents
+		defer a.scaleDownEventsLock.RUnlock()
+		scaleDownLimit := calculateScaleDownLimitWithBehaviors(args.CurrentReplicas, a.scaleUpEvents[args.Key], a.scaleDownEvents[args.Key], args.ScaleDownBehavior) // 计算下限
+
+		if scaleDownLimit > args.CurrentReplicas { // 如果下限大于当前副本数，不应继续缩容直到清理scaleDownEvents
+			scaleDownLimit = args.CurrentReplicas
+		}
+		minimumAllowedReplicas := args.MinReplicas // 允许的最小副本数
+		if minimumAllowedReplicas < scaleDownLimit { //如果最小允许实例数量小于了扩容下限，则需要进行限制，记录下限制原因和原因描述信息
+			minimumAllowedReplicas = scaleDownLimit // 记录限制原因为“扩容下限”
+			possibleLimitingReason = "ScaleDownLimit"
+			possibleLimitingMessage = "the desired replica count is decreasing faster than the maximum scale rate"
+		} else { // 如果不需要限制，则记录原因描述信息和原因
+			possibleLimitingMessage = "the desired replica count is less than the minimum replica count"
+			possibleLimitingReason = "TooFewReplicas"
+		}
+		if args.DesiredReplicas < minimumAllowedReplicas { // 如果期望的实例数量小于了最小允许实例数量，则需要进行限制，返回最小允许实例数量以及限制原因和原因描述信息
+			return minimumAllowedReplicas, possibleLimitingReason, possibleLimitingMessage
+		}
+	}
+    // 如果实例数量在合理范围内，则返回期望的实例数量以及状态“DesiredWithinRange”和状态描述信息“期望的实例数量在可接受的范围内”
+	return args.DesiredReplicas, "DesiredWithinRange", "the desired count is within the acceptable range"
 }
 ```
 
