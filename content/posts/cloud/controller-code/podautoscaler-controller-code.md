@@ -1981,6 +1981,429 @@ func (a *HorizontalController) recordInitialRecommendation(currentReplicas int32
 }
 ````
 
+#### computeReplicasForMetrics
+
+```GO
+func (a *HorizontalController) computeReplicasForMetrics(ctx context.Context, hpa *autoscalingv2.HorizontalPodAutoscaler, scale *autoscalingv1.Scale,
+	metricSpecs []autoscalingv2.MetricSpec) (replicas int32, metric string, statuses []autoscalingv2.MetricStatus, timestamp time.Time, err error) {
+	// 计算基于指标的自动伸缩副本数
+
+	selector, err := a.validateAndParseSelector(hpa, scale.Status.Selector) // 验证并解析选择器
+	if err != nil {
+		return -1, "", nil, time.Time{}, err // 如果出错，返回错误信息
+	}
+
+	specReplicas := scale.Spec.Replicas // 获取期望副本数
+	statusReplicas := scale.Status.Replicas // 获取当前副本数
+	statuses = make([]autoscalingv2.MetricStatus, len(metricSpecs)) // 根据指标规格数量初始化指标状态数组
+
+	invalidMetricsCount := 0 // 记录无效指标数量
+	var invalidMetricError error // 记录无效指标错误
+	var invalidMetricCondition autoscalingv2.HorizontalPodAutoscalerCondition // 记录无效指标的条件
+
+	for i, metricSpec := range metricSpecs { // 遍历每个指标规格
+		replicaCountProposal, metricNameProposal, timestampProposal, condition, err := a.computeReplicasForMetric(ctx, hpa, metricSpec, specReplicas, statusReplicas, selector, &statuses[i])
+
+		if err != nil { // 如果计算指标出错
+			if invalidMetricsCount <= 0 { // 如果是第一个无效的指标
+				invalidMetricCondition = condition // 记录无效指标的条件
+				invalidMetricError = err // 记录无效指标的错误
+			}
+			invalidMetricsCount++ // 无效指标数量加一
+			continue // 继续下一个指标的计算
+		}
+		if replicas == 0 || replicaCountProposal > replicas { // 如果当前指标的副本数大于之前计算的副本数
+			timestamp = timestampProposal // 更新时间戳
+			replicas = replicaCountProposal // 更新副本数
+			metric = metricNameProposal // 更新指标名称
+		}
+	}
+
+	if invalidMetricError != nil { // 如果存在无效指标
+		invalidMetricError = fmt.Errorf("invalid metrics (%v invalid out of %v), first error is: %v", invalidMetricsCount, len(metricSpecs), invalidMetricError) // 构造错误信息
+	}
+
+	// 如果所有指标都无效，或者存在无效指标且计算出的副本数小于期望副本数，则返回错误，并设置 HPA 的条件为第一个无效指标的条件
+	// 否则设置 HPA 的条件为 ScalingActive，表示自动伸缩生效
+	if invalidMetricsCount >= len(metricSpecs) || (invalidMetricsCount > 0 && replicas < specReplicas) {
+		setCondition(hpa, invalidMetricCondition.Type, invalidMetricCondition.Status, invalidMetricCondition.Reason, invalidMetricCondition.Message)
+		return -1, "", statuses, time.Time{}, invalidMetricError
+	}
+	setCondition(hpa, autoscalingv2.ScalingActive, v1.ConditionTrue, "ValidMetricFound", "the HPA was able to successfully calculate a replica count from %s", metric)
+
+	return replicas, metric, statuses, timestamp, invalidMetricError
+}
+```
+
+##### validateAndParseSelector
+
+```go
+func (a *HorizontalController) validateAndParseSelector(hpa *autoscalingv2.HorizontalPodAutoscaler, selector string) (labels.Selector, error) {
+	// 校验并解析传入的 selector 参数
+	if selector == "" {
+		// 如果 selector 参数为空，则记录错误事件并设置 HPA 的条件
+		errMsg := "selector is required" 
+		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "SelectorRequired", errMsg)
+		setCondition(hpa, autoscalingv2.ScalingActive, v1.ConditionFalse, "InvalidSelector", "the HPA target's scale is missing a selector")
+		return nil, fmt.Errorf(errMsg)
+	}
+
+	// 将 selector 字符串解析为内部的 selector 对象
+	parsedSelector, err := labels.Parse(selector)
+	if err != nil {
+		// 如果解析失败，则记录错误事件并设置 HPA 的条件
+		errMsg := fmt.Sprintf("couldn't convert selector into a corresponding internal selector object: %v", err)
+		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "InvalidSelector", errMsg)
+		setCondition(hpa, autoscalingv2.ScalingActive, v1.ConditionFalse, "InvalidSelector", errMsg)
+		return nil, fmt.Errorf(errMsg)
+	}
+
+	// 构建 HPA 的键值
+	hpaKey := selectors.Key{Name: hpa.Name, Namespace: hpa.Namespace}
+	a.hpaSelectorsMux.Lock()
+	if a.hpaSelectors.SelectorExists(hpaKey) {
+		// 如果 HPA 在 enqueueHPA 中注册，则更新 HPA 的选择器
+		a.hpaSelectors.PutSelector(hpaKey, parsedSelector)
+	}
+	a.hpaSelectorsMux.Unlock()
+
+	// 根据解析后的 selector 查询符合条件的 Pods
+	pods, err := a.podLister.Pods(hpa.Namespace).List(parsedSelector)
+	if err != nil {
+		return nil, err
+	}
+
+	// 检查由 selector 控制的 Pods 是否受到多个 HPA 的控制
+	selectingHpas := a.hpasControllingPodsUnderSelector(pods)
+	if len(selectingHpas) > 1 {
+		// 如果由 selector 控制的 Pods 受到多个 HPA 控制，则记录错误事件并设置 HPA 的条件
+		errMsg := fmt.Sprintf("pods by selector %v are controlled by multiple HPAs: %v", selector, selectingHpas)
+		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "AmbiguousSelector", errMsg)
+		setCondition(hpa, autoscalingv2.ScalingActive, v1.ConditionFalse, "AmbiguousSelector", errMsg)
+		return nil, fmt.Errorf(errMsg)
+	}
+
+	// 返回解析后的 selector 对象
+	return parsedSelector, nil
+}
+```
+
+
+
+```go
+func (a *HorizontalController) computeReplicasForMetric(ctx context.Context, hpa *autoscalingv2.HorizontalPodAutoscaler, spec autoscalingv2.MetricSpec,
+	specReplicas, statusReplicas int32, selector labels.Selector, status *autoscalingv2.MetricStatus) (replicaCountProposal int32, metricNameProposal string,
+	timestampProposal time.Time, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+	// actionLabel is used to report which actions this reconciliation has taken.
+	start := time.Now()
+	defer func() {
+		actionLabel := monitor.ActionLabelNone
+		switch {
+		case replicaCountProposal > hpa.Status.CurrentReplicas:
+			actionLabel = monitor.ActionLabelScaleUp
+		case replicaCountProposal < hpa.Status.CurrentReplicas:
+			actionLabel = monitor.ActionLabelScaleDown
+		}
+
+		errorLabel := monitor.ErrorLabelNone
+		if err != nil {
+			// In case of error, set "internal" as default.
+			errorLabel = monitor.ErrorLabelInternal
+			actionLabel = monitor.ActionLabelNone
+		}
+		if errors.Is(err, errSpec) {
+			errorLabel = monitor.ErrorLabelSpec
+		}
+
+		a.monitor.ObserveMetricComputationResult(actionLabel, errorLabel, time.Since(start), spec.Type)
+	}()
+
+	switch spec.Type {
+	case autoscalingv2.ObjectMetricSourceType: // 如果是对象型指标
+		metricSelector, err := metav1.LabelSelectorAsSelector(spec.Object.Metric.Selector) // 将对象型指标的选择器转换为Selector
+		if err != nil {
+			condition := a.getUnableComputeReplicaCountCondition(hpa, "FailedGetObjectMetric", err)
+			return 0, "", time.Time{}, condition, fmt.Errorf("failed to get object metric value: %v", err)
+		}
+		replicaCountProposal, timestampProposal, metricNameProposal, condition, err = a.computeStatusForObjectMetric(specReplicas, statusReplicas, spec, hpa, selector, status, metricSelector) // 计算对象型指标的副本数量
+		if err != nil {
+			return 0, "", time.Time{}, condition, fmt.Errorf("failed to get object metric value: %v", err)
+		}
+	case autoscalingv2.PodsMetricSourceType: // 如果是Pods型指标
+		metricSelector, err := metav1.LabelSelectorAsSelector(spec.Pods.Metric.Selector) // 将Pods型指标的选择器转换为Selector
+		if err != nil {
+			condition := a.getUnableComputeReplicaCountCondition(hpa, "FailedGetPodsMetric", err)
+			return 0, "", time.Time{}, condition, fmt.Errorf("failed to get pods metric value: %v", err)
+		}
+		replicaCountProposal, timestampProposal, metricNameProposal, condition, err = a.computeStatusForPodsMetric(specReplicas, spec, hpa, selector, status, metricSelector) // 计算Pods型指标的副本数量
+		if err != nil {
+			return 0, "", time.Time{}, condition, fmt.Errorf("failed to get pods metric value: %v", err)
+		}
+	case autoscalingv2.ResourceMetricSourceType: // 如果是资源型指标
+		replicaCountProposal, timestampProposal, metricNameProposal, condition, err = a.computeStatusForResourceMetric(ctx, specReplicas, spec, hpa, selector, status) // 计算资源型指标
+        if err != nil {
+			return 0, "", time.Time{}, condition, fmt.Errorf("failed to get %s resource metric value: %v", spec.Resource.Name, err)
+		}
+  	case autoscalingv2.ContainerResourceMetricSourceType:
+		if !a.containerResourceMetricsEnabled {
+			// If the container resource metrics feature is disabled but the object has the one,
+			// that means the user enabled the feature once,
+			// created some HPAs with the container resource metrics, and disabled it finally.
+			return 0, "", time.Time{}, condition, fmt.Errorf("ContainerResource metric type is not supported: disabled by the feature gate")
+		}
+		replicaCountProposal, timestampProposal, metricNameProposal, condition, err = a.computeStatusForContainerResourceMetric(ctx, specReplicas, spec, hpa, selector, status)
+		if err != nil {
+			return 0, "", time.Time{}, condition, fmt.Errorf("failed to get %s container metric value: %v", spec.ContainerResource.Container, err)
+		}
+	case autoscalingv2.ExternalMetricSourceType:
+		replicaCountProposal, timestampProposal, metricNameProposal, condition, err = a.computeStatusForExternalMetric(specReplicas, statusReplicas, spec, hpa, selector, status)
+		if err != nil {
+			return 0, "", time.Time{}, condition, fmt.Errorf("failed to get %s external metric value: %v", spec.External.Metric.Name, err)
+		}
+	default:
+		// 它不应该到达这里，因为在api服务器的验证中过滤掉了无效的度量源类型
+		err = fmt.Errorf("unknown metric source type %q%w", string(spec.Type), errSpec)
+		condition := a.getUnableComputeReplicaCountCondition(hpa, "InvalidMetricSourceType", err)
+		return 0, "", time.Time{}, condition, err
+	}
+	return replicaCountProposal, metricNameProposal, timestampProposal, autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
+}
+```
+
+###### getUnableComputeReplicaCountCondition
+
+```GO
+func (a *HorizontalController) getUnableComputeReplicaCountCondition(hpa runtime.Object, reason string, err error) (condition autoscalingv2.HorizontalPodAutoscalerCondition) {
+	a.eventRecorder.Event(hpa, v1.EventTypeWarning, reason, err.Error())
+	return autoscalingv2.HorizontalPodAutoscalerCondition{
+		Type:    autoscalingv2.ScalingActive,
+		Status:  v1.ConditionFalse,
+		Reason:  reason,
+		Message: fmt.Sprintf("the HPA was unable to compute the replica count: %v", err),
+	}
+}
+```
+
+###### computeStatusForObjectMetric
+
+```GO
+func (a *HorizontalController) computeStatusForObjectMetric(specReplicas, statusReplicas int32, metricSpec autoscalingv2.MetricSpec, hpa *autoscalingv2.HorizontalPodAutoscaler, selector labels.Selector, status *autoscalingv2.MetricStatus, metricSelector labels.Selector) (replicas int32, timestamp time.Time, metricName string, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+	if metricSpec.Object.Target.Type == autoscalingv2.ValueMetricType {
+		// 如果指标类型为ValueMetricType
+		replicaCountProposal, usageProposal, timestampProposal, err := a.replicaCalc.GetObjectMetricReplicas(specReplicas, metricSpec.Object.Target.Value.MilliValue(), metricSpec.Object.Metric.Name, hpa.Namespace, &metricSpec.Object.DescribedObject, selector, metricSelector)
+		if err != nil {
+			// 如果计算指标失败，设置错误条件并返回
+			condition := a.getUnableComputeReplicaCountCondition(hpa, "FailedGetObjectMetric", err)
+			return 0, timestampProposal, "", condition, err
+		}
+		// 设置 MetricStatus 结构体的值
+		*status = autoscalingv2.MetricStatus{
+			Type: autoscalingv2.ObjectMetricSourceType,
+			Object: &autoscalingv2.ObjectMetricStatus{
+				DescribedObject: metricSpec.Object.DescribedObject,
+				Metric: autoscalingv2.MetricIdentifier{
+					Name:     metricSpec.Object.Metric.Name,
+					Selector: metricSpec.Object.Metric.Selector,
+				},
+				Current: autoscalingv2.MetricValueStatus{
+					Value: resource.NewMilliQuantity(usageProposal, resource.DecimalSI),
+				},
+			},
+		}
+		// 返回计算得到的结果
+		return replicaCountProposal, timestampProposal, fmt.Sprintf("%s metric %s", metricSpec.Object.DescribedObject.Kind, metricSpec.Object.Metric.Name), autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
+	} else if metricSpec.Object.Target.Type == autoscalingv2.AverageValueMetricType {
+		// 如果指标类型为AverageValueMetricType
+		replicaCountProposal, usageProposal, timestampProposal, err := a.replicaCalc.GetObjectPerPodMetricReplicas(statusReplicas, metricSpec.Object.Target.AverageValue.MilliValue(), metricSpec.Object.Metric.Name, hpa.Namespace, &metricSpec.Object.DescribedObject, metricSelector)
+		if err != nil {
+			// 如果计算指标失败，设置错误条件并返回
+			condition := a.getUnableComputeReplicaCountCondition(hpa, "FailedGetObjectMetric", err)
+			return 0, time.Time{}, "", condition, fmt.Errorf("failed to get %s object metric: %v", metricSpec.Object.Metric.Name, err)
+		}
+		// 设置 MetricStatus 结构体的值
+		*status = autoscalingv2.MetricStatus{
+			Type: autoscalingv2.ObjectMetricSourceType,
+			Object: &autoscalingv2.ObjectMetricStatus{
+				Metric: autoscalingv2.MetricIdentifier{
+					Name:     metricSpec.Object.Metric.Name,
+					Selector: metricSpec.Object.Metric.Selector,
+				},
+				Current: autoscalingv2.MetricValueStatus{
+					AverageValue: resource.NewMilliQuantity(usageProposal, resource.DecimalSI),
+				},
+			},
+		}
+		// 返回计算得到的结果
+		return replicaCountProposal, timestampProposal, fmt.Sprintf("external metric %s(%+v)", metricSpec.Object.Metric.Name, metricSpec.Object.Metric.Selector), autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
+	}
+    // 如果前面的条件不满足，则说明 object metric 源无效，将生成一个错误信息并返回相应的 condition 和错误信息
+	errMsg := "invalid object metric source: neither a value target nor an average value target was set"
+	err = fmt.Errorf(errMsg)
+	condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetObjectMetric", err)
+	return 0, time.Time{}, "", condition, err
+}                                                                   
+```
+
+###### computeStatusForPodsMetric
+
+```GO
+// 定义一个名为HorizontalController的结构体，具有computeStatusForPodsMetric方法
+func (a *HorizontalController) computeStatusForPodsMetric(currentReplicas int32, metricSpec autoscalingv2.MetricSpec, hpa *autoscalingv2.HorizontalPodAutoscaler, selector labels.Selector, status *autoscalingv2.MetricStatus, metricSelector labels.Selector) (replicaCountProposal int32, timestampProposal time.Time, metricNameProposal string, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+	
+	// 调用replicaCalc结构体中的GetMetricReplicas方法，获取指标的当前副本数，使用率，时间戳和错误信息
+	replicaCountProposal, usageProposal, timestampProposal, err := a.replicaCalc.GetMetricReplicas(currentReplicas, metricSpec.Pods.Target.AverageValue.MilliValue(), metricSpec.Pods.Metric.Name, hpa.Namespace, selector, metricSelector)
+	if err != nil {
+		// 如果获取指标失败，则返回UnableComputeReplicaCountCondition错误条件，指示无法计算副本数
+		condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetPodsMetric", err)
+		return 0, timestampProposal, "", condition, err
+	}
+	
+	// 将指标状态设置为当前指标的状态
+	*status = autoscalingv2.MetricStatus{
+		Type: autoscalingv2.PodsMetricSourceType,
+		Pods: &autoscalingv2.PodsMetricStatus{
+			Metric: autoscalingv2.MetricIdentifier{
+				Name:     metricSpec.Pods.Metric.Name,
+				Selector: metricSpec.Pods.Metric.Selector,
+			},
+			Current: autoscalingv2.MetricValueStatus{
+				AverageValue: resource.NewMilliQuantity(usageProposal, resource.DecimalSI),
+			},
+		},
+	}
+
+	// 返回计算的副本数提议、时间戳提议、指标名称提议、横向Pod自动缩放器条件和无错误
+	return replicaCountProposal, timestampProposal, fmt.Sprintf("pods metric %s", metricSpec.Pods.Metric.Name), autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
+}
+```
+
+###### computeStatusForResourceMetric
+
+```go
+func (a *HorizontalController) computeStatusForResourceMetric(ctx context.Context, currentReplicas int32, metricSpec autoscalingv2.MetricSpec, hpa *autoscalingv2.HorizontalPodAutoscaler,
+selector labels.Selector, status *autoscalingv2.MetricStatus) (replicaCountProposal int32, timestampProposal time.Time,
+metricNameProposal string, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+    // 定义函数 computeStatusForResourceMetric，用于计算 ResourceMetric 类型的指标状态并返回建议的副本数、时间戳、度量名称、水平自动伸缩器的条件和错误
+    // 函数接收的参数包括：ctx 上下文，currentReplicas 当前副本数，metricSpec 指标规范，hpa 水平自动伸缩器，selector 选择器，status 指标状态
+    replicaCountProposal, metricValueStatus, timestampProposal, metricNameProposal, condition, err := a.computeStatusForResourceMetricGeneric(ctx, currentReplicas, metricSpec.Resource.Target, metricSpec.Resource.Name, hpa.Namespace, "", selector, autoscalingv2.ResourceMetricSourceType)
+
+    // 调用 a.computeStatusForResourceMetricGeneric 函数，计算 ResourceMetric 类型的指标状态，并返回建议的副本数、度量值状态、时间戳、度量名称、水平自动伸缩器的条件和错误
+    // 计算时需要传入上下文、当前副本数、度量目标值、度量名称、水平自动伸缩器的命名空间、度量描述、选择器和度量类型
+    // 函数将返回的值分别赋值给 replicaCountProposal、metricValueStatus、timestampProposal、metricNameProposal、condition 和 err
+    if err != nil {
+        condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetResourceMetric", err)
+        // 如果计算出错，调用 a.getUnableComputeReplicaCountCondition 函数，返回计算副本数无法完成的条件
+        // 函数接收的参数包括：hpa 水平自动伸缩器，错误类型 FailedGetResourceMetric 和错误 err
+        return replicaCountProposal, timestampProposal, metricNameProposal, condition, err
+    }
+
+    *status = autoscalingv2.MetricStatus{
+        Type: autoscalingv2.ResourceMetricSourceType,
+        Resource: &autoscalingv2.ResourceMetricStatus{
+            Name:    metricSpec.Resource.Name,
+            Current: *metricValueStatus,
+        },
+    }
+    // 更新 status 的值为 autoscalingv2.MetricStatus 类型，其中 Type 为 ResourceMetricSourceType，Resource 中包括 Name 和 Current 两个字段，分别为度量名称和当前度量值
+    // 前面计算出的 metricSpec.Resource.Name 和 metricValueStatus 分别赋值给 Name 和 Current 字段
+    // 注意这里使用了指针 *metricValueStatus，因为 metricValueStatus 的类型为 *resource.Quantity
+    return replicaCountProposal, timestampProposal, metricNameProposal, condition, nil
+    // 返回计算出的建议副本数、时间戳、度量名称、水平自动伸缩器的条件和错误，注意此时 err 为 nil
+}
+```
+
+###### computeStatusForContainerResourceMetric
+
+```GO
+func (a *HorizontalController) computeStatusForContainerResourceMetric(ctx context.Context, currentReplicas int32, metricSpec autoscalingv2.MetricSpec, hpa *autoscalingv2.HorizontalPodAutoscaler,
+	selector labels.Selector, status *autoscalingv2.MetricStatus) (replicaCountProposal int32, timestampProposal time.Time,
+	metricNameProposal string, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+
+	// 计算容器资源指标的状态，并返回建议的副本数量、时间戳、指标名称、条件和错误
+	replicaCountProposal, metricValueStatus, timestampProposal, metricNameProposal, condition, err := a.computeStatusForResourceMetricGeneric(ctx, currentReplicas, metricSpec.ContainerResource.Target, metricSpec.ContainerResource.Name, hpa.Namespace, metricSpec.ContainerResource.Container, selector, autoscalingv2.ContainerResourceMetricSourceType)
+	if err != nil {
+		// 如果计算状态出现错误，则设置无法计算副本数量的条件，并返回错误
+		condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetContainerResourceMetric", err)
+		return replicaCountProposal, timestampProposal, metricNameProposal, condition, err
+	}
+
+	// 将计算得到的状态更新到传入的参数 status 中
+	*status = autoscalingv2.MetricStatus{
+		Type: autoscalingv2.ContainerResourceMetricSourceType,
+		ContainerResource: &autoscalingv2.ContainerResourceMetricStatus{
+			Name:      metricSpec.ContainerResource.Name,
+			Container: metricSpec.ContainerResource.Container,
+			Current:   *metricValueStatus,
+		},
+	}
+
+	// 返回建议的副本数量、时间戳、指标名称、条件和空错误
+	return replicaCountProposal, timestampProposal, metricNameProposal, condition, nil
+}
+```
+
+
+
+```go
+func (a *HorizontalController) computeStatusForExternalMetric(specReplicas, statusReplicas int32, metricSpec autoscalingv2.MetricSpec, hpa *autoscalingv2.HorizontalPodAutoscaler, selector labels.Selector, status *autoscalingv2.MetricStatus) (replicaCountProposal int32, timestampProposal time.Time, metricNameProposal string, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+	// 如果 metricSpec.External.Target.AverageValue 不为空
+	if metricSpec.External.Target.AverageValue != nil {
+		// 调用 replicaCalc 的 GetExternalPerPodMetricReplicas 方法，计算推荐的副本数量、使用量、时间戳和错误
+		replicaCountProposal, usageProposal, timestampProposal, err := a.replicaCalc.GetExternalPerPodMetricReplicas(statusReplicas, metricSpec.External.Target.AverageValue.MilliValue(), metricSpec.External.Metric.Name, hpa.Namespace, metricSpec.External.Metric.Selector)
+		// 如果计算出现错误
+		if err != nil {
+			// 根据错误获取无法计算副本数量的条件
+			condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetExternalMetric", err)
+			// 返回错误信息
+			return 0, time.Time{}, "", condition, fmt.Errorf("failed to get %s external metric: %v", metricSpec.External.Metric.Name, err)
+		}
+		// 将计算得到的结果设置到 MetricStatus 结构体中
+		*status = autoscalingv2.MetricStatus{
+			Type: autoscalingv2.ExternalMetricSourceType,
+			External: &autoscalingv2.ExternalMetricStatus{
+				Metric: autoscalingv2.MetricIdentifier{
+					Name:     metricSpec.External.Metric.Name,
+					Selector: metricSpec.External.Metric.Selector,
+				},
+				Current: autoscalingv2.MetricValueStatus{
+					AverageValue: resource.NewMilliQuantity(usageProposal, resource.DecimalSI),
+				},
+			},
+		}
+		// 返回推荐的副本数量、时间戳、度量名称和空的条件和错误
+		return replicaCountProposal, timestampProposal, fmt.Sprintf("external metric %s(%+v)", metricSpec.External.Metric.Name, metricSpec.External.Metric.Selector), autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
+	}
+	// 如果 metricSpec.External.Target.Value 不为空
+	if metricSpec.External.Target.Value != nil {
+		// 调用 replicaCalc 的 GetExternalMetricReplicas 方法，计算推荐的副本数量、使用量、时间戳和错误
+		replicaCountProposal, usageProposal, timestampProposal, err := a.replicaCalc.GetExternalMetricReplicas(specReplicas, metricSpec.External.Target.Value.MilliValue(), metricSpec.External.Metric.Name, hpa.Namespace, metricSpec.External.Metric.Selector, selector)
+		if err != nil { // 如果发生错误
+        condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetExternalMetric", err) // 调用方法设置条件
+        return 0, time.Time{}, "", condition, fmt.Errorf("failed to get external metric %s: %v", metricSpec.External.Metric.Name, err) // 返回错误信息
+    }
+
+    *status = autoscalingv2.MetricStatus{ // 设置 MetricStatus 结构体的字段值
+        Type: autoscalingv2.ExternalMetricSourceType, // 设置 Type 字段为 ExternalMetricSourceType
+        External: &autoscalingv2.ExternalMetricStatus{ // 设置 External 字段为 ExternalMetricStatus 结构体指针
+            Metric: autoscalingv2.MetricIdentifier{ // 设置 Metric 字段为 MetricIdentifier 结构体
+                Name:     metricSpec.External.Metric.Name, // 设置 Name 字段为外部指标的名称
+                Selector: metricSpec.External.Metric.Selector, // 设置 Selector 字段为外部指标的选择器
+            },
+            Current: autoscalingv2.MetricValueStatus{ // 设置 Current 字段为 MetricValueStatus 结构体
+                Value: resource.NewMilliQuantity(usageProposal, resource.DecimalSI), // 设置 Value 字段为外部指标的当前值
+            },
+        },
+    }
+
+    return replicaCountProposal, timestampProposal, fmt.Sprintf("external metric %s(%+v)", metricSpec.External.Metric.Name, metricSpec.External.Metric.Selector), autoscalingv2.HorizontalPodAutoscalerCondition{}, nil // 返回各个计算结果以及空的条件和错误
+
+    errMsg := "invalid external metric source: neither a value target nor an average value target was set" // 设置错误消息
+    err = fmt.Errorf(errMsg) // 创建错误对象
+    condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetExternalMetric", err) // 调用方法设置条件
+    return 0, time.Time{}, "", condition, fmt.Errorf(errMsg) // 返回错误信息和空的计算结果
+}
+```
+
 #### setCurrentReplicasInStatus
 
 ```GO
