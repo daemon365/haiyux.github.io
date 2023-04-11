@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/controller/attachdetach-controller.jpg
+featuredImagePreview: /img/preview/controller/attachdetach-controller.jpg
 ---
 
 ## 简介
@@ -1458,6 +1458,354 @@ func (dswp *desiredStateOfWorldPopulator) findAndAddActivePods(logger klog.Logge
 
 	}
 
+}
+```
+
+## Run
+
+```go
+func (adc *attachDetachController) Run(ctx context.Context) {
+	defer runtime.HandleCrash() // 在函数退出时处理可能发生的崩溃
+	defer adc.pvcQueue.ShutDown() // 在函数退出时关闭 pvcQueue
+
+	// 启动事件处理管道
+	adc.broadcaster.StartStructuredLogging(0)
+	adc.broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: adc.kubeClient.CoreV1().Events("")})
+	defer adc.broadcaster.Shutdown() // 在函数退出时关闭事件广播器
+
+	logger := klog.FromContext(ctx) // 从上下文中获取 logger
+	logger.Info("Starting attach detach controller") // 记录日志，表示开始运行附加和分离控制器
+	defer logger.Info("Shutting down attach detach controller") // 在函数退出时记录日志，表示关闭附加和分离控制器
+
+	// 创建 InformerSynced 列表，并添加到 synced 列表中
+	synced := []kcache.InformerSynced{adc.podsSynced, adc.nodesSynced, adc.pvcsSynced, adc.pvsSynced}
+	if adc.csiNodeSynced != nil {
+		synced = append(synced, adc.csiNodeSynced)
+	}
+	if adc.csiDriversSynced != nil {
+		synced = append(synced, adc.csiDriversSynced)
+	}
+	if adc.volumeAttachmentSynced != nil {
+		synced = append(synced, adc.volumeAttachmentSynced)
+	}
+
+	// 等待 InformerSynced 列表同步完成
+	if !kcache.WaitForNamedCacheSync("attach detach", ctx.Done(), synced...) {
+		return
+	}
+
+	// 填充实际状态
+	err := adc.populateActualStateOfWorld(logger)
+	if err != nil {
+		logger.Error(err, "Error populating the actual state of world")
+	}
+
+	// 填充期望状态
+	err = adc.populateDesiredStateOfWorld(logger)
+	if err != nil {
+		logger.Error(err, "Error populating the desired state of world")
+	}
+
+	// 启动协调器、期望状态填充器和 pvcWorker
+	go adc.reconciler.Run(ctx)
+	go adc.desiredStateOfWorldPopulator.Run(ctx)
+	go wait.UntilWithContext(ctx, adc.pvcWorker, time.Second)
+
+	// 注册 metrics
+	metrics.Register(adc.pvcLister,
+		adc.pvLister,
+		adc.podLister,
+		adc.actualStateOfWorld,
+		adc.desiredStateOfWorld,
+		&adc.volumePluginMgr,
+		adc.csiMigratedPluginManager,
+		adc.intreeToCSITranslator)
+
+	<-ctx.Done() // 等待 ctx 被取消，函数退出
+}
+```
+
+### populateActualStateOfWorld
+
+```GO
+func (adc *attachDetachController) populateActualStateOfWorld(logger klog.Logger) error {
+    logger.V(5).Info("Populating ActualStateOfworld") // 记录日志，表示正在填充 ActualStateOfWorld
+
+    nodes, err := adc.nodeLister.List(labels.Everything()) // 获取所有节点信息
+    if err != nil {
+        return err
+    }
+
+    for _, node := range nodes { // 遍历每个节点
+        nodeName := types.NodeName(node.Name)
+        for _, attachedVolume := range node.Status.VolumesAttached { // 遍历每个节点的已附加卷信息
+            uniqueName := attachedVolume.Name
+            // 空的 VolumeSpec 只有在卷没有被任何 Pod 使用时才是安全的
+            // 在这种情况下，卷应该在第一个协调周期内被分离，并且不需要 VolumeSpec 来分离卷
+            // 如果卷被 Pod 使用，其规范会在 populateDesiredStateOfWorld 中更新 ActualStateOfWorld
+            err = adc.actualStateOfWorld.MarkVolumeAsAttached(logger, uniqueName, nil /* VolumeSpec */, nodeName, attachedVolume.DevicePath) // 将卷标记为已附加到节点上
+            if err != nil {
+                logger.Error(err, "Failed to mark the volume as attached") // 记录错误日志，表示无法将卷标记为已附加
+                continue
+            }
+            adc.processVolumesInUse(logger, nodeName, node.Status.VolumesInUse) // 处理正在使用的卷
+            adc.addNodeToDswp(node, types.NodeName(node.Name)) // 将节点添加到 DesiredStateOfWorldPopulator 的节点缓存中
+        }
+    }
+    err = adc.processVolumeAttachments(logger) // 处理卷附件
+    if err != nil {
+        logger.Error(err, "Failed to process volume attachments") // 记录错误日志，表示无法处理卷附件
+    }
+    return err
+}
+```
+
+#### processVolumeAttachments
+
+```GO
+func (adc *attachDetachController) processVolumeAttachments(logger klog.Logger) error {
+	vas, err := adc.volumeAttachmentLister.List(labels.Everything()) // 获取所有的 VolumeAttachment 对象列表
+	if err != nil {
+		logger.Error(err, "Failed to list VolumeAttachment objects") // 如果获取失败，记录错误日志并返回错误
+		return err
+	}
+	for _, va := range vas { // 遍历 VolumeAttachment 对象列表
+		nodeName := types.NodeName(va.Spec.NodeName) // 获取节点名称
+		pvName := va.Spec.Source.PersistentVolumeName // 获取持久卷名称
+		if pvName == nil { // 如果持久卷名称为空，生成警告日志并跳过当前循环
+			logger.Info("Skipping the va as its pvName is nil", "node", klog.KRef("", string(nodeName)), "vaName", va.Name)
+			continue
+		}
+		pv, err := adc.pvLister.Get(*pvName) // 根据持久卷名称获取持久卷对象
+		if err != nil {
+			logger.Error(err, "Unable to lookup pv object", "PV", klog.KRef("", *pvName)) // 如果获取持久卷对象失败，记录错误日志并跳过当前循环
+			continue
+		}
+
+		var plugin volume.AttachableVolumePlugin // 声明可附加卷插件变量
+		volumeSpec := volume.NewSpecFromPersistentVolume(pv, false) // 根据持久卷对象创建卷规格对象
+
+		// 在查询 volumePluginMgr 中注册的插件之前，首先查询 csiMigratedPluginManager 中是否有对应的 in-tree 插件
+		// 注册的 in-tree 插件在迁移到 CSI 后将不再注册，一旦相应的功能门已启用
+		if inTreePluginName, err := adc.csiMigratedPluginManager.GetInTreePluginNameFromSpec(pv, nil); err == nil {
+			if adc.csiMigratedPluginManager.IsMigrationEnabledForPlugin(inTreePluginName) {
+				// 持久卷已迁移到 CSI 插件，应该由 CSI 插件处理而不是 in-tree 插件
+				plugin, _ = adc.volumePluginMgr.FindAttachablePluginByName(csi.CSIPluginName) // 根据插件名称查找可附加卷插件
+				// 对于 Azurefile，这里不需要 podNamespace，因为生成的 volumeName 将在有或没有 podNamespace 的情况下相同
+				volumeSpec, err = csimigration.TranslateInTreeSpecToCSI(volumeSpec, "" /* podNamespace */, adc.intreeToCSITranslator) // 将 in-tree 的卷规格转换为 CSI 的卷规格
+				if err != nil {
+					logger.Error(err, "Failed to translate intree volumeSpec to CSI volumeSpec for volume", "node", klog.KRef("", string(nodeName)), "inTreePluginName", inTreePluginName, "vaName", va.Name, "PV", klog.KRef("", *pvName)) // 如果转换失败，记录错误日志并跳过当前循环
+					continue
+				}
+			}
+            
+            attachState := adc.actualStateOfWorld.GetAttachState(volumeName, nodeName)
+            if attachState == cache.AttachStateDetached {
+                // 如果卷未附加，则将其标记为不确定状态，并将此信息记录到日志中。
+                logger.V(1).Info("Marking volume attachment as uncertain as volume is not attached", "node", klog.KRef("", string(nodeName)), "volumeName", volumeName, "attachState", attachState)
+                err = adc.actualStateOfWorld.MarkVolumeAsUncertain(logger, volumeName, volumeSpec, nodeName)
+                if err != nil {
+                    logger.Error(err, "MarkVolumeAsUncertain fail to add the volume to ASW", "node", klog.KRef("", string(nodeName)), "volumeName", volumeName)
+                }
+            }
+		}
+	return nil
+}
+```
+
+### populateDesiredStateOfWorld
+
+```GO
+func (adc *attachDetachController) populateDesiredStateOfWorld(logger klog.Logger) error {
+	logger.V(5).Info("Populating DesiredStateOfworld") // 记录日志，输出 "Populating DesiredStateOfworld"，日志级别为 5
+
+	pods, err := adc.podLister.List(labels.Everything()) // 获取所有的 Pod 列表
+	if err != nil {
+		return err // 如果获取 Pod 列表失败，返回错误
+	}
+	for _, pod := range pods { // 遍历 Pod 列表
+		podToAdd := pod // 将当前 Pod 赋值给 podToAdd
+		adc.podAdd(logger, podToAdd) // 调用 adc 的 podAdd 方法，传入日志和 podToAdd
+		for _, podVolume := range podToAdd.Spec.Volumes { // 遍历 podToAdd 的 Volumes
+			nodeName := types.NodeName(podToAdd.Spec.NodeName) // 获取 podToAdd 的节点名称
+			// 在 ActualStateOfWorld 中的 volume specs 为 nil，将其替换为从 pod 中找到的正确的 specs。
+			// 在 ActualStateOfWorld 中没有对应的 pod 的 volume specs 将被分离，并且 specs 是无关紧要的。
+			volumeSpec, err := util.CreateVolumeSpec(logger, podVolume, podToAdd, nodeName, &adc.volumePluginMgr, adc.pvcLister, adc.pvLister, adc.csiMigratedPluginManager, adc.intreeToCSITranslator)
+			if err != nil { // 如果创建 volume specs 失败，记录错误日志并继续下一次循环
+				logger.Error(
+					err,
+					"Error creating spec for volume of pod",
+					"pod", klog.KObj(podToAdd),
+					"volumeName", podVolume.Name)
+				continue
+			}
+			plugin, err := adc.volumePluginMgr.FindAttachablePluginBySpec(volumeSpec) // 根据 volume specs 查找可附加的插件
+			if err != nil || plugin == nil { // 如果查找插件失败或者插件为 nil，记录日志并继续下一次循环
+				logger.V(10).Info(
+					"Skipping volume for pod: it does not implement attacher interface",
+					"pod", klog.KObj(podToAdd),
+					"volumeName", podVolume.Name,
+					"err", err)
+				continue
+			}
+			volumeName, err := volumeutil.GetUniqueVolumeNameFromSpec(plugin, volumeSpec) // 根据插件和 volume specs 获取唯一的 volume 名称
+			if err != nil { // 如果获取唯一的 volume 名称失败，记录错误日志并继续下一次循环
+				logger.Error(
+					err,
+					"Failed to find unique name for volume of pod",
+					"pod", klog.KObj(podToAdd),
+					"volumeName", podVolume.Name)
+				continue
+			}
+			attachState := adc.actualStateOfWorld.GetAttachState(volumeName, nodeName) // 获取 volume 在节点上的附加状态
+			if attachState == cache.AttachStateAttached { // 如果 volume 已经附加到节点上
+				logger.V(10).Info("Volume is attached to node. Marking as attached in ActualStateOfWorld",
+					"node", klog.KRef("", string(nodeName)),
+					"volumeName", volumeName)
+                // 调用 getNodeVolumeDevicePath 函数来获取节点的设备路径，如果出错，则将错误信息记录到日志中，并继续下一次循环。
+				devicePath, err := adc.getNodeVolumeDevicePath(volumeName, nodeName)
+				if err != nil {
+					logger.Error(err, "Failed to find device path")
+					continue
+				}
+                // 调用 actualStateOfWorld.MarkVolumeAsAttached 函数，将卷标记为已附加，并将其更新到实际世界的状态中。
+				err = adc.actualStateOfWorld.MarkVolumeAsAttached(logger, volumeName, volumeSpec, nodeName, devicePath)
+				if err != nil {
+					logger.Error(err, "Failed to update volume spec for node", "node", klog.KRef("", string(nodeName)))
+				}
+			}
+        }
+	}
+
+	return nil
+}
+```
+
+#### getNodeVolumeDevicePath
+
+```GO
+func (adc *attachDetachController) getNodeVolumeDevicePath(
+	volumeName v1.UniqueVolumeName, nodeName types.NodeName) (string, error) {
+	var devicePath string
+	var found bool
+	node, err := adc.nodeLister.Get(string(nodeName)) // 通过nodeName从nodeLister获取节点对象
+	if err != nil {
+		return devicePath, err
+	}
+	for _, attachedVolume := range node.Status.VolumesAttached { // 遍历节点上已经挂载的卷
+		if volumeName == attachedVolume.Name { // 如果找到了目标卷
+			devicePath = attachedVolume.DevicePath // 获取卷的设备路径
+			found = true
+			break
+		}
+	}
+	if !found { // 如果没有找到目标卷，则返回错误
+		err = fmt.Errorf("Volume %s not found on node %s", volumeName, nodeName)
+	}
+
+	return devicePath, err
+}
+```
+
+## pvcWorker
+
+```GO
+func (adc *attachDetachController) pvcWorker(ctx context.Context) {
+	for adc.processNextItem(klog.FromContext(ctx)) {
+	}
+}
+
+func (adc *attachDetachController) processNextItem(logger klog.Logger) bool {
+	keyObj, shutdown := adc.pvcQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer adc.pvcQueue.Done(keyObj)
+	
+    // 同步 
+	if err := adc.syncPVCByKey(logger, keyObj.(string)); err != nil {
+		// Rather than wait for a full resync, re-add the key to the
+		// queue to be processed.
+		adc.pvcQueue.AddRateLimited(keyObj)
+		runtime.HandleError(fmt.Errorf("Failed to sync pvc %q, will retry again: %v", keyObj.(string), err))
+		return true
+	}
+
+	// Finally, if no error occurs we Forget this item so it does not
+	// get queued again until another change happens.
+	adc.pvcQueue.Forget(keyObj)
+	return true
+}
+```
+
+### syncPVCByKey
+
+```GO
+func (adc *attachDetachController) syncPVCByKey(logger klog.Logger, key string) error {
+	logger.V(5).Info("syncPVCByKey", "pvcKey", key) // 打印日志，记录 key 值
+	namespace, name, err := kcache.SplitMetaNamespaceKey(key) // 从 key 中解析出 namespace 和 name
+	if err != nil {
+		logger.V(4).Info("Error getting namespace & name of pvc to get pvc from informer", "pvcKey", key, "err", err) // 打印解析错误日志并返回 nil
+		return nil
+	}
+	pvc, err := adc.pvcLister.PersistentVolumeClaims(namespace).Get(name) // 从 pvcLister 获取 PersistentVolumeClaim 对象
+	if apierrors.IsNotFound(err) { // 如果获取的错误是 "Not Found" 错误，则打印日志并返回 nil
+		logger.V(4).Info("Error getting pvc from informer", "pvcKey", key, "err", err)
+		return nil
+	}
+	if err != nil { // 如果获取的错误不是 "Not Found" 错误，则返回错误
+		return err
+	}
+
+	if pvc.Status.Phase != v1.ClaimBound || pvc.Spec.VolumeName == "" {
+		// 跳过未绑定的 PVC
+		return nil
+	}
+
+	objs, err := adc.podIndexer.ByIndex(common.PodPVCIndex, key) // 通过 podIndexer 根据 key 获取 pod 列表
+	if err != nil {
+		return err
+	}
+	for _, obj := range objs { // 遍历 pod 列表
+		pod, ok := obj.(*v1.Pod) // 将对象转换为 Pod 对象
+		if !ok {
+			continue
+		}
+		// 我们只关心 nodeName 已设置且处于活动状态的 Pod
+		if len(pod.Spec.NodeName) == 0 || volumeutil.IsPodTerminated(pod, pod.Status) {
+			continue
+		}
+		volumeActionFlag := util.DetermineVolumeAction(
+			pod,
+			adc.desiredStateOfWorld,
+			true /* default volume action */) // 根据 Pod、desiredStateOfWorld 和默认的 volume action 确定 volume action 标志位
+
+		util.ProcessPodVolumes(logger, pod, volumeActionFlag, /* addVolumes */
+			adc.desiredStateOfWorld, &adc.volumePluginMgr, adc.pvcLister, adc.pvLister, adc.csiMigratedPluginManager, adc.intreeToCSITranslator) // 处理 Pod 的卷，包括添加卷、更新卷和删除卷的操作
+	}
+	return nil
+}
+```
+
+#### DetermineVolumeAction
+
+```go
+func DetermineVolumeAction(pod *v1.Pod, desiredStateOfWorld cache.DesiredStateOfWorld, defaultAction bool) bool {
+	// 如果 Pod 为空或者没有定义任何卷，返回默认操作。
+	if pod == nil || len(pod.Spec.Volumes) <= 0 {
+		return defaultAction
+	}
+
+	// 如果 Pod 处于终止状态，获取 Pod 所在节点的 DesiredStateOfWorld 中的 keepTerminatedPodVolume 设置。
+	if util.IsPodTerminated(pod, pod.Status) {
+		nodeName := types.NodeName(pod.Spec.NodeName)
+		keepTerminatedPodVolume := desiredStateOfWorld.GetKeepTerminatedPodVolumesForNode(nodeName)
+		// 如果 Pod 处于终止状态，根据 kubelet 策略判断是否应该执行卷的卸载操作。
+		return keepTerminatedPodVolume
+	}
+
+	// 如果 Pod 不处于终止状态，返回默认操作。
+	return defaultAction
 }
 ```
 
