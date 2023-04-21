@@ -1239,6 +1239,275 @@ type frameworkImpl struct {
 }
 ```
 
+### Plugin
+
+```GO
+// Plugin is the parent type for all the scheduling framework plugins.
+type Plugin interface {
+	Name() string
+}
+
+```
+
+#### PreEnqueuePlugin
+
+```go
+// PreEnqueuePlugin 接口必须被“PreEnqueue”插件实现。
+// 这些插件在将Pod添加到 activeQ 之前调用。
+// 注意：预调度插件应该是轻量级和高效的，因此不应涉及像访问外部端点这样的昂贵调用；否则将会阻塞事件处理程序中其他Pod的入队。
+type PreEnqueuePlugin interface {
+    Plugin
+    // PreEnqueue 在将Pod添加到 activeQ 之前调用。
+    PreEnqueue(ctx context.Context, p *v1.Pod) *Status
+}
+```
+
+#### QueueSortPlugin
+
+```GO
+// QueueSortPlugin 接口必须被“QueueSort”插件实现。
+// 这些插件用于对调度队列中的Pod进行排序。一次只能启用一个队列排序插件。
+type QueueSortPlugin interface {
+    Plugin
+    // Less 用于对调度队列中的Pod进行排序。
+    Less(*QueuedPodInfo, *QueuedPodInfo) bool
+}
+```
+
+#### PreFilterPlugin
+
+```GO
+// PreFilterPlugin 接口必须被“PreFilter”插件实现。
+// 这些插件在调度周期开始时调用。
+type PreFilterPlugin interface {
+    Plugin
+    // PreFilter 在调度周期开始时调用。所有 PreFilter 插件必须返回成功，否则Pod将被拒绝。
+    // PreFilter 可以选择返回 PreFilterResult 来影响后续评估哪些节点。这对于可以在 O(1) 时间内确定要处理的节点子集的情况很有用。
+    // 当它返回 Skip 状态时，返回的 PreFilterResult 和状态中的其他字段将被忽略，并且配对的 Filter 插件/PreFilterExtensions() 将在此调度周期中被跳过。
+    PreFilter(ctx context.Context, state *CycleState, p *v1.Pod) (*PreFilterResult, *Status)
+    // PreFilterExtensions 如果插件实现，则返回 PreFilterExtensions 接口，否则返回 nil。
+    // Pre-filter 插件可以提供扩展来逐步修改其预处理信息。框架保证扩展 AddPod/RemovePod 只会在 PreFilter 之后调用，可能在克隆的 CycleState 上调用，可能在特定节点上再次调用这些函数之前调用这些函数。
+    PreFilterExtensions() PreFilterExtensions
+}
+```
+
+##### PreFilterExtensions
+
+```GO
+// PreFilterExtensions是一个接口，包含在允许指定回调以对其预计算状态进行增量更新的插件中。
+type PreFilterExtensions interface {
+    // AddPod由框架调用，当调度podToSchedule时，尝试评估将podToAdd添加到节点的影响。
+    AddPod(ctx context.Context, state *CycleState, podToSchedule *v1.Pod, podInfoToAdd *PodInfo, nodeInfo *NodeInfo) *Status
+    // RemovePod由框架调用，当调度podToSchedule时，尝试评估从节点中删除podToRemove的影响。
+    RemovePod(ctx context.Context, state *CycleState, podToSchedule *v1.Pod, podInfoToRemove *PodInfo, nodeInfo *NodeInfo) *Status
+}
+```
+
+#### FilterPlugin
+
+```GO
+// FilterPlugin是过滤器插件的接口。这些插件在过滤扩展点中被调用，用于过滤无法运行pod的主机。
+// 在原始调度程序中，这个概念被称为“predicate”。
+// 这些插件应该在Status.code中返回“Success”、“Unschedulable”或“Error”。
+// 但是，调度程序也接受其他有效的代码。
+// 除了“Success”之外的任何代码都将导致该主机被排除在运行pod的范围之外。
+type FilterPlugin interface {
+    Plugin
+    // Filter被调度框架调用。
+    // 所有Filter插件应该返回“Success”来声明给定节点适合pod。如果Filter没有返回“Success”，它将返回“Unschedulable”、“UnschedulableAndUnresolvable”或“Error”。
+    // 对于正在评估的节点，Filter插件应该查看传递的nodeInfo引用，以获取特定节点信息的信息（例如，在节点上运行的pod），
+    // 而不是在NodeInfoSnapshot中查找它们，因为我们不能保证它们将是相同的。
+    // 例如，在抢占期间，我们可能会传递一个原始nodeInfo对象的副本，其中一些pod已从中删除，以评估抢占它们以调度目标pod的可能性。
+    Filter(ctx context.Context, state *CycleState, pod *v1.Pod, nodeInfo *NodeInfo) *Status
+}
+```
+
+#### PostFilterPlugin
+
+```GO
+// PostFilterPlugin是“PostFilter”插件的接口。这些插件在pod无法被调度后被调用。
+type PostFilterPlugin interface {
+    Plugin
+    // PostFilter由调度框架调用。
+    // PostFilter插件应返回以下状态之一：
+    // - Unschedulable：插件执行成功，但无法使pod可调度。
+    // - Success：插件执行成功，pod可调度。
+    // - Error：插件由于某些内部错误而中止。
+    //
+    // 信息插件应该在其他插件之前进行配置，并始终返回Unschedulable状态。
+    // 可选地，可以在Success状态下返回非nil的PostFilterResult。例如，
+    // 抢占插件可以选择返回nominatedNodeName，以便框架可以重用它来更新抢占pod的.spec.status.nominatedNodeName字段。
+    PostFilter(ctx context.Context, state *CycleState, pod *v1.Pod, filteredNodeStatusMap NodeToStatusMap) (*PostFilterResult, *Status)
+}
+```
+
+#### PreScorePlugin
+
+```GO
+// PreScorePlugin是“PreScore”插件的接口。PreScore是一个信息扩展点。插件将使用通过过滤阶段的节点列表调用。
+// 插件可以使用此数据来更新内部状态或生成日志/指标。
+type PreScorePlugin interface {
+    Plugin
+    // PreScore由调度框架在通过过滤阶段的节点列表后调用。所有的预分数插件必须返回成功，
+    // 否则pod将被拒绝。
+    // 当它返回Skip状态时，状态中的其他字段将被忽略，并且耦合的Score插件将在此调度周期中被跳过。
+    PreScore(ctx context.Context, state *CycleState, pod *v1.Pod, nodes []*v1.Node) *Status
+}
+```
+
+#### ScorePlugin
+
+```GO
+// ScorePlugin是“Score”插件必须实现的接口，用于对通过筛选阶段的节点进行排序。
+type ScorePlugin interface {
+	Plugin
+    // Score在每个过滤后的节点上调用。它必须返回成功和一个表示节点排名的整数。
+    // 所有的评分插件都必须返回成功，否则Pod将被拒绝。
+    Score(ctx context.Context, state *CycleState, p *v1.Pod, nodeName string) (int64, *Status)
+    // ScoreExtensions如果实现了，则返回ScoreExtensions接口，否则返回nil。
+    ScoreExtensions() ScoreExtensions
+}
+```
+
+##### ScoreExtensions
+
+```GO
+// ScoreExtensions是Score扩展功能的接口。
+type ScoreExtensions interface {
+    // NormalizeScore对同一插件的“Score”方法产生的所有节点分数进行调整。
+    // 成功运行NormalizeScore将更新得分列表并返回成功状态。
+    NormalizeScore(ctx context.Context, state *CycleState, p *v1.Pod, scores NodeScoreList) *Status
+}
+```
+
+#### ReservePlugin
+
+```GO
+// ReservePlugin是具有Reserve和Unreserve方法的插件接口。这些方法用于更新插件状态。
+// 在原始调度程序中，这个概念被称为“假定”。这些插件应该只返回Status.code中的Success或Error，但是调度程序也接受其他有效的代码。
+// 除了Success之外的任何代码都将导致拒绝Pod。
+type ReservePlugin interface {
+Plugin
+    // Reserve在更新调度程序缓存时由调度框架调用。如果此方法返回失败的状态，则调度程序将为所有启用的ReservePlugins调用Unreserve方法。
+    Reserve(ctx context.Context, state *CycleState, p *v1.Pod, nodeName string) *Status
+    // Unreserve由调度框架在拒绝保留的Pod、在后续插件的保留过程中发生错误或在后续阶段调用时调用。
+    // Unreserve方法的实现必须是幂等的，即使相应的插件的Reserve方法没有被调用，调度程序也可能会调用Unreserve方法。
+    Unreserve(ctx context.Context, state *CycleState, p *v1.Pod, nodeName string)
+}
+```
+
+#### PreBindPlugin
+
+```GO
+// PreBindPlugin是“PreBind”插件必须实现的接口。
+// 这些插件在调度Pod之前被调用。
+type PreBindPlugin interface {
+    Plugin
+    // PreBind在绑定Pod之前被调用。所有PreBind插件都必须返回Success，否则Pod将被拒绝并且不会被发送进行绑定。
+    PreBind(ctx context.Context, state *CycleState, p *v1.Pod, nodeName string) *Status
+}
+```
+
+#### BindPlugin
+
+```GO
+// BindPlugin 是实现“Bind”插件必须的接口。Bind插件用于将Pod绑定到节点。
+type BindPlugin interface {
+    Plugin
+    // Bind插件在所有预绑定插件完成之前不会被调用。每个绑定插件按照配置的顺序调用。绑定插件可以选择是否处理给定的Pod。如果绑定插件选择处理Pod，则其余绑定插件将被跳过。当绑定插件不处理Pod时，它必须在其状态代码中返回“Skip”。如果绑定插件返回“Error”，则Pod将被拒绝并且不会被绑定。
+    Bind(ctx context.Context, state *CycleState, p *v1.Pod, nodeName string) *Status
+}
+```
+
+#### PostBindPlugin
+
+```GO
+// PostBindPlugin 是实现“PostBind”插件必须的接口。这些插件在成功将Pod绑定到节点后调用。
+type PostBindPlugin interface {
+    Plugin
+    // 在成功绑定Pod到节点后，将调用PostBind。这些插件是信息性的。这个扩展点的一个常见应用是清理。如果插件需要在调度和绑定Pod之后清除其状态，则PostBind是应该注册的扩展点。
+    PostBind(ctx context.Context, state *CycleState, p *v1.Pod, nodeName string)
+}
+```
+
+#### PermitPlugin
+
+```GO
+// PermitPlugin是一个接口，必须由“Permit”插件实现。
+// 这些插件在一个Pod被绑定到节点之前被调用。
+type PermitPlugin interface {
+    Plugin
+    // Permit在绑定Pod之前（以及prebind插件之前）被调用。 Permit插件用于防止或延迟Pod的绑定。
+    // 允许插件必须返回成功或等待一段时间，否则Pod将被拒绝。
+    // 如果等待超时或者在等待时Pod被拒绝，那么Pod也会被拒绝。
+    // 注意，如果插件返回“wait”，则框架只会在运行剩余插件之后等待，
+    // 前提是没有其他插件拒绝该Pod。
+    Permit(ctx context.Context, state *CycleState, p *v1.Pod, nodeName string) (*Status, time.Duration)
+}
+```
+
+#### QueuedPodInfo
+
+```GO
+// QueuedPodInfo 是一个 Pod 包装器，附带了与调度队列中该 Pod 状态相关的其他信息，例如加入队列时的时间戳。
+type QueuedPodInfo struct {
+    *PodInfo
+    // Pod 加入调度队列的时间戳。
+    Timestamp time.Time
+    // 成功调度前的尝试次数。它用于记录尝试次数指标。
+    Attempts int
+    // 当 Pod 第一次添加到队列时的时间。Pod 可能在成功调度之前被多次添加到队列中。
+    // 一旦初始化，就不应再更新。它用于记录 Pod 的端到端调度延迟。
+    InitialAttemptTimestamp time.Time
+    // 如果 Pod 在调度周期中失败，则记录其失败的插件名称。
+    UnschedulablePlugins sets.Set[string]
+    // Pod 是否被调度阻塞（由 PreEnqueuePlugins）。
+    Gated bool
+}
+```
+
+##### PodInfo
+
+```GO
+// PodInfo 是一个包装器，包装了 Pod 对象，同时还包含了一些预处理的信息，以加速处理。这些信息通常是不可变的（例如，预处理的 pod 间亲和力选择器）。
+type PodInfo struct {
+    // Pod 对象
+    Pod *v1.Pod
+    // 所需的亲和性术语（AffinityTerm）列表
+    RequiredAffinityTerms []AffinityTerm
+    // 所需的反亲和性术语（AffinityTerm）列表
+    RequiredAntiAffinityTerms []AffinityTerm
+    // 首选亲和性术语（WeightedAffinityTerm）列表
+    PreferredAffinityTerms []WeightedAffinityTerm
+    // 首选反亲和性术语（WeightedAffinityTerm）列表
+    PreferredAntiAffinityTerms []WeightedAffinityTerm
+}
+```
+
+##### AffinityTerm&WeightedAffinityTerm
+
+```GO
+// AffinityTerm 是 v1.PodAffinityTerm 的处理版本。
+type AffinityTerm struct {
+    // Namespaces 指定了此术语（term）的限制范围（namespace）。
+    Namespaces sets.Set[string]
+    // Selector 是一个对 Pods 进行匹配的标签选择器。
+    Selector labels.Selector
+    // TopologyKey 指定了用于考虑拓扑域的标签的键。
+    TopologyKey string
+    // NamespaceSelector 是一个对 Namespaces 进行匹配的标签选择器。
+    NamespaceSelector labels.Selector
+}
+
+// WeightedAffinityTerm 是 v1.WeightedAffinityTerm 的“处理”表示。
+type WeightedAffinityTerm struct {
+    // AffinityTerm 是 AffinityTerm 的一个实例，包含此加权术语的规范。
+    AffinityTerm
+    // Weight 是此加权术语的权重。
+    Weight int32
+}
+```
+
 ### NewFramework
 
 ```go
@@ -2397,6 +2666,77 @@ func (f *frameworkImpl) RunFilterPluginsWithNominatedPods(ctx context.Context, s
 }
 ```
 
+#### addNominatedPods
+
+```GO
+// 该函数用于在节点上添加具有相等或更高优先级的已被提名的 Pod，函数返回三个参数：1）是否添加了任何 Pod，2）增强的 cycleState，3）增强的 nodeInfo。
+func addNominatedPods(ctx context.Context, fh framework.Handle, pod *v1.Pod, state *framework.CycleState, nodeInfo *framework.NodeInfo) (bool, *framework.CycleState, *framework.NodeInfo, error) {
+    // 如果 fh 或 nodeInfo.Node() 为 nil，则返回 false，state，nodeInfo 和 nil。
+    if fh == nil || nodeInfo.Node() == nil {
+        // This may happen only in tests.
+        return false, state, nodeInfo, nil
+    }
+
+    // 获取已被提名的 Pod 信息。
+    nominatedPodInfos := fh.NominatedPodsForNode(nodeInfo.Node().Name)
+    // 如果没有已被提名的 Pod，则返回 false，state，nodeInfo 和 nil。
+    if len(nominatedPodInfos) == 0 {
+        return false, state, nodeInfo, nil
+    }
+
+    // 克隆 nodeInfo 和 cycleState。
+    nodeInfoOut := nodeInfo.Clone()
+    stateOut := state.Clone()
+    // 用于记录是否添加了任何 Pod。
+    podsAdded := false
+
+    // 遍历已被提名的 Pod 信息。
+    for _, pi := range nominatedPodInfos {
+        // 如果该 Pod 优先级大于等于 pod 的优先级并且该 Pod 的 UID 不等于 pod 的 UID，则将该 Pod 添加到 nodeInfoOut 中。
+        if corev1.PodPriority(pi.Pod) >= corev1.PodPriority(pod) && pi.Pod.UID != pod.UID {
+            nodeInfoOut.AddPodInfo(pi)
+            // 运行 preFilter extension 添加 Pod。
+            status := fh.RunPreFilterExtensionAddPod(ctx, stateOut, pod, pi, nodeInfoOut)
+            if !status.IsSuccess() {
+                return false, state, nodeInfo, status.AsError()
+            }
+            // 标记已添加 Pod。
+            podsAdded = true
+        }
+    }
+    return podsAdded, stateOut, nodeInfoOut, nil
+}
+```
+
+#### RunFilterPlugins
+
+```GO
+func (f *frameworkImpl) RunFilterPlugins(
+	ctx context.Context,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	nodeInfo *framework.NodeInfo,
+) *framework.Status {
+	for _, pl := range f.filterPlugins {
+		if state.SkipFilterPlugins.Has(pl.Name()) {
+			continue
+		}
+		metrics.PluginEvaluationTotal.WithLabelValues(pl.Name(), metrics.Filter, f.profileName).Inc()
+		if status := f.runFilterPlugin(ctx, pl, state, pod, nodeInfo); !status.IsSuccess() {
+			if !status.IsUnschedulable() {
+				// Filter plugins are not supposed to return any status other than
+				// Success or Unschedulable.
+				status = framework.AsStatus(fmt.Errorf("running %q filter plugin: %w", pl.Name(), status.AsError()))
+			}
+			status.SetFailedPlugin(pl.Name())
+			return status
+		}
+	}
+
+	return nil
+}
+```
+
 ### Extenders
 
 ```GO
@@ -2585,7 +2925,7 @@ func (f *frameworkImpl) RunScorePlugins(ctx context.Context, state *framework.Cy
 }
 ```
 
-### runScorePlugin
+#### runScorePlugin
 
 ```GO
 func (f *frameworkImpl) runScorePlugin(ctx context.Context, pl framework.ScorePlugin, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
