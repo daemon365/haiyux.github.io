@@ -489,6 +489,7 @@ func New(client clientset.Interface, // 用于与 Kubernetes API Server 通信�
 
 	// 创建 InTreeRegistry，并合并 FrameworkOutOfTreeRegistry
 	registry := frameworkplugins.NewInTreeRegistry()
+    // 把自定义的merge进去
 	if err := registry.Merge(options.frameworkOutOfTreeRegistry); err != nil {
 		return nil, err
 	}
@@ -594,45 +595,6 @@ func New(client clientset.Interface, // 用于与 Kubernetes API Server 通信�
 	addAllEventHandlers(sched, informerFactory, dynInformerFactory, unionedGVKs(clusterEventMap))
 
 	return sched, nil
-}
-```
-
-#### Registry
-
-```go
-type Registry map[string]PluginFactory
-
-// PluginFactory is a function that builds a plugin.
-type PluginFactory = func(configuration runtime.Object, f framework.Handle) (framework.Plugin, error)
-
-// PluginFactoryWithFts is a function that builds a plugin with certain feature gates.
-type PluginFactoryWithFts func(runtime.Object, framework.Handle, plfeature.Features) (framework.Plugin, error)
-```
-
-```go
-func (r Registry) Register(name string, factory PluginFactory) error {
-	if _, ok := r[name]; ok {
-		return fmt.Errorf("a plugin named %v already exists", name)
-	}
-	r[name] = factory
-	return nil
-}
-
-func (r Registry) Unregister(name string) error {
-	if _, ok := r[name]; !ok {
-		return fmt.Errorf("no plugin named %v exists", name)
-	}
-	delete(r, name)
-	return nil
-}
-
-func (r Registry) Merge(in Registry) error {
-	for name, factory := range in {
-		if err := r.Register(name, factory); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 ```
 
@@ -896,31 +858,6 @@ func buildExtenders(extenders []schedulerapi.Extender, profiles []schedulerapi.K
 }
 ```
 
-#### Snapshot
-
-```go
-type Snapshot struct {
-    // nodeInfoMap 是一个节点名称到其 NodeInfo 快照的映射。
-    nodeInfoMap map[string]*framework.NodeInfo
-    // nodeInfoList 是节点列表，按照缓存的 nodeTree 中的顺序排列。
-    nodeInfoList []*framework.NodeInfo
-    // havePodsWithAffinityNodeInfoList 是具有至少一个声明亲和性词条的 Pod 的节点列表。
-    havePodsWithAffinityNodeInfoList []*framework.NodeInfo
-    // havePodsWithRequiredAntiAffinityNodeInfoList 是具有至少一个声明必要反亲和性词条的 Pod 的节点列表。
-    havePodsWithRequiredAntiAffinityNodeInfoList []*framework.NodeInfo
-    // usedPVCSet 包含一个 PVC 名称的集合，其中至少有一个已调度的 Pod 使用了该 PVC，键格式为 "namespace/name"。
-    usedPVCSet sets.Set[string]
-    generation int64
-}
-
-func NewEmptySnapshot() *Snapshot {
-	return &Snapshot{
-		nodeInfoMap: make(map[string]*framework.NodeInfo),
-		usedPVCSet:  sets.New[string](),
-	}
-}
-```
-
 ####  profile.NewMap
 
 ```go
@@ -945,75 +882,592 @@ func NewMap(cfgs []config.KubeSchedulerProfile, r frameworkruntime.Registry, rec
 }
 ```
 
-#### Framework
+#### NewMap
+
+```GO
+type Map map[string]framework.Framework
+
+func NewMap(cfgs []config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
+	stopCh <-chan struct{}, opts ...frameworkruntime.Option) (Map, error) {
+	// 创建一个 Map 对象
+	m := make(Map)
+	// 创建一个 cfgValidator 对象，该对象将使用 Map
+	v := cfgValidator{m: m}
+
+	// 遍历 cfgs 数组
+	for _, cfg := range cfgs {
+		// 为当前调度器配置创建一个新的 profile
+		p, err := newProfile(cfg, r, recorderFact, stopCh, opts...)
+		if err != nil {
+			// 如果创建 profile 失败，返回错误
+			return nil, fmt.Errorf("creating profile for scheduler name %s: %v", cfg.SchedulerName, err)
+		}
+		// 验证当前配置和 profile 是否合法
+		if err := v.validate(cfg, p); err != nil {
+			// 如果验证失败，返回错误
+			return nil, err
+		}
+		// 将 profile 存储在 Map 中，以调度器名称为键
+		m[cfg.SchedulerName] = p
+	}
+	// 返回 Map 和空错误对象
+	return m, nil
+}
+
+type RecorderFactory func(string) events.EventRecorder
+```
+
+##### cfgValidator
+
+```GO
+type cfgValidator struct {
+	m             Map
+	queueSort     string
+	queueSortArgs runtime.Object
+}
+```
+
+##### newProfile
+
+```GO
+func newProfile(cfg config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
+	stopCh <-chan struct{}, opts ...frameworkruntime.Option) (framework.Framework, error) {
+	recorder := recorderFact(cfg.SchedulerName)
+	opts = append(opts, frameworkruntime.WithEventRecorder(recorder))
+	return frameworkruntime.NewFramework(r, &cfg, stopCh, opts...)
+}
+```
+
+##### validate
+
+```GO
+func (v *cfgValidator) validate(cfg config.KubeSchedulerProfile, f framework.Framework) error {
+	// 检查调度器名称是否为空
+	if len(f.ProfileName()) == 0 {
+		return errors.New("scheduler name is needed")
+	}
+	// 检查插件是否为空
+	if cfg.Plugins == nil {
+		return fmt.Errorf("plugins required for profile with scheduler name %q", f.ProfileName())
+	}
+	// 检查是否存在相同名称的 profile
+	if v.m[f.ProfileName()] != nil {
+		return fmt.Errorf("duplicate profile with scheduler name %q", f.ProfileName())
+	}
+
+	// 获取队列排序插件的名称和参数
+	queueSort := f.ListPlugins().QueueSort.Enabled[0].Name
+	var queueSortArgs runtime.Object
+	for _, plCfg := range cfg.PluginConfig {
+		if plCfg.Name == queueSort {
+			queueSortArgs = plCfg.Args
+			break
+		}
+	}
+	// 如果队列排序插件名称为空，则将当前名称和参数存储在 cfgValidator 对象中，并返回 nil
+	if len(v.queueSort) == 0 {
+		v.queueSort = queueSort
+		v.queueSortArgs = queueSortArgs
+		return nil
+	}
+	// 如果当前队列排序插件名称和存储在 cfgValidator 对象中的不同，则返回错误
+	if v.queueSort != queueSort {
+		return fmt.Errorf("different queue sort plugins for profile %q: %q, first: %q", cfg.SchedulerName, queueSort, v.queueSort)
+	}
+	// 如果当前队列排序插件名称相同，但参数不同，则返回错误
+	if !cmp.Equal(v.queueSortArgs, queueSortArgs) {
+		return fmt.Errorf("different queue sort plugin args for profile %q", cfg.SchedulerName)
+	}
+	// 如果当前队列排序插件名称和参数都相同，则返回 nil
+	return nil
+}
+```
+
+#### addAllEventHandlers
+
+```GO
+// addAllEventHandlers is a helper function used in tests and in Scheduler
+// to add event handlers for various informers.
+func addAllEventHandlers(
+	sched *Scheduler,
+	informerFactory informers.SharedInformerFactory,
+	dynInformerFactory dynamicinformer.DynamicSharedInformerFactory,
+	gvkMap map[framework.GVK]framework.ActionType,
+) {
+	// scheduled pod cache
+    informerFactory.Core().V1().Pods().Informer().AddEventHandler(
+        cache.FilteringResourceEventHandler{
+            // 事件过滤器，筛选出需要缓存的 Pod
+            FilterFunc: func(obj interface{}) bool {
+                switch t := obj.(type) {
+                case *v1.Pod:
+                    return assignedPod(t)  // 返回分配的 Pod
+                case cache.DeletedFinalStateUnknown:
+                    if _, ok := t.Obj.(*v1.Pod); ok {
+                        // carried object 可能已过时，因此我们不使用它来检查它是否已分配。尝试清理。
+                        return true
+                    }
+                    utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
+                    return false
+                default:
+                    utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+                    return false
+                }
+            },
+            // 事件处理器
+            Handler: cache.ResourceEventHandlerFuncs{
+                AddFunc:    sched.addPodToCache,         // 添加 Pod 到缓存
+                UpdateFunc: sched.updatePodInCache,      // 更新 Pod 在缓存中的状态
+                DeleteFunc: sched.deletePodFromCache,    // 从缓存中删除 Pod
+            },
+        },
+    )
+
+    // unscheduled pod queue
+    informerFactory.Core().V1().Pods().Informer().AddEventHandler(
+        cache.FilteringResourceEventHandler{
+            // 事件过滤器，筛选出需要加入队列的 Pod
+            FilterFunc: func(obj interface{}) bool {
+                switch t := obj.(type) {
+                case *v1.Pod:
+                    return !assignedPod(t) && responsibleForPod(t, sched.Profiles)  // 返回未分配的 Pod 且该调度器能够负责
+                case cache.DeletedFinalStateUnknown:
+                    if pod, ok := t.Obj.(*v1.Pod); ok {
+                        // carried object 可能已过时，因此我们不使用它来检查它是否已分配。
+                        return responsibleForPod(pod, sched.Profiles)  // 返回未分配的 Pod 且该调度器能够负责
+                    }
+                    utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
+                    return false
+                default:
+                    utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+                    return false
+                }
+            },
+            // 事件处理器
+            Handler: cache.ResourceEventHandlerFuncs{
+                AddFunc:    sched.addPodToSchedulingQueue,      // 添加 Pod 到调度队列
+                UpdateFunc: sched.updatePodInSchedulingQueue,   // 更新 Pod 在调度队列中的状态
+                DeleteFunc: sched.deletePodFromSchedulingQueue, // 从调度队列中删除 Pod
+            },
+        },
+    )
+
+	// 监控node
+	informerFactory.Core().V1().Nodes().Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    sched.addNodeToCache,
+			UpdateFunc: sched.updateNodeInCache,
+			DeleteFunc: sched.deleteNodeFromCache,
+		},
+	)
+
+	buildEvtResHandler := func(at framework.ActionType, gvk framework.GVK, shortGVK string) cache.ResourceEventHandlerFuncs {
+		// 定义一个函数，该函数接收三个参数：framework.ActionType、framework.GVK 和 shortGVK，并返回 cache.ResourceEventHandlerFuncs 类型的结果。
+        funcs := cache.ResourceEventHandlerFuncs{} // 创建一个空的 ResourceEventHandlerFuncs 对象。
+        if at&framework.Add != 0 { // 如果 at 包含 framework.Add 标志位
+            evt := framework.ClusterEvent{Resource: gvk, ActionType: framework.Add, Label: fmt.Sprintf("%vAdd", shortGVK)}
+            // 创建 ClusterEvent 对象 evt，设置 Resource 属性为 gvk，ActionType 属性为 framework.Add，Label 属性为 shortGVK 加上字符串 "Add"。
+            funcs.AddFunc = func(_ interface{}) {
+                sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(evt, nil)
+                // 定义 AddFunc 方法，该方法将所有的事件移动到活动或回退队列中。
+            }
+        }
+        if at&framework.Update != 0 { // 如果 at 包含 framework.Update 标志位
+            evt := framework.ClusterEvent{Resource: gvk, ActionType: framework.Update, Label: fmt.Sprintf("%vUpdate", shortGVK)}
+            // 创建 ClusterEvent 对象 evt，设置 Resource 属性为 gvk，ActionType 属性为 framework.Update，Label 属性为 shortGVK 加上字符串 "Update"。
+            funcs.UpdateFunc = func(_, _ interface{}) {
+                sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(evt, nil)
+                // 定义 UpdateFunc 方法，该方法将所有的事件移动到活动或回退队列中。
+            }
+        }
+        if at&framework.Delete != 0 { // 如果 at 包含 framework.Delete 标志位
+            evt := framework.ClusterEvent{Resource: gvk, ActionType: framework.Delete, Label: fmt.Sprintf("%vDelete", shortGVK)}
+            // 创建 ClusterEvent 对象 evt，设置 Resource 属性为 gvk，ActionType 属性为 framework.Delete，Label 属性为 shortGVK 加上字符串 "Delete"。
+            funcs.DeleteFunc = func(_ interface{}) {
+                sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(evt, nil)
+                // 定义 DeleteFunc 方法，该方法将所有的事件移动到活动或回退队列中。
+            }
+        }
+        return funcs // 返回 ResourceEventHandlerFuncs 对象 funcs。
+	}
+
+	for gvk, at := range gvkMap {  // 遍历 gvkMap 中的所有 gvk
+        switch gvk {
+        case framework.Node, framework.Pod:  // 对于 framework.Node 和 framework.Pod 类型，不进行处理
+            // Do nothing.
+        case framework.CSINode:  // 对于 framework.CSINode 类型，添加事件处理程序
+            informerFactory.Storage().V1().CSINodes().Informer().AddEventHandler(
+                buildEvtResHandler(at, framework.CSINode, "CSINode"),
+            )
+        case framework.CSIDriver:  // 对于 framework.CSIDriver 类型，添加事件处理程序
+            informerFactory.Storage().V1().CSIDrivers().Informer().AddEventHandler(
+                buildEvtResHandler(at, framework.CSIDriver, "CSIDriver"),
+            )
+        case framework.CSIStorageCapacity:  // 对于 framework.CSIStorageCapacity 类型，添加事件处理程序
+            informerFactory.Storage().V1().CSIStorageCapacities().Informer().AddEventHandler(
+                buildEvtResHandler(at, framework.CSIStorageCapacity, "CSIStorageCapacity"),
+            )
+        case framework.PersistentVolume:  // 对于 framework.PersistentVolume 类型，添加事件处理程序
+            informerFactory.Core().V1().PersistentVolumes().Informer().AddEventHandler(
+                buildEvtResHandler(at, framework.PersistentVolume, "Pv"),
+            )
+        case framework.PersistentVolumeClaim:  // 对于 framework.PersistentVolumeClaim 类型，添加事件处理程序
+            informerFactory.Core().V1().PersistentVolumeClaims().Informer().AddEventHandler(
+                buildEvtResHandler(at, framework.PersistentVolumeClaim, "Pvc"),
+            )
+        case framework.PodSchedulingContext:  // 对于 framework.PodSchedulingContext 类型，添加事件处理程序
+            if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+                _, _ = informerFactory.Resource().V1alpha2().PodSchedulingContexts().Informer().AddEventHandler(
+                    buildEvtResHandler(at, framework.PodSchedulingContext, "PodSchedulingContext"),
+                )
+            }
+        case framework.ResourceClaim:  // 对于 framework.ResourceClaim 类型，添加事件处理程序
+            if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+                _, _ = informerFactory.Resource().V1alpha2().ResourceClaims().Informer().AddEventHandler(
+                    buildEvtResHandler(at, framework.ResourceClaim, "ResourceClaim"),
+                )
+            }
+        case framework.StorageClass:  // 对于 framework.StorageClass 类型，根据 at 指定的操作添加事件处理程序
+            if at&framework.Add != 0 {  // 添加事件处理程序
+                informerFactory.Storage().V1().StorageClasses().Informer().AddEventHandler(
+                    cache.ResourceEventHandlerFuncs{
+                        AddFunc: sched.onStorageClassAdd,  // 在存储类添加时执行 sched.onStorageClassAdd 函数
+                    },
+                )
+            }
+			if at&framework.Update != 0 { // 更新事件处理程序
+				informerFactory.Storage().V1().StorageClasses().Informer().AddEventHandler(
+					cache.ResourceEventHandlerFuncs{
+						UpdateFunc: func(_, _ interface{}) { // 在存储类更新时执行匿名函数
+							sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(queue.StorageClassUpdate, nil) // 将所有调度队列中的存储类更新移动到活动队列或备用队列中
+						},
+					},
+				)
+			}
+		default:
+			// 注意：测试可能不会实例化dynInformerFactory。
+			if dynInformerFactory == nil {
+				continue
+			}
+			// GVK预期至少有三个部分，由句点分隔。
+            // <kind in plural>.<version>.<group>
+            // 有效示例：
+            // - foos.v1.example.com
+            // - bars.v1beta1.a.b.c
+            // 无效示例：
+            // - foos.v1（2个部分）
+            // - foo.v1.example.com（第一个部分应该是复数形式）
+			if strings.Count(string(gvk), ".") < 2 {
+				klog.ErrorS(nil, "incorrect event registration", "gvk", gvk)
+				continue
+			}
+			// 回退到尝试动态informer。
+			gvr, _ := schema.ParseResourceArg(string(gvk))
+			dynInformer := dynInformerFactory.ForResource(*gvr).Informer()
+			dynInformer.AddEventHandler(
+				buildEvtResHandler(at, gvk, strings.Title(gvr.Resource)),
+			)
+		}
+	}
+}
+```
+
+##### assignedPod
+
+```GO
+func assignedPod(pod *v1.Pod) bool {
+	return len(pod.Spec.NodeName) != 0
+}
+```
+
+##### responsibleForPod
+
+```GO
+func responsibleForPod(pod *v1.Pod, profiles profile.Map) bool {
+	return profiles.HandlesSchedulerName(pod.Spec.SchedulerName)
+}
+```
+
+##### pod
+
+```GO
+// 将 Pod 添加到调度器的缓存中
+func (sched *Scheduler) addPodToCache(obj interface{}) {
+	// 将 obj 转换为 *v1.Pod 类型，如果类型不匹配，则打印错误并返回
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		klog.ErrorS(nil, "Cannot convert to *v1.Pod", "obj", obj)
+		return
+	}
+	// 打印调试日志
+	klog.V(3).InfoS("Add event for scheduled pod", "pod", klog.KObj(pod))
+
+	// 将 Pod 添加到缓存中，如果操作失败，则打印错误
+	if err := sched.Cache.AddPod(pod); err != nil {
+		klog.ErrorS(err, "Scheduler cache AddPod failed", "pod", klog.KObj(pod))
+	}
+
+	// 将 Pod 添加到调度队列中
+	sched.SchedulingQueue.AssignedPodAdded(pod)
+}
+
+// 更新 Pod 在调度器的缓存中的信息
+func (sched *Scheduler) updatePodInCache(oldObj, newObj interface{}) {
+	// 将 oldObj 和 newObj 转换为 *v1.Pod 类型，如果类型不匹配，则打印错误并返回
+	oldPod, ok := oldObj.(*v1.Pod)
+	if !ok {
+		klog.ErrorS(nil, "Cannot convert oldObj to *v1.Pod", "oldObj", oldObj)
+		return
+	}
+	newPod, ok := newObj.(*v1.Pod)
+	if !ok {
+		klog.ErrorS(nil, "Cannot convert newObj to *v1.Pod", "newObj", newObj)
+		return
+	}
+	// 打印调试日志
+	klog.V(4).InfoS("Update event for scheduled pod", "pod", klog.KObj(oldPod))
+
+	// 更新缓存中的 Pod 信息，如果操作失败，则打印错误
+	if err := sched.Cache.UpdatePod(oldPod, newPod); err != nil {
+		klog.ErrorS(err, "Scheduler cache UpdatePod failed", "pod", klog.KObj(oldPod))
+	}
+
+	// 将更新后的 Pod 添加到调度队列中
+	sched.SchedulingQueue.AssignedPodUpdated(newPod)
+}
+
+// 从调度器的缓存中删除 Pod
+func (sched *Scheduler) deletePodFromCache(obj interface{}) {
+	var pod *v1.Pod
+	switch t := obj.(type) {
+	// 如果 obj 是 *v1.Pod 类型，则直接赋值给 pod
+	case *v1.Pod:
+		pod = t
+	// 如果 obj 是 DeletedFinalStateUnknown 类型，则从 Obj 字段中提取 Pod 对象
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		pod, ok = t.Obj.(*v1.Pod)
+		if !ok {
+			klog.ErrorS(nil, "Cannot convert to *v1.Pod", "obj", t.Obj)
+			return
+		}
+	default:
+		klog.ErrorS(nil, "Cannot convert to *v1.Pod", "obj", t)
+		return
+	}
+	// 打印调试日志
+	klog.V(3).InfoS("Delete event for scheduled pod", "pod", klog.KObj(pod))
+	// 从缓存中删除 Pod，如果操作失败，则打印错误
+	if err := sched.Cache.RemovePod(pod); err != nil {
+		klog.ErrorS(err, "Scheduler cache RemovePod failed", "pod", klog.KObj(pod))
+	}
+	// 将所有Pod移动到退避队列中
+	sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(queue.AssignedPodDelete, nil)
+}
+
+func (sched *Scheduler) addPodToSchedulingQueue(obj interface{}) {
+    // 将 obj 强制类型转换为 v1.Pod 类型的指针
+    pod := obj.(*v1.Pod)
+    // 记录日志，表示向调度队列添加未调度的 Pod
+    klog.V(3).InfoS("Add event for unscheduled pod", "pod", klog.KObj(pod))
+    // 将 Pod 添加到调度队列中
+    if err := sched.SchedulingQueue.Add(pod); err != nil {
+        // 处理添加失败的情况，记录错误日志
+        utilruntime.HandleError(fmt.Errorf("unable to queue %T: %v", obj, err))
+    }
+}
+
+func (sched *Scheduler) updatePodInSchedulingQueue(oldObj, newObj interface{}) {
+    // 将 oldObj 和 newObj 强制类型转换为 v1.Pod 类型的指针
+    oldPod, newPod := oldObj.(*v1.Pod), newObj.(*v1.Pod)
+    // 如果两个 Pod 对象的资源版本相同，则跳过更新
+    if oldPod.ResourceVersion == newPod.ResourceVersion {
+        return
+    }
+
+    // 检查 Pod 是否是假定的 Pod，如果是则跳过更新
+    isAssumed, err := sched.Cache.IsAssumedPod(newPod)
+    if err != nil {
+        utilruntime.HandleError(fmt.Errorf("failed to check whether pod %s/%s is assumed: %v", newPod.Namespace, newPod.Name, err))
+    }
+    if isAssumed {
+        return
+    }
+
+    // 更新 Pod 在调度队列中的状态
+    if err := sched.SchedulingQueue.Update(oldPod, newPod); err != nil {
+        utilruntime.HandleError(fmt.Errorf("unable to update %T: %v", newObj, err))
+    }
+}
+
+func (sched *Scheduler) deletePodFromSchedulingQueue(obj interface{}) {
+    // 定义了一个方法，接收一个 interface{} 类型的参数，表示要从调度队列中删除的对象
+    var pod *v1.Pod
+    // 定义了一个 *v1.Pod 类型的指针 pod，用于保存要删除的 Pod 对象
+    switch t := obj.(type) {
+        // 通过 switch 语句，根据传入的对象类型，判断需要删除的对象是 Pod 对象还是其他类型的对象
+        case *v1.Pod:
+        	pod = obj.(*v1.Pod)
+        // 如果是 Pod 对象，则将传入的 obj 转换为 *v1.Pod 类型，并赋值给 pod 变量
+        case cache.DeletedFinalStateUnknown:
+            var ok bool
+            // 如果是一个已被删除的 Pod 对象
+            pod, ok = t.Obj.(*v1.Pod)
+            // 尝试将 t.Obj 转换为 *v1.Pod 类型，并赋值给 pod 变量
+            if !ok {
+                // 如果转换失败，则打印错误信息，返回
+                utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
+                return
+    		}
+        default:
+            // 如果不是 Pod 对象或已被删除的 Pod 对象，则打印错误信息，返回
+            utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+            return
+    }
+    // 打印删除未调度 Pod 的日志信息
+    klog.V(3).InfoS("Delete event for unscheduled pod", "pod", klog.KObj(pod))
+    // 从调度队列中删除 pod
+    if err := sched.SchedulingQueue.Delete(pod); err != nil {
+        // 如果删除失败，则打印错误信息
+        utilruntime.HandleError(fmt.Errorf("unable to dequeue %T: %v", obj, err))
+    }
+    // 获取 Pod 所属的 framework 对象
+    fwk, err := sched.frameworkForPod(pod)
+    if err != nil {
+        // 如果获取 framework 失败，则打印错误信息，返回
+        klog.ErrorS(err, "Unable to get profile", "pod", klog.KObj(pod))
+    return
+    }
+    // 如果等待调度的 Pod 被拒绝了，则表示该 Pod 是以前被假定调度的，现在将其从调度缓存中删除。在这种情况下，发送一个 AssignedPodDelete 事件以立即重试一些未调度的 Pod。
+    if fwk.RejectWaitingPod(pod.UID) {
+    	sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(queue.AssignedPodDelete, nil)
+    }
+}
+```
+
+##### node
 
 ```go
-type Framework interface {
-	Handle
+func (sched *Scheduler) addNodeToCache(obj interface{}) {
+    // 将obj转换为*v1.Node类型
+    node, ok := obj.(*v1.Node)
+    if !ok {
+        // 如果转换失败，则记录错误并直接返回
+        klog.ErrorS(nil, "Cannot convert to *v1.Node", "obj", obj)
+        return
+    }
 
-	// 返回已注册的预入队插件（PreEnqueue Plugins）的列表
-	PreEnqueuePlugins() []PreEnqueuePlugin
+    // 将Node信息添加到调度器的缓存中
+    nodeInfo := sched.Cache.AddNode(node)
 
-	// 返回一个用于对调度队列中的Pod进行排序的函数
-	QueueSortFunc() LessFunc
+    // 记录Node添加事件
+    klog.V(3).InfoS("Add event for node", "node", klog.KObj(node))
 
-	// 运行配置的预过滤器（PreFilter Plugins）集合。如果任何一个插件返回除了"Success"以外的值，则返回一个非成功（non-success）的*Status，其code字段被设置为对应的错误码。
-    // 如果返回了非成功的状态，调度循环将被中止。此外，还返回一个PreFilterResult，可能会影响下游的节点评估过程。
-	RunPreFilterPlugins(ctx context.Context, state *CycleState, pod *v1.Pod) (*PreFilterResult, *Status)
-
-	// 运行配置的后过滤器（PostFilter Plugins）集合。后过滤器可以是信息性的，这种情况下应该配置为先执行并返回不可调度（Unschedulable）状态；
-    // 或者是试图更改集群状态以便在将来的调度循环中使Pod可能可调度的插件。函数返回一个PostFilterResult和一个Status。
-	RunPostFilterPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, filteredNodeStatusMap NodeToStatusMap) (*PostFilterResult, *Status)
-
-	// 运行配置的预绑定插件（PreBind Plugins）。如果任何一个插件返回除了"Success"以外的值，函数返回一个非成功的*Status，其code字段被设置为对应的错误码。
-    // 如果返回的Status的code为"Unschedulable"，表示调度检查失败；否则，表示内部错误。在任何情况下，Pod都不会被绑定。
-	RunPreBindPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
-
-	// 运行配置的后绑定插件（PostBind Plugins）
-	RunPostBindPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string)
-
-	// 运行配置的预留（Reserve）插件的Reserve方法。如果任何一个调用返回错误，函数将不再继续运行剩余的插件，并返回错误。在这种情况下，Pod将不会被调度。
-	RunReservePluginsReserve(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
-
-	// 运行配置的预留（Reserve）插件的Unreserve方法
-	RunReservePluginsUnreserve(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string)
-
-	// RunPermitPlugins 运行配置的 Permit 插件。如果任何一个插件返回除了 "Success" 或 "Wait" 外的状态，
-    // 则不会继续运行剩余的插件并返回错误。否则，如果任何一个插件返回 "Wait"，
-    // 则此函数将创建并添加一个等待中的 Pod 到当前等待 Pod 的映射中，并返回带有 "Wait" 状态的结果。
-    // Pod 将保持为等待 Pod，直到 Permit 插件返回的最小持续时间过去。
-	RunPermitPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
-
-	// WaitOnPermit 如果 Pod 是等待中的 Pod，则阻塞，直到等待的 Pod 被拒绝或允许。
-	WaitOnPermit(ctx context.Context, pod *v1.Pod) *Status
-
-	// RunBindPlugins 运行配置的 Bind 插件。Bind 插件可以选择是否处理给定的 Pod。
-    // 如果 Bind 插件选择跳过绑定操作，则应返回 code=5（"skip"）状态。
-    // 否则，应返回 "Error" 或 "Success" 状态。
-    // 如果没有插件处理绑定，则 RunBindPlugins 返回 code=5（"skip"）状态。
-	RunBindPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
-
-	// HasFilterPlugins 如果至少定义了一个 Filter 插件，则返回 true。
-	HasFilterPlugins() bool
-
-	// HasPostFilterPlugins 如果至少定义了一个 PostFilter 插件，则返回 true。
-	HasPostFilterPlugins() bool
-
-	// HasScorePlugins 如果至少定义了一个 Score 插件，则返回 true。
-	HasScorePlugins() bool
-
-	// ListPlugins 返回一个映射，其中键是扩展点的名称，值是配置的插件列表。
-	ListPlugins() *config.Plugins
-
-	// ProfileName 返回与配置文件关联的配置文件名称。
-	ProfileName() string
-
-	// PercentageOfNodesToScore 返回与配置文件关联的节点评分的百分比。
-	PercentageOfNodesToScore() *int32
-
-	// SetPodNominator 设置 PodNominator。
-	SetPodNominator(nominator PodNominator)
+    // 将当前等待调度的Pod移动到活跃或退避队列
+    sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(queue.NodeAdd, preCheckForNode(nodeInfo))
 }
+
+func (sched *Scheduler) updateNodeInCache(oldObj, newObj interface{}) {
+    // 将旧对象和新对象分别转换为*v1.Node类型
+    oldNode, ok := oldObj.(*v1.Node)
+    if !ok {
+        // 如果旧对象转换失败，则记录错误并直接返回
+        klog.ErrorS(nil, "Cannot convert oldObj to *v1.Node", "oldObj", oldObj)
+        return
+    }
+    newNode, ok := newObj.(*v1.Node)
+    if !ok {
+        // 如果新对象转换失败，则记录错误并直接返回
+        klog.ErrorS(nil, "Cannot convert newObj to *v1.Node", "newObj", newObj)
+        return
+    }
+
+    // 更新调度器的缓存中的Node信息
+    nodeInfo := sched.Cache.UpdateNode(oldNode, newNode)
+
+    // 如果节点的调度属性发生了变化，则将等待调度的Pod移动到活跃或退避队列
+    if event := nodeSchedulingPropertiesChange(newNode, oldNode); event != nil {
+        sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(*event, preCheckForNode(nodeInfo))
+    }
+}
+
+func (sched *Scheduler) deleteNodeFromCache(obj interface{}) {
+    var node *v1.Node
+    switch t := obj.(type) {
+    case *v1.Node:
+        node = t
+    case cache.DeletedFinalStateUnknown:
+        var ok bool
+        node, ok = t.Obj.(*v1.Node)
+        if !ok {
+            // 如果转换失败，则记录错误并直接返回
+            klog.ErrorS(nil, "Cannot convert to *v1.Node", "obj", t.Obj)
+            return
+        }
+    default:
+        // 如果类型不匹配，则记录错误并直接返回
+        klog.ErrorS(nil, "Cannot convert to *v1.Node", "obj", t)
+        return
+    }
+
+    // 记录Node删除事件
+    klog.V(3).InfoS("Delete event for node", "node", klog.KObj(node))
+
+    // 从调度器的缓存中删除Node信息
+    if err := sched.Cache.RemoveNode(node); err != nil {
+        // 如果删除失败，则记录错误
+        klog.ErrorS(err, "Scheduler cache RemoveNode failed")
+    }
+}
+```
+
+##### ClusterEvent
+
+```GO
+// ClusterEvent 是一个表示系统资源状态变化的抽象对象。
+// Resource 表示标准 API 资源，例如 Pod、Node 等。
+// ActionType 表示特定的更改类型，例如添加、更新或删除。
+type ClusterEvent struct {
+    Resource GVK // 资源对象的 GVK（group/version/kind），用于唯一标识 API 资源
+    ActionType ActionType // 表示资源更改的类型，可通过位运算组合不同的 ActionType 实现新的语义
+    Label string // 标签信息
+}
+
+// GVK 表示组/版本/种类，可唯一标识一个特定的 API 资源。
+type GVK string
+
+const (
+	Pod                   GVK = "Pod"
+	Node                  GVK = "Node"
+	PersistentVolume      GVK = "PersistentVolume"
+	PersistentVolumeClaim GVK = "PersistentVolumeClaim"
+	PodSchedulingContext  GVK = "PodSchedulingContext"
+	ResourceClaim         GVK = "ResourceClaim"
+	StorageClass          GVK = "storage.k8s.io/StorageClass"
+	CSINode               GVK = "storage.k8s.io/CSINode"
+	CSIDriver             GVK = "storage.k8s.io/CSIDriver"
+	CSIStorageCapacity    GVK = "storage.k8s.io/CSIStorageCapacity"
+	WildCard              GVK = "*"
+)
+
+// ActionType 是一个整数，用于表示一种资源更改类型。
+// 不同的 ActionType 可以通过位运算组合成新的语义。
+type ActionType int64
+
+const (
+	Add    ActionType = 1 << iota // 1
+	Delete                        // 10
+	// UpdateNodeXYZ 仅适用于节点事件。
+	UpdateNodeAllocatable // 100
+	UpdateNodeLabel       // 1000
+	UpdateNodeTaint       // 10000
+	UpdateNodeCondition   // 100000
+
+	All ActionType = 1<<iota - 1 // 111111
+
+	// 如果您不知道或不关心要使用的特定子更新类型，请使用常规更新类型。
+	Update = UpdateNodeAllocatable | UpdateNodeLabel | UpdateNodeTaint | UpdateNodeCondition
+)
 ```
 
 #### applyDefaultHandlers
