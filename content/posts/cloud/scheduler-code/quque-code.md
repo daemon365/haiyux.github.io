@@ -11,6 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
+featuredImagePreview: /img/preview/scheduler/scheduler-queue.jpg
 ---
 
 ## 作用

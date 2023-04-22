@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/controller/attachdetach-controller.jpg
+featuredImagePreview: /img/preview/scheduler/kube-scheduler.jpg
 ---
 
 ## 介绍
@@ -1497,7 +1497,982 @@ func (sched *Scheduler) Run(ctx context.Context) {
 }
 ```
 
+### scheduleOne
+
+```go
+// scheduleOne为单个Pod执行整个调度工作流。它在调度算法的主机适配上被序列化。
+func (sched *Scheduler) scheduleOne(ctx context.Context) {
+    // 从调度队列中获取下一个待调度的Pod
+    podInfo := sched.NextPod()
+    // 当schedulerQueue关闭或podInfo为nil时返回
+    if podInfo == nil || podInfo.Pod == nil {
+    	return
+    }
+    pod := podInfo.Pod
+    // 获取Pod对应的调度框架
+    fwk, err := sched.frameworkForPod(pod)
+    if err != nil {
+        // 这不应该发生，因为我们只接受指定了与配置文件中的调度程序名称匹配的profile的Pod进行调度。
+        klog.ErrorS(err, "Error occurred")
+        return
+    }
+    // 如果pod不需要调度，则返回
+    if sched.skipPodSchedule(fwk, pod) {
+    	return
+    }
+    
+    klog.V(3).InfoS("Attempting to schedule pod", "pod", klog.KObj(pod))
+
+    // 同步地为Pod查找合适的主机。
+    start := time.Now()
+    state := framework.NewCycleState()
+    state.SetRecordPluginMetrics(rand.Intn(100) < pluginMetricsSamplePercent)
+
+    // 初始化一个空的podsToActivate结构体，它将由插件填充或保持为空。
+    podsToActivate := framework.NewPodsToActivate()
+    state.Write(framework.PodsToActivateKey, podsToActivate)
+
+    // 创建一个新的调度循环的上下文，并在函数结束时取消
+    schedulingCycleCtx, cancel := context.WithCancel(ctx)
+    defer cancel()
+
+    // 调度循环
+    scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
+    if !status.IsSuccess() {
+        // 如果调度循环失败，则使用FailureHandler处理错误
+        sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+        return
+    }
+
+    // 异步绑定Pod到它的主机（这是由于上面的假设步骤而可以这样做）
+    go func() {
+        // 创建一个新的绑定循环的上下文，并在函数结束时取消
+        bindingCycleCtx, cancel := context.WithCancel(ctx)
+        defer cancel()
+
+        // 绑定循环的度量
+        metrics.SchedulerGoroutines.WithLabelValues(metrics.Binding).Inc()
+        defer metrics.SchedulerGoroutines.WithLabelValues(metrics.Binding).Dec()
+        metrics.Goroutines.WithLabelValues(metrics.Binding).Inc()
+        defer metrics.Goroutines.WithLabelValues(metrics.Binding).Dec()
+
+        // 执行绑定循环
+        status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
+        if !status.IsSuccess() {
+            // 如果绑定循环失败，则使用handleBindingCycleError处理错误
+            sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
+        }
+    }()
+}
+```
+
+#### NextPod
+
+```go
+// MakeNextPodFunc函数返回一个函数，该函数从传入的调度队列中取出下一个待调度的PodInfo并返回。
+func MakeNextPodFunc(queue SchedulingQueue) func() framework.QueuedPodInfo {
+    // 定义返回的函数，其返回值为framework.QueuedPodInfo类型指针
+    return func() *framework.QueuedPodInfo {
+        // 从队列中取出下一个PodInfo
+        podInfo, err := queue.Pop()
+        if err == nil {
+            // 打印日志并更新指标
+            klog.V(4).InfoS("About to try and schedule pod", "pod", klog.KObj(podInfo.Pod))
+            for plugin := range podInfo.UnschedulablePlugins {
+                metrics.UnschedulableReason(plugin, podInfo.Pod.Spec.SchedulerName).Dec()
+            }
+            // 返回PodInfo指针
+            return podInfo
+        }
+        // 打印错误日志并返回nil
+        klog.ErrorS(err, "Error while retrieving next pod from scheduling queue")
+        return nil
+    }
+}
+```
+
+#### frameworkForPod
+
+```go
+// 根据schdulerName获取framework
+func (sched *Scheduler) frameworkForPod(pod *v1.Pod) (framework.Framework, error) {
+	fwk, ok := sched.Profiles[pod.Spec.SchedulerName]
+	if !ok {
+		return nil, fmt.Errorf("profile not found for scheduler name %q", pod.Spec.SchedulerName)
+	}
+	return fwk, nil
+}
+```
+
+#### skipPodSchedule
+
+```go
+// skipPodSchedule函数返回一个布尔值，用于判断是否可以跳过指定情况下的调度该Pod。
+func (sched *Scheduler) skipPodSchedule(fwk framework.Framework, pod *v1.Pod) bool {
+    // Case 1: Pod正在被删除。
+    if pod.DeletionTimestamp != nil {
+        // 事件记录器记录“FailedScheduling”事件，表明调度失败。
+        fwk.EventRecorder().Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
+        // klog记录详细信息。
+        klog.V(3).InfoS("Skip schedule deleting pod", "pod", klog.KObj(pod))
+        	return true
+    }
+    // Case 2: 可以跳过已经被假设的Pod。
+    // 如果假设的Pod在之前的调度周期内获得了更新事件，
+    // 在被假设之前可以再次添加到调度队列中。
+    isAssumed, err := sched.Cache.IsAssumedPod(pod)
+    if err != nil {
+        // 错误处理。
+        utilruntime.HandleError(fmt.Errorf("failed to check whether pod %s/%s is assumed: %v", pod.Namespace, pod.Name, err))
+        return false
+    }
+    return isAssumed
+}
+```
+
+#### schedulingCycle
+
+```GO
+// schedulingCycle 试图调度单个 Pod。
+func (sched *Scheduler) schedulingCycle(
+	ctx context.Context,
+	state *framework.CycleState,
+	fwk framework.Framework,
+	podInfo *framework.QueuedPodInfo,
+	start time.Time,
+	podsToActivate *framework.PodsToActivate,
+) (ScheduleResult, *framework.QueuedPodInfo, *framework.Status) {
+    // 获取 Pod
+	pod := podInfo.Pod
+    // 调用 SchedulePod() 函数尝试为 Pod 进行调度
+	scheduleResult, err := sched.SchedulePod(ctx, fwk, state, pod)
+	if err != nil {
+        // 若返回 ErrNoNodesAvailable，则 Pod 没有可供调度的节点，报错
+		if err == ErrNoNodesAvailable {
+			status := framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
+			return ScheduleResult{nominatingInfo: clearNominatedNode}, podInfo, status
+		}
+		// 若返回的是 *framework.FitError 类型的错误，则进行后续的处理
+		fitError, ok := err.(*framework.FitError)
+		if !ok {
+            // 若错误类型不是 *framework.FitError 类型，则记录错误日志，返回错误状态
+			klog.ErrorS(err, "Error selecting node for pod", "pod", klog.KObj(pod))
+			return ScheduleResult{nominatingInfo: clearNominatedNode}, podInfo, framework.AsStatus(err)
+		}
+		// SchedulePod() 可能失败是因为 pod 无法适配到任何一个主机，因此我们尝试使用抢占式调度，
+        // 希望下次尝试调度该 pod 时，由于抢占而适配成功。也有可能会有另一个 pod 调度到了被抢占的资源上，
+        // 但这是无害的。
+		if !fwk.HasPostFilterPlugins() {
+            // 没有PostFilter插件 报错返回
+			klog.V(3).InfoS("No PostFilter plugins are registered, so no preemption will be performed")
+			return ScheduleResult{}, podInfo, framework.NewStatus(framework.Unschedulable).WithError(err)
+		}
+
+		// 调用 fwk.RunPostFilterPlugins() 函数运行 PostFilter 插件，尝试在未来的调度周期中将 Pod 调度到节点上
+		result, status := fwk.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatusMap)
+		// 记录日志
+        msg := status.Message()
+		fitError.Diagnosis.PostFilterMsg = msg
+		if status.Code() == framework.Error {
+			klog.ErrorS(nil, "Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+		} else {
+			klog.V(5).InfoS("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+		}
+
+		var nominatingInfo *framework.NominatingInfo
+		if result != nil {
+           // 如果调度器的调度结果不为 nil，即存在合适的 Node 被选中，则将其返回的提名信息保存下来。
+            // 其中 framework.NominatingInfo 结构体包含了一个 Pod 提名的相关信息，例如该 Pod 可以运行在哪些 Node 上。
+            // 这样在下面的运行过程中可以通过 nominatingInfo 传递这些信息。
+			nominatingInfo = result.NominatingInfo
+		}
+        // 返回一个 ScheduleResult 结构体，包含调度结果中的 nominatingInfo 和 podInfo，以及一个带有错误信息的 Status。
+        // 这里的 Status 状态为 Unschedulable，表示调度器未能为 Pod 分配到合适的 Node 上运行。
+        // 同时将 err 作为错误信息存储在 Status 中。
+		return ScheduleResult{nominatingInfo: nominatingInfo}, podInfo, framework.NewStatus(framework.Unschedulable).WithError(err)
+	}
+	
+    // 在 Prometheus 指标中记录调度算法的延迟。
+	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
+	
+    // 深拷贝 podInfo，得到一个新的 PodInfo 对象，然后将 PodInfo 中的 Pod 赋值给 assumedPod。
+	assumedPodInfo := podInfo.DeepCopy()
+	assumedPod := assumedPodInfo.Pod
+	// 将 assumedPod 分配给 scheduleResult.SuggestedHost 所代表的 Node 上运行，同时更新调度器内部的缓存状态。
+    // 其中 sched 是调度器对象，assume 是调度器的一个方法。
+    // 如果出现错误，则返回该错误对象。
+	err = sched.assume(assumedPod, scheduleResult.SuggestedHost)
+	if err != nil {
+		// 如果 assume 方法出现错误，则进行以下操作。
+        // 返回一个带有错误信息的 Status 对象，其中 clearNominatedNode 表示清除提名节点。
+    	// 在这里没有更新 nominatingInfo，所以其值为 nil。
+		return ScheduleResult{nominatingInfo: clearNominatedNode},
+			assumedPodInfo,
+			framework.AsStatus(err)
+	}
+
+	// // 运行 reserve 插件的 Reserve 方法。
+	if sts := fwk.RunReservePluginsReserve(ctx, state, assumedPod, scheduleResult.SuggestedHost); !sts.IsSuccess() {
+		// 如果 Reserve 方法的执行结果不是 Success，说明分配失败。
+        // 这时需要进行清理工作，调用 Unreserve 方法来撤销之前的分配。
+		fwk.RunReservePluginsUnreserve(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+		if forgetErr := sched.Cache.ForgetPod(assumedPod); forgetErr != nil {
+			klog.ErrorS(forgetErr, "Scheduler cache ForgetPod failed")
+		}
+
+		return ScheduleResult{nominatingInfo: clearNominatedNode},
+			assumedPodInfo,
+			sts
+	}
+
+	// 运行permit插件，这些插件用于检查是否可以在节点上启动容器
+	runPermitStatus := fwk.RunPermitPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+	if !runPermitStatus.IsWait() && !runPermitStatus.IsSuccess() {
+		// 如果不是等待或者成功 调用 Unreserve 方法来撤销之前的分配 bing返回错误
+		fwk.RunReservePluginsUnreserve(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+		if forgetErr := sched.Cache.ForgetPod(assumedPod); forgetErr != nil {
+			klog.ErrorS(forgetErr, "Scheduler cache ForgetPod failed")
+		}
+
+		return ScheduleResult{nominatingInfo: clearNominatedNode},
+			assumedPodInfo,
+			runPermitStatus
+	}
+
+	// 在成功的调度周期结束时，如果需要，弹出和移动 Pod。
+	if len(podsToActivate.Map) != 0 {
+        // 将 podsToActivate.Map 中的 Pod 标记为已激活，以便它们可以开始被调度器监视。
+		sched.SchedulingQueue.Activate(podsToActivate.Map)
+		// 激活后清空 podsToActivate.Map。
+		podsToActivate.Map = make(map[string]*v1.Pod)
+	}
+
+	return scheduleResult, assumedPodInfo, nil
+}
+```
+
+##### schedulePod
+
+```GO
+// schedulePod 尝试将给定的 Pod 安排到节点列表中的某个节点上。
+// 如果成功，它将返回节点的名称。
+// 如果失败，它将返回一个带有原因的 FitError。
+func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
+    // 创建一个调度追踪
+    trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
+    defer trace.LogIfLong(100 * time.Millisecond)
+    // 更新调度器快照
+    if err := sched.Cache.UpdateSnapshot(sched.nodeInfoSnapshot); err != nil {
+        return result, err
+    }
+    trace.Step("Snapshotting scheduler cache and node infos done")
+
+    // 如果没有节点可用，则返回 ErrNoNodesAvailable
+    if sched.nodeInfoSnapshot.NumNodes() == 0 {
+        return result, ErrNoNodesAvailable
+    }
+
+    // 查找适合 Pod 的节点
+    feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+    if err != nil {
+        return result, err
+    }
+    trace.Step("Computing predicates done")
+
+    // 如果没有适合的节点，则返回 FitError
+    if len(feasibleNodes) == 0 {
+        return result, &framework.FitError{
+            Pod:         pod,
+            NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
+            Diagnosis:   diagnosis,
+        }
+    }
+
+    // 当只有一个节点时，直接使用该节点。
+    if len(feasibleNodes) == 1 {
+        return ScheduleResult{
+            SuggestedHost:  feasibleNodes[0].Name,
+            EvaluatedNodes: 1 + len(diagnosis.NodeToStatusMap),
+            FeasibleNodes:  1,
+        }, nil
+    }
+
+    // 对节点进行优先级排序
+    priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
+    if err != nil {
+        return result, err
+    }
+
+    // 选择主机节点
+    host, err := selectHost(priorityList)
+    trace.Step("Prioritizing done")
+
+    return ScheduleResult{
+        SuggestedHost:  host,
+        EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
+        FeasibleNodes:  len(feasibleNodes),
+    }, err
+}
+```
 
 
 
+```GO
+// 根据框架过滤器插件和过滤器扩展程序过滤节点，找到适合Pod的节点。
+// Filters the nodes to find the ones that fit the pod based on the framework
+// filter plugins and filter extenders.
+func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) ([]*v1.Node, framework.Diagnosis, error) {
+    // 创建一个诊断对象，用于存储调度过程中的状态信息
+    diagnosis := framework.Diagnosis{
+        NodeToStatusMap:      make(framework.NodeToStatusMap), // 存储节点的状态信息
+        UnschedulablePlugins: sets.New[string](), // 存储不能成功调度的插件的名称
+    }
+
+    // 获取所有节点的信息
+    allNodes, err := sched.nodeInfoSnapshot.NodeInfos().List()
+    if err != nil {
+        return nil, diagnosis, err
+    }
+
+    // 运行 "prefilter" 插件
+    preRes, s := fwk.RunPreFilterPlugins(ctx, state, pod)
+    if !s.IsSuccess() {
+        if !s.IsUnschedulable() {
+            return nil, diagnosis, s.AsError()
+        }
+        // 记录 PreFilter 插件的信息
+        msg := s.Message()
+        diagnosis.PreFilterMsg = msg
+        klog.V(5).InfoS("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+        // 记录调用 PreFilter 插件失败的插件名称
+        if s.FailedPlugin() != "" {
+            diagnosis.UnschedulablePlugins.Insert(s.FailedPlugin())
+        }
+        return nil, diagnosis, nil
+    }
+
+    // 如果 Pod 的 NominatedNodeName 不为空，则优先选择该节点进行调度
+    if len(pod.Status.NominatedNodeName) > 0 {
+        feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
+        if err != nil {
+            klog.ErrorS(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
+        }
+        // 如果该节点通过了所有过滤器的检查，则将其作为唯一的候选节点
+        if len(feasibleNodes) != 0 {
+            return feasibleNodes, diagnosis, nil
+        }
+    }
+
+    // 根据 preRes 中包含的节点列表或所有节点来过滤节点
+    nodes := allNodes
+    if !preRes.AllNodes() {
+        nodes = make([]*framework.NodeInfo, 0, len(preRes.NodeNames))
+        for n := range preRes.NodeNames {
+            nInfo, err := sched.nodeInfoSnapshot.NodeInfos().Get(n)
+            if err != nil {
+                return nil, diagnosis, err
+            }
+            nodes = append(nodes, nInfo)
+        }
+    }
+
+    // 在过滤器中查找符合要求的节点
+    feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes)
+    // 计算下一轮开始搜索的节点索引，这个索引是在所有节点中的索引，并不仅仅是已经经过筛选的节点
+	// 通过计算，可以使得调度器下一次搜索时不会从已经被搜索过的节点开始，而是从接下来的节点开始搜索，确保所有节点都有被搜索到的机会
+    processedNodes := len(feasibleNodes) + len(diagnosis.NodeToStatusMap)
+	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(nodes)
+	if err != nil {
+        // 如果前面的操作出现了错误，直接返回错误信息
+		return nil, diagnosis, err
+	}
+	// 根据 extenders 过滤节点，筛选出最终适合 Pod 的节点，可能会修改 diagnosis.NodeToStatusMap 中的节点状态信息
+	feasibleNodes, err = findNodesThatPassExtenders(sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+    // 返回筛选出的适合 Pod 的节点列表，以及状态诊断信息
+	return feasibleNodes, diagnosis, nil
+}
+```
+
+###### evaluateNominatedNode
+
+```GO
+// 该函数的作用是评估被提名的节点是否适合调度当前的Pod。
+// 参数列表：调度器（Scheduler）、Pod对象（pod）、框架（fwk）、调度周期状态（state）、诊断信息（diagnosis）。
+func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, fwk framework.Framework, state *framework.CycleState, diagnosis framework.Diagnosis) ([]*v1.Node, error) {
+    // 获取Pod的被提名节点名称。
+    nnn := pod.Status.NominatedNodeName
+    // 根据被提名节点名称获取节点信息。
+    nodeInfo, err := sched.nodeInfoSnapshot.Get(nnn)
+    if err != nil {
+    	return nil, err
+    }
+    // 将节点信息封装成framework.NodeInfo对象并添加到节点切片中。
+    node := []*framework.NodeInfo{nodeInfo}
+    // 通过过滤器找到符合要求的节点。
+    feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, node)
+    if err != nil {
+    	return nil, err
+    }
+
+    // 使用Extender扩展器对节点进行扩展，进一步筛选符合要求的节点。
+    feasibleNodes, err = findNodesThatPassExtenders(sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
+    if err != nil {
+        return nil, err
+    }
+
+    // 返回符合要求的节点切片和错误信息。
+    return feasibleNodes, nil
+}
+```
+
+###### findNodesThatPassFilters
+
+```go
+// findNodesThatPassFilters函数找到符合筛选插件的节点。
+    func (sched *Scheduler) findNodesThatPassFilters(
+    ctx context.Context, // 上下文
+    fwk framework.Framework, // 框架
+    state *framework.CycleState, // 状态信息
+    pod *v1.Pod, // pod对象
+    diagnosis framework.Diagnosis, // 诊断信息
+    nodes []*framework.NodeInfo, // 可用节点信息
+) ([]*v1.Node, error) {
+    numAllNodes := len(nodes) // 可用节点数量
+    numNodesToFind := sched.numFeasibleNodesToFind(fwk.PercentageOfNodesToScore(), int32(numAllNodes)) // 需要找到的节点数量
+   // 创建一个足够大的feasibleNodes切片，避免动态增长。
+    feasibleNodes := make([]*v1.Node, numNodesToFind)
+
+    // 如果没有筛选插件，直接选择前numNodesToFind个节点。
+    if !fwk.HasFilterPlugins() {
+        for i := range feasibleNodes {
+            feasibleNodes[i] = nodes[(sched.nextStartNodeIndex+i)%numAllNodes].Node()
+        }
+        return feasibleNodes, nil
+    }
+
+    errCh := parallelize.NewErrorChannel() // 创建一个用于报告错误的通道
+    var statusesLock sync.Mutex // 用于保护statusMap的锁
+    var feasibleNodesLen int32 // 可用节点数量
+    ctx, cancel := context.WithCancel(ctx) // 用于取消处理过程的上下文
+    defer cancel()
+    checkNode := func(i int) { // 用于遍历节点并检查可用性的函数
+        // 我们从前一次调度周期结束的地方开始检查节点，这样可以确保所有节点有相同的机会被检查。
+        nodeInfo := nodes[(sched.nextStartNodeIndex+i)%numAllNodes] // 取出当前要检查的节点信息
+        status := fwk.RunFilterPluginsWithNominatedPods(ctx, state, pod, nodeInfo) // 运行筛选插件来检查节点可用性
+        if status.Code() == framework.Error { // 如果检查出错
+            errCh.SendErrorWithCancel(status.AsError(), cancel) // 报告错误并取消处理过程
+            return
+        }
+        if status.IsSuccess() { // 如果节点可用
+            length := atomic.AddInt32(&feasibleNodesLen, 1) // 增加可用节点数量并获取其长度
+            if length > numNodesToFind { // 如果可用节点数量大于需要找到的数量
+                cancel() // 取消处理过程
+                atomic.AddInt32(&feasibleNodesLen, -1) // 减少可用节点数量
+            } else {
+                feasibleNodes[length-1] = nodeInfo.Node() // 将可用节点添加到feasibleNodes中
+            }
+        } else { // 如果节点不可用
+            statusesLock.Lock()
+            diagnosis.NodeToStatusMap[nodeInfo.Node().Name] = status // 添加节点的状态信息
+            diagnosis.UnschedulablePlugins.Insert(status.FailedPlugin()) // 添加不可调度的插件
+            statusesLock.Unlock()
+        }
+    }
+
+    beginCheckNode := time.Now()
+	statusCode := framework.Success
+	defer func() {
+		metrics.FrameworkExtensionPointDuration.WithLabelValues(metrics.Filter, statusCode.String(), fwk.ProfileName()).Observe(metrics.SinceInSeconds(beginCheckNode))
+	}()
+
+	//一旦找到配置数量的可行节点，就停止搜索更多节点。
+	fwk.Parallelizer().Until(ctx, numAllNodes, checkNode, metrics.Filter)
+	feasibleNodes = feasibleNodes[:feasibleNodesLen]
+	if err := errCh.ReceiveError(); err != nil {
+		statusCode = framework.Error
+		return feasibleNodes, err
+	}
+	return feasibleNodes, nil
+}
+```
+
+###### prioritizeNodes
+
+```GO
+// prioritizeNodes通过运行评分插件对节点进行排序，
+// 运行评分插件会为每个节点返回一个分数，这些插件的分数会被加在一起以得出节点的总分数，然后运行任何扩展插件。
+// 最后，所有分数会被组合（相加），以获得所有节点的加权总分数
+func prioritizeNodes(
+    ctx context.Context, // 运行上下文
+    extenders []framework.Extender, // 扩展插件
+    fwk framework.Framework, // 调度框架
+    state *framework.CycleState, // 调度周期状态
+    pod *v1.Pod, // pod对象
+    nodes []*v1.Node, // 节点数组
+) ([]framework.NodePluginScores, error) { // 返回节点插件分数数组和错误
+
+    // 如果未提供优先级配置，则所有节点的分数都为1。
+    // 这是为了以所需格式生成优先级列表所必需的
+    if len(extenders) == 0 && !fwk.HasScorePlugins() {
+        result := make([]framework.NodePluginScores, 0, len(nodes))
+        for i := range nodes {
+            result = append(result, framework.NodePluginScores{
+                Name:       nodes[i].Name,
+                TotalScore: 1,
+            })
+        }
+        return result, nil
+    }
+
+    // 运行PreScore插件。
+    preScoreStatus := fwk.RunPreScorePlugins(ctx, state, pod, nodes)
+    if !preScoreStatus.IsSuccess() {
+        return nil, preScoreStatus.AsError()
+    }
+
+    // 运行Score插件。
+    nodesScores, scoreStatus := fwk.RunScorePlugins(ctx, state, pod, nodes)
+    if !scoreStatus.IsSuccess() {
+        return nil, scoreStatus.AsError()
+    }
+
+    // 如果启用，记录级别为10的其他详细信息。
+    klogV := klog.V(10)
+    if klogV.Enabled() {
+        for _, nodeScore := range nodesScores {
+            for _, pluginScore := range nodeScore.Scores {
+                klogV.InfoS("Plugin scored node for pod", "pod", klog.KObj(pod), "plugin", pluginScore.Name, "node", nodeScore.Name, "score", pluginScore.Score)
+            }
+        }
+    }
+
+    if len(extenders) != 0 && nodes != nil {
+		// allNodeExtendersScores包含所有节点的所有扩展程序分数。
+        // 它的键名为节点名称。
+		allNodeExtendersScores := make(map[string]*framework.NodePluginScores, len(nodes))
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for i := range extenders {
+            // 如果extenders不关心pod 跳过
+			if !extenders[i].IsInterested(pod) {
+				continue
+			}
+			wg.Add(1)
+			go func(extIndex int) {
+                // 记录调度器协程数量和扩展器的数量
+				metrics.SchedulerGoroutines.WithLabelValues(metrics.PrioritizingExtender).Inc()
+				metrics.Goroutines.WithLabelValues(metrics.PrioritizingExtender).Inc()
+				// 在函数返回时减少协程数量并完成 WaitGroup
+                defer func() {
+					metrics.SchedulerGoroutines.WithLabelValues(metrics.PrioritizingExtender).Dec()
+					metrics.Goroutines.WithLabelValues(metrics.PrioritizingExtender).Dec()
+					wg.Done()
+				}()
+                // 使用扩展器的 Prioritize 函数计算优先级
+				prioritizedList, weight, err := extenders[extIndex].Prioritize(pod, nodes)
+				if err != nil {
+					// 如果计算失败则忽略此扩展器
+					klog.V(5).InfoS("Failed to run extender's priority function. No score given by this extender.", "error", err, "pod", klog.KObj(pod), "extender", extenders[extIndex].Name())
+					return
+				}
+                // 对于每个经过优先排序的节点，计算最终得分
+				mu.Lock()
+				defer mu.Unlock()
+				for i := range *prioritizedList {
+					nodename := (*prioritizedList)[i].Host
+					score := (*prioritizedList)[i].Score
+					if klogV.Enabled() {
+						klogV.InfoS("Extender scored node for pod", "pod", klog.KObj(pod), "extender", extenders[extIndex].Name(), "node", nodename, "score", score)
+					}
+
+					 // 将扩展器得分与节点名称组合成一个新的 PluginScore 并添加到 allNodeExtendersScores 中
+					finalscore := score * weight * (framework.MaxNodeScore / extenderv1.MaxExtenderPriority)
+
+					if allNodeExtendersScores[nodename] == nil {
+						allNodeExtendersScores[nodename] = &framework.NodePluginScores{
+							Name:   nodename,
+							Scores: make([]framework.PluginScore, 0, len(extenders)),
+						}
+					}
+					allNodeExtendersScores[nodename].Scores = append(allNodeExtendersScores[nodename].Scores, framework.PluginScore{
+						Name:  extenders[extIndex].Name(),
+						Score: finalscore,
+					})
+					allNodeExtendersScores[nodename].TotalScore += finalscore
+				}
+			}(i)
+		}
+		// 等待所有goroutine完成
+		wg.Wait()
+		for i := range nodesScores {
+			if score, ok := allNodeExtendersScores[nodes[i].Name]; ok {
+				nodesScores[i].Scores = append(nodesScores[i].Scores, score.Scores...)
+				nodesScores[i].TotalScore += score.TotalScore
+			}
+		}
+	}
+	
+    // 如果开启了 打印日志
+	if klogV.Enabled() {
+		for i := range nodesScores {
+			klogV.InfoS("Calculated node's final score for pod", "pod", klog.KObj(pod), "node", nodesScores[i].Name, "score", nodesScores[i].TotalScore)
+		}
+	}
+	return nodesScores, nil
+}
+```
+
+###### selectHost
+
+```go
+// selectHost函数从节点得分列表中以 reservoir sampling 的方式选择一个节点。
+func selectHost(nodeScores []framework.NodePluginScores) (string, error) {
+	// 如果列表为空，则返回错误。
+	if len(nodeScores) == 0 {
+		return "", fmt.Errorf("empty priorityList")
+	}
+	// 初始化得分最高的节点。
+	maxScore := nodeScores[0].TotalScore
+	selected := nodeScores[0].Name
+	cntOfMaxScore := 1 // 记录得分最高的节点数目。
+	// 遍历剩余的节点得分列表。
+	for _, ns := range nodeScores[1:] {
+		// 如果有一个节点的总得分比当前最高得分更高，则将其设为新的最高得分的节点。
+		if ns.TotalScore > maxScore {
+			maxScore = ns.TotalScore
+			selected = ns.Name
+			cntOfMaxScore = 1 // 重新计算得分最高的节点数目。
+		// 如果有一个节点的总得分等于当前最高得分，则可能将其选为新的候选节点。
+		} else if ns.TotalScore == maxScore {
+			cntOfMaxScore++ // 增加得分最高的节点数目。
+			if rand.Intn(cntOfMaxScore) == 0 {
+				// 用1/cntOfMaxScore的概率用当前节点替换候选节点。
+				selected = ns.Name
+			}
+		}
+	}
+	// 返回所选节点的名称。
+	return selected, nil
+}
+```
+
+##### assume
+
+```go
+// assume函数用于将Pod添加到缓存中，以便可以异步地进行绑定。修改了传入的参数"assumed"。
+func (sched *Scheduler) assume(assumed *v1.Pod, host string) error {
+    // 乐观地假设绑定将成功，并在后台将其发送到api服务器。
+    // 如果绑定失败，调度程序将立即释放分配给"assumed"的资源。
+    assumed.Spec.NodeName = host
+    // 将Pod添加到缓存中
+    if err := sched.Cache.AssumePod(assumed); err != nil {
+        klog.ErrorS(err, "Scheduler cache AssumePod failed") // 如果添加失败，则记录错误日志
+        return err // 返回错误
+    }
+
+    // 如果"assumed"是已提名的Pod，则应从内部缓存中删除它
+    if sched.SchedulingQueue != nil {
+        sched.SchedulingQueue.DeleteNominatedPodIfExists(assumed)
+    }
+
+    return nil // 返回nil表示没有错误
+}
+```
+
+#### bindingCycle
+
+```go
+// bindingCycle函数尝试将一个已经假定的Pod进行绑定。
+func (sched *Scheduler) bindingCycle(
+    ctx context.Context, // 上下文
+    state *framework.CycleState, // 周期状态
+    fwk framework.Framework, // 调度框架
+    scheduleResult ScheduleResult, // 调度结果
+    assumedPodInfo *framework.QueuedPodInfo, // 已假定Pod的信息
+    start time.Time, // 绑定开始时间
+    podsToActivate *framework.PodsToActivate) *framework.Status { // 激活的Pod列表
+    
+    assumedPod := assumedPodInfo.Pod // 获取已假定的Pod
+
+    // 运行"permit"插件
+    if status := fwk.WaitOnPermit(ctx, assumedPod); !status.IsSuccess() {
+        return status // 如果不成功则返回状态
+    }
+
+    // 运行"prebind"插件
+    if status := fwk.RunPreBindPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost); !status.IsSuccess() {
+        return status // 如果不成功则返回状态
+    }
+
+    // 运行"bind"插件
+    if status := sched.bind(ctx, fwk, assumedPod, scheduleResult.SuggestedHost, state); !status.IsSuccess() {
+        return status // 如果不成功则返回状态
+    }
+
+    // 当klog的详细程度低于2时，计算nodeResourceString可能很重。如果是这样，则避免计算。
+    klog.V(2).InfoS("Successfully bound pod to node", "pod", klog.KObj(assumedPod), "node", scheduleResult.SuggestedHost, "evaluatedNodes", scheduleResult.EvaluatedNodes, "feasibleNodes", scheduleResult.FeasibleNodes)
+
+    // 记录调度的度量指标
+    metrics.PodScheduled(fwk.ProfileName(), metrics.SinceInSeconds(start))
+    metrics.PodSchedulingAttempts.Observe(float64(assumedPodInfo.Attempts))
+    metrics.PodSchedulingDuration.WithLabelValues(getAttemptsLabel(assumedPodInfo)).Observe(metrics.SinceInSeconds(assumedPodInfo.InitialAttemptTimestamp))
+
+    // 运行"postbind"插件
+    fwk.RunPostBindPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+
+    // 在成功绑定周期的末尾，如果需要，移动Pods。
+    if len(podsToActivate.Map) != 0 {
+        sched.SchedulingQueue.Activate(podsToActivate.Map)
+        // 不像schedulingCycle()函数中的逻辑，我们不需要删除条目，
+        // 因为"podsToActivate.Map"不再使用。
+    }
+
+    return nil // 返回nil表示没有错误
+}
+```
+
+##### bind
+
+```go
+// bind函数用于将Pod绑定到给定的节点上。
+// 绑定的优先级为：(1) 扩展程序，(2) 框架插件。
+// 我们期望它以异步方式运行，因此我们在内部处理绑定指标。
+func (sched *Scheduler) bind(ctx context.Context, fwk framework.Framework, assumed *v1.Pod, targetNode string, state *framework.CycleState) (status *framework.Status) {
+    // 延迟函数在函数返回前执行
+    defer func() {
+    // 完成绑定时，记录绑定指标
+    sched.finishBinding(fwk, assumed, targetNode, status)
+    }()
+    // 如果扩展程序成功绑定Pod，返回状态并携带错误信息
+    bound, err := sched.extendersBinding(assumed, targetNode)
+    if bound {
+        return framework.AsStatus(err)
+    }
+    // 否则运行框架插件进行绑定
+    return fwk.RunBindPlugins(ctx, state, assumed, targetNode)
+}
+```
+
+###### finishBinding
+
+```go
+func (sched *Scheduler) finishBinding(fwk framework.Framework, assumed *v1.Pod, targetNode string, status *framework.Status) {
+    // 在调度器的缓存中完成绑定
+    if finErr := sched.Cache.FinishBinding(assumed); finErr != nil {
+    klog.ErrorS(finErr, "Scheduler cache FinishBinding failed")
+    }
+
+    // 如果绑定失败，则记录日志并返回
+    if !status.IsSuccess() {
+        klog.V(1).InfoS("Failed to bind pod", "pod", klog.KObj(assumed))
+        return
+    }
+
+    // 记录事件，表示绑定成功
+    fwk.EventRecorder().Eventf(assumed, nil, v1.EventTypeNormal, "Scheduled", "Binding", "Successfully assigned %v/%v to %v", assumed.Namespace, assumed.Name, targetNode)
+}
+```
+
+###### extendersBinding
+
+```go
+// TODO(#87159): 将此代码移到插件中。
+func (sched *Scheduler) extendersBinding(pod *v1.Pod, node string) (bool, error) {
+    // 遍历所有扩展器
+    for _, extender := range sched.Extenders {
+        // 如果扩展器不是绑定器或不关心该 Pod，则继续循环
+        if !extender.IsBinder() || !extender.IsInterested(pod) {
+        	continue
+        }
+        // 调用扩展器的 Bind 函数完成绑定，并返回 true 表示绑定成功
+        return true, extender.Bind(&v1.Binding{
+            ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
+            Target: v1.ObjectReference{Kind: "Node", Name: node},
+    	})
+    }
+    // 如果没有扩展器对该 Pod 进行绑定操作，则返回 false 表示未绑定
+    return false, nil
+}
+```
+
+#### handleBindingCycleError
+
+```go
+func (sched *Scheduler) handleBindingCycleError(
+    ctx context.Context,
+    state *framework.CycleState,
+    fwk framework.Framework,
+    podInfo *framework.QueuedPodInfo,
+    start time.Time,
+    scheduleResult ScheduleResult,
+    status *framework.Status) {
+    
+    // 获取 Pod 的信息
+    assumedPod := podInfo.Pod
+
+    // 触发未预留插件进行清理与回收已预留的资源
+    fwk.RunReservePluginsUnreserve(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+
+    // 将 Assumed Pod 从调度器缓存中移除
+    if forgetErr := sched.Cache.ForgetPod(assumedPod); forgetErr != nil {
+        klog.ErrorS(forgetErr, "scheduler cache ForgetPod failed")
+    } else {
+        // 在绑定周期中，从缓存中 "Forget" 掉一个 Assumed Pod 应该被视为一个 PodDelete 事件，
+        // 因为该 Assumed Pod 已经占用了调度器缓存中的一定资源。
+        //
+        // 注意，不要移动 Assumed Pod 本身，因为 Assumed Pod 始终是不可调度的。
+        // 这里有意将此操作 "defer"，否则 MoveAllToActiveOrBackoffQueue() 将更新 `q.moveRequest`，
+        // 并将 Assumed Pod 移动到 backoffQ。
+        if status.IsUnschedulable() {
+            defer sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(internalqueue.AssignedPodDelete, func(pod *v1.Pod) bool {
+                return assumedPod.UID != pod.UID
+            })
+        } else {
+            sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(internalqueue.AssignedPodDelete, nil)
+        }
+    }
+
+    // 调用 FailureHandler 处理错误
+    sched.FailureHandler(ctx, fwk, podInfo, status, clearNominatedNode, start)
+}
+```
+
+##### handleSchedulingFailure
+
+```GO
+// handleSchedulingFailure记录一个事件，表示Pod无法调度。如果设置了，还要更新Pod条件和被提名的节点名称。
+func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, fwk framework.Framework, podInfo *framework.QueuedPodInfo, status *framework.Status, nominatingInfo *framework.NominatingInfo, start time.Time) {
+	// 设置 pod 的失败原因
+	reason := v1.PodReasonSchedulerError
+	if status.IsUnschedulable() {
+		reason = v1.PodReasonUnschedulable
+	}
+
+	// 根据不同的原因进行相应的处理
+	switch reason {
+	case v1.PodReasonUnschedulable:
+		metrics.PodUnschedulable(fwk.ProfileName(), metrics.SinceInSeconds(start))
+	case v1.PodReasonSchedulerError:
+		metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
+	}
+
+	pod := podInfo.Pod
+	err := status.AsError()
+	errMsg := status.Message()
+
+	// 如果没有可用节点，等待
+	if err == ErrNoNodesAvailable {
+		klog.V(2).InfoS("Unable to schedule pod; no nodes are registered to the cluster; waiting", "pod", klog.KObj(pod), "err", err)
+	} else if fitError, ok := err.(*framework.FitError); ok {
+		// 如果是无法调度的错误，则将 UnschedulablePlugins 注入 PodInfo，以便稍后有效地在队列之间移动 Pod。
+		podInfo.UnschedulablePlugins = fitError.Diagnosis.UnschedulablePlugins
+		klog.V(2).InfoS("Unable to schedule pod; no fit; waiting", "pod", klog.KObj(pod), "err", errMsg)
+	} else if apierrors.IsNotFound(err) {
+		// 如果是找不到节点，则等待
+		klog.V(2).InfoS("Unable to schedule pod, possibly due to node not found; waiting", "pod", klog.KObj(pod), "err", errMsg)
+		if errStatus, ok := err.(apierrors.APIStatus); ok && errStatus.Status().Details.Kind == "node" {
+			nodeName := errStatus.Status().Details.Name
+			// 如果节点未找到，则不立即删除节点。再次尝试获取节点，如果仍然未找到，则从调度器缓存中删除该节点。
+			_, err := fwk.ClientSet().CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+			if err != nil && apierrors.IsNotFound(err) {
+				node := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+				if err := sched.Cache.RemoveNode(&node); err != nil {
+					klog.V(4).InfoS("Node is not found; failed to remove it from the cache", "node", node.Name)
+				}
+			}
+		}
+	} else {
+		// 其他错误重试
+		klog.ErrorS(err, "Error scheduling pod; retrying", "pod", klog.KObj(pod))
+	}
+
+	// 检查Pod是否存在于informer缓存中。
+	podLister := fwk.SharedInformerFactory().Core().V1().Pods().Lister()
+	cachedPod, e := podLister.Pods(pod.Namespace).Get(pod.Name)
+	if e != nil {
+        // 如果Pod不存在于informer缓存中，则打印日志并退出函数。
+		klog.InfoS("Pod doesn't exist in informer cache", "pod", klog.KObj(pod), "err", e)
+	} else {
+		// 如果Pod存在于informer缓存中，继续判断其是否已被分配到节点上。
+		if len(cachedPod.Spec.NodeName) != 0 {
+            // 如果Pod已经被分配到节点上，则打印日志并退出函数。
+			klog.InfoS("Pod has been assigned to node. Abort adding it back to queue.", "pod", klog.KObj(pod), "node", cachedPod.Spec.NodeName)
+		} else {
+			// 如果Pod存在于informer缓存中，并且没有被分配到节点上，则将其添加到调度队列中。
+			// 注意，此处需要先进行DeepCopy操作，因为cachedPod是从SharedInformer中获取的，可能会在之后被修改。
+			podInfo.PodInfo, _ = framework.NewPodInfo(cachedPod.DeepCopy())
+			if err := sched.SchedulingQueue.AddUnschedulableIfNotPresent(podInfo, sched.SchedulingQueue.SchedulingCycle()); err != nil {
+				klog.ErrorS(err, "Error occurred")
+			}
+		}
+	}
+
+	// 更新调度队列中被提名的Pod信息。
+	if sched.SchedulingQueue != nil {
+		sched.SchedulingQueue.AddNominatedPod(podInfo.PodInfo, nominatingInfo)
+	}
+
+	if err == nil {
+		// 只有在测试时才会执行到这里。
+		return
+	}
+	
+    // 如果出现错误，则打印日志并更新Pod的调度状态。
+	msg := truncateMessage(errMsg)
+	fwk.EventRecorder().Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", msg)
+	if err := updatePod(ctx, sched.client, pod, &v1.PodCondition{
+		Type:    v1.PodScheduled,
+		Status:  v1.ConditionFalse,
+		Reason:  reason,
+		Message: errMsg,
+	}, nominatingInfo); err != nil {
+		klog.ErrorS(err, "Error updating pod", "pod", klog.KObj(pod))
+	}
+}
+```
+
+###### truncateMessage
+
+```go
+// truncateMessage 是一个函数，用于截断消息以符合 NoteLengthLimit 的限制。
+func truncateMessage(message string) string {
+    // 将 max 设为 validation 包中 NoteLengthLimit 的值。
+    max := validation.NoteLengthLimit
+    // 如果消息长度小于等于限制长度，则返回原消息。
+    if len(message) <= max {
+    	return message
+    }
+    // 将 suffix 设为字符串 " ..."。
+    suffix := " ..."
+    // 截取消息字符串，长度为限制长度减去后缀长度，再加上后缀本身。
+    return message[:max-len(suffix)] + suffix
+}
+```
+
+###### updatePod
+
+```go
+// updatePod 是一个函数，用于更新 Pod 的状态。
+func updatePod(ctx context.Context, client clientset.Interface, pod *v1.Pod, condition *v1.PodCondition, nominatingInfo *framework.NominatingInfo) error {
+    // 打印日志，记录正在更新的 Pod 条件的类型、状态、原因等信息。
+    klog.V(3).InfoS("Updating pod condition", "pod", klog.KObj(pod), "conditionType", condition.Type, "conditionStatus", condition.Status, "conditionReason", condition.Reason)
+    // 复制一份 Pod 的状态。
+    podStatusCopy := pod.Status.DeepCopy()
+    // 如果正在尝试设置 NominatedNodeName，并且它与现有值不同，则需要更新 NominatedNodeName。
+    nnnNeedsUpdate := nominatingInfo.Mode() == framework.ModeOverride && pod.Status.NominatedNodeName != nominatingInfo.NominatedNodeName
+    // 如果不能更新 Pod 的条件且不需要更新 NominatedNodeName，则直接返回 nil。
+    if !podutil.UpdatePodCondition(podStatusCopy, condition) && !nnnNeedsUpdate {
+    	return nil
+    }
+    // 如果需要更新 NominatedNodeName，则将 NominatedNodeName 更新为新值。
+    if nnnNeedsUpdate {
+    	podStatusCopy.NominatedNodeName = nominatingInfo.NominatedNodeName
+    }
+    // 使用 util.PatchPodStatus 函数更新 Pod 的状态，并返回错误信息。
+    return util.PatchPodStatus(ctx, client, pod, podStatusCopy)
+}
+```
 
