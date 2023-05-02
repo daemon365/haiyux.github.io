@@ -2508,3 +2508,908 @@ func (pl *NodePorts) EventsToRegister() []framework.ClusterEvent {
 }
 ```
 
+## NodeResourcesBalancedAllocation
+
+### 作用
+
+该插件旨在在调度容器时平衡节点资源的使用，即在节点之间分配CPU和内存资源，以确保在节点上运行的所有容器都可以获得所需的资源。它的主要工作原理是评估节点的可用资源，然后在尽可能相等地使用所有节点资源的同时，将容器调度到可用节点上。
+
+该插件考虑以下因素来平衡节点的资源使用：
+
+- 节点的总资源
+- 节点上正在运行的容器和其资源需求
+- 节点上已经被预留的资源（如果有）
+
+该插件还考虑到节点的标签，以便将容器调度到具有特定标签的节点上。例如，如果一个容器需要特定的GPU资源，该插件将考虑到只有具有适当GPU标签的节点才能运行该容器。
+
+### 结构
+
+```GO
+// BalancedAllocation是一个分数插件，用于计算容量的CPU和内存分数之间的差异，并根据两个度量之间的接近程度优先考虑主机。
+type BalancedAllocation struct {
+    handle framework.Handle
+    resourceAllocationScorer
+}
+
+// _ framework.PreScorePlugin = &BalancedAllocation{}，确保BalancedAllocation实现了PreScorePlugin接口
+// _ framework.ScorePlugin = &BalancedAllocation{}，确保BalancedAllocation实现了ScorePlugin接口
+var _ framework.PreScorePlugin = &BalancedAllocation{}
+var _ framework.ScorePlugin = &BalancedAllocation{}
+
+const (
+    // BalancedAllocationName是插件在插件注册表和配置中使用的名称。
+	BalancedAllocationName = names.NodeResourcesBalancedAllocation
+    // balancedAllocationPreScoreStateKey是CycleState中的键，用于NodeResourcesBalancedAllocation的预计算数据以进行评分。
+	balancedAllocationPreScoreStateKey = "PreScore" + BalancedAllocationName
+)
+
+// Name返回插件的名称。它用于日志等。
+func (ba *BalancedAllocation) Name() string {
+	return BalancedAllocationName
+}
+
+// NewBalancedAllocation初始化一个新的插件并返回它。
+func NewBalancedAllocation(baArgs runtime.Object, h framework.Handle, fts feature.Features) (framework.Plugin, error) {
+    args, ok := baArgs.(*config.NodeResourcesBalancedAllocationArgs)
+    if !ok {
+    	return nil, fmt.Errorf("want args to be of type NodeResourcesBalancedAllocationArgs, got %T", baArgs)
+    }
+    // 验证参数
+    if err := validation.ValidateNodeResourcesBalancedAllocationArgs(nil, args); err != nil {
+        return nil, err
+    }
+
+    return &BalancedAllocation{
+        handle: h,
+        resourceAllocationScorer: resourceAllocationScorer{
+            Name:         BalancedAllocationName,
+            scorer:       balancedResourceScorer,
+            useRequested: true,
+            resources:    args.Resources,
+        },
+    }, nil
+}
+```
+
+#### resourceAllocationScorer
+
+```go
+// scorer 是 resourceAllocationScorer 的装饰器。
+type scorer func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer
+
+// resourceAllocationScorer 包含计算资源分配得分所需的信息。
+type resourceAllocationScorer struct {
+    Name string
+    // 用于决定在计算 cpu 和 memory 时使用 Requested 还是 NonZeroRequested。
+    useRequested bool
+    scorer func(requested, allocable []int64) int64
+    resources []config.ResourceSpec
+}
+
+// score函数将使用'scorer'函数计算得分。
+func (r *resourceAllocationScorer) score(
+    ctx context.Context, // 上下文对象
+    pod *v1.Pod, // Pod对象
+    nodeInfo *framework.NodeInfo, // 节点信息对象
+    podRequests []int64) (int64, *framework.Status) { // Pod资源请求列表，返回得分和状态对象
+    logger := klog.FromContext(ctx) // 获取logger对象
+    node := nodeInfo.Node() // 获取节点对象
+    if node == nil { // 节点不存在，则返回错误状态
+    	return 0, framework.NewStatus(framework.Error, "node not found")
+    }
+    // 如果资源未设置，则无法调度Pod，返回错误状态
+    if len(r.resources) == 0 {
+    	return 0, framework.NewStatus(framework.Error, "resources not found")
+    }
+	requested := make([]int64, len(r.resources))  // 声明一个与资源列表同长度的切片，用于存储请求的资源量
+    allocatable := make([]int64, len(r.resources))  // 声明一个与资源列表同长度的切片，用于存储节点上可用的资源量
+    for i := range r.resources {  // 遍历资源列表
+        // 计算资源可分配和请求的数量
+        alloc, req := r.calculateResourceAllocatableRequest(logger, nodeInfo, v1.ResourceName(r.resources[i].Name), podRequests[i])
+        // 仅当可分配数量为0时跳过，不进行存储
+        if alloc == 0 {
+            continue
+        }
+        allocatable[i] = alloc  // 将可分配数量存储在allocatable中
+        requested[i] = req  // 将请求的数量存储在requested中
+    }
+
+    // 计算资源的得分
+    score := r.scorer(requested, allocatable)
+
+    // 当logger的V方法返回值大于等于10时，输出内部信息
+    if loggerV := logger.V(10); loggerV.Enabled() {
+        loggerV.Info("Listed internal info for allocatable resources, requested resources and score", "pod",
+            klog.KObj(pod), "node", klog.KObj(node), "resourceAllocationScorer", r.Name,
+            "allocatableResource", allocatable, "requestedResource", requested, "resourceScore", score,
+        )
+    }
+
+    return score, nil  // 返回资源得分和状态
+}
+
+// calculateResourceAllocatableRequest 返回2个参数：
+// - 第1个参数：节点上可分配资源的数量。
+// - 第2个参数：节点上请求资源的总和。
+// 注意：如果它是扩展资源，且Pod不请求它，则返回(0, 0)。
+func (r *resourceAllocationScorer) calculateResourceAllocatableRequest(logger klog.Logger, nodeInfo *framework.NodeInfo, resource v1.ResourceName, podRequest int64) (int64, int64) {
+    requested := nodeInfo.NonZeroRequested
+    // 如果 useRequested 为 true，则使用 Requested，否则使用 NonZeroRequested
+    if r.useRequested {
+        requested = nodeInfo.Requested
+    }
+
+    // 如果 pod 不请求该扩展资源，则返回 (0, 0) 以跳过对该资源的评分
+    if podRequest == 0 && schedutil.IsScalarResourceName(resource) {
+        return 0, 0
+    }
+
+    switch resource {
+    // 如果请求的资源是 CPU，则返回节点可分配 CPU 数量和请求 CPU 数量之和
+    case v1.ResourceCPU:
+        return nodeInfo.Allocatable.MilliCPU, (requested.MilliCPU + podRequest)
+
+    // 如果请求的资源是 Memory，则返回节点可分配内存量和请求内存量之和
+    case v1.ResourceMemory:
+        return nodeInfo.Allocatable.Memory, (requested.Memory + podRequest)
+
+    // 如果请求的资源是 EphemeralStorage，则返回节点可分配临时存储量和请求临时存储量之和
+    case v1.ResourceEphemeralStorage:
+        return nodeInfo.Allocatable.EphemeralStorage, (nodeInfo.Requested.EphemeralStorage + podRequest)
+
+    // 如果请求的资源是扩展资源，则返回节点可分配该扩展资源量和请求该扩展资源量之和
+    default:
+        if _, exists := nodeInfo.Allocatable.ScalarResources[resource]; exists {
+            return nodeInfo.Allocatable.ScalarResources[resource], (nodeInfo.Requested.ScalarResources[resource] + podRequest)
+        }
+    }
+
+    // 记录跳过对该资源评分的信息
+    logger.V(10).Info("Requested resource is omitted for node score calculation", "resourceName", resource)
+
+    // 如果请求的资源不属于上述任何一种类型，则返回 (0, 0)
+    return 0, 0
+}
+
+// calculatePodResourceRequest函数返回总的非零资源请求量。如果Pod定义了Overhead，那么将其加到结果中。
+func (r *resourceAllocationScorer) calculatePodResourceRequest(pod *v1.Pod, resourceName v1.ResourceName) int64 {
+    // 定义PodResourcesOptions对象
+    opts := resourcehelper.PodResourcesOptions{
+        InPlacePodVerticalScalingEnabled: utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling),
+    }
+
+    // 如果不使用请求资源，则设置默认CPU和内存请求量
+    if !r.useRequested {
+        opts.NonMissingContainerRequests = v1.ResourceList{
+            v1.ResourceCPU:    *resource.NewMilliQuantity(schedutil.DefaultMilliCPURequest, resource.DecimalSI),
+            v1.ResourceMemory: *resource.NewQuantity(schedutil.DefaultMemoryRequest, resource.DecimalSI),
+        }
+    }
+
+    // 获取Pod的资源请求量
+    requests := resourcehelper.PodRequests(pod, opts)
+
+    // 获取指定资源类型的请求量
+    quantity := requests[resourceName]
+    if resourceName == v1.ResourceCPU {
+        // 如果是CPU资源，返回毫核单位的请求量
+        return quantity.MilliValue()
+    }
+    // 如果是其他类型的资源，返回对应的值
+    return quantity.Value()
+}
+
+// calculatePodResourceRequestList函数返回Pod对于资源列表中每个资源类型的请求量
+func (r *resourceAllocationScorer) calculatePodResourceRequestList(pod *v1.Pod, resources []config.ResourceSpec) []int64 {
+	podRequests := make([]int64, len(resources))
+    for i := range resources {
+        // 调用calculatePodResourceRequest计算每个资源类型的请求量
+        podRequests[i] = r.calculatePodResourceRequest(pod, v1.ResourceName(resources[i].Name))
+    }
+    return podRequests
+}
+```
+
+#### balancedResourceScorer
+
+```go
+func balancedResourceScorer(requested, allocable []int64) int64 {
+	// 定义存储每个资源使用率的分数和总的使用率分数
+	var resourceToFractions []float64
+	var totalFraction float64
+	// 遍历 requested 列表，计算每个资源的使用率
+	for i := range requested {
+		// 如果该资源在该节点上不可用，则跳过
+		if allocable[i] == 0 {
+			continue
+		}
+		// 计算该资源的使用率分数
+		fraction := float64(requested[i]) / float64(allocable[i])
+		// 如果使用率超过 1，将其设为 1，因为使用率不能超过 100%
+		if fraction > 1 {
+			fraction = 1
+		}
+		// 累加总的使用率分数，并将该资源的使用率分数加入 resourceToFractions
+		totalFraction += fraction
+		resourceToFractions = append(resourceToFractions, fraction)
+	}
+
+	// 初始化标准差
+	std := 0.0
+
+	// 如果资源数量只有两个，可以简化计算标准差的公式
+	if len(resourceToFractions) == 2 {
+		std = math.Abs((resourceToFractions[0] - resourceToFractions[1]) / 2)
+	// 否则，使用常见的公式计算标准差
+	} else if len(resourceToFractions) > 2 {
+		// 计算平均使用率
+		mean := totalFraction / float64(len(resourceToFractions))
+		var sum float64
+		// 计算每个使用率与平均使用率的差的平方之和
+		for _, fraction := range resourceToFractions {
+			sum = sum + (fraction-mean)*(fraction-mean)
+		}
+		// 标准差等于上述平方和除以使用率数量再开根号
+		std = math.Sqrt(sum / float64(len(resourceToFractions)))
+	}
+
+	// 标准差始终是正值。1 减去标准差，可以让得分更高的节点具有更小的标准差，从而更平衡，同时将其乘以 `MaxNodeScore` 可以提供所需的缩放因子
+	return int64((1 - std) * float64(framework.MaxNodeScore))
+}
+```
+
+### PreScore
+
+```GO
+// PreScore函数计算传入的Pod资源请求，并将其写入用于周期状态的环境中。
+func (ba *BalancedAllocation) PreScore(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+    // 创建一个balancedAllocationPreScoreState的结构体对象state，其中podRequests存储Pod资源请求列表
+    state := &balancedAllocationPreScoreState{
+    	podRequests: ba.calculatePodResourceRequestList(pod, ba.resources),
+    }
+    // 将state写入周期状态环境中，使用balancedAllocationPreScoreStateKey作为key
+    cycleState.Write(balancedAllocationPreScoreStateKey, state)
+    return nil
+}
+```
+
+#### balancedAllocationPreScoreState
+
+```GO
+// balancedAllocationPreScoreState在PreScore时计算，在Score时使用。
+type balancedAllocationPreScoreState struct {
+    // podRequests的顺序与NodeResourcesFitArgs.Resources中定义的资源相同，在其他存储类似列表的地方也是如此。
+    podRequests []int64
+}
+
+// Clone实现了必需的Clone接口。实际上并没有复制数据，因为没有必要。
+func (s *balancedAllocationPreScoreState) Clone() framework.StateData {
+	return s
+}
+```
+
+### Score&ScoreExtensions
+
+```GO
+// Score在计算分数的扩展点被调用。
+func (ba *BalancedAllocation) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+    // 从Snapshot中获取节点的信息
+    nodeInfo, err := ba.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+    if err != nil {
+    	return 0, framework.AsStatus(fmt.Errorf("getting node %q from Snapshot: %w", nodeName, err))
+    }
+	// 获取balancedAllocationPreScoreState，如果获取失败则计算pod的资源请求列表并创建一个新的状态
+    s, err := getBalancedAllocationPreScoreState(state)
+    if err != nil {
+        s = &balancedAllocationPreScoreState{podRequests: ba.calculatePodResourceRequestList(pod, ba.resources)}
+    }
+
+    // ba.score偏爱资源使用率平衡的节点。它计算这些资源的标准差，并根据这些资源的使用情况有多接近，优先选择节点。
+    // 具体来说，score = (1 - std) * MaxNodeScore，其中std通过Σ((fraction(i)-mean)^2)/len(resources)的平方根计算。
+    // 算法部分灵感来源于：
+    // "Wei Huang等人。具有平衡资源利用率的节能虚拟机放置算法"
+    return ba.score(ctx, pod, nodeInfo, s.podRequests)
+}
+
+// ScoreExtensions函数实现了Score插件的ScoreExtensions接口，返回nil。
+func (ba *BalancedAllocation) ScoreExtensions() framework.ScoreExtensions {
+	return nil
+}
+```
+
+#### getBalancedAllocationPreScoreState
+
+```go
+// getBalancedAllocationPreScoreState从cycleState中获取balancedAllocationPreScoreState，如果获取失败则返回错误。
+func getBalancedAllocationPreScoreState(cycleState *framework.CycleState) (*balancedAllocationPreScoreState, error) {
+    c, err := cycleState.Read(balancedAllocationPreScoreStateKey)
+    if err != nil {
+    	return nil, fmt.Errorf("reading %q from cycleState: %w", balancedAllocationPreScoreStateKey, err)
+    }
+        s, ok := c.(*balancedAllocationPreScoreState)
+    if !ok {
+        return nil, fmt.Errorf("invalid PreScore state, got type %T", c)
+    }
+    return s, nil
+}
+```
+
+## NodeResourcesFit
+
+### 作用
+
+用于检查要调度到节点的 Pod 所需资源是否与该节点上的可用资源相匹配。在 Kubernetes 中，Pods 可以请求 CPU、内存、存储和其他资源。这些资源必须可用于节点才能调度 Pod。`NodeResourcesFit` 功能会检查要调度的 Pod 的资源需求是否与节点上的可用资源匹配。
+
+如果 Pod 所需的资源不匹配，调度器将不会将其调度到该节点上。调度器将尝试在其他可用的节点上找到匹配的节点以调度该 Pod。
+
+此外，`NodeResourcesFit` 还可以考虑其他因素，例如节点上已经运行的 Pod 的资源需求，以确保节点不会过度分配资源。
+
+### 结构
+
+```GO
+// 定义一个实现 PreFilterPlugin 接口的类型 Fit，确保 Fit 类型实现了 PreFilterPlugin 接口
+var _ framework.PreFilterPlugin = &Fit{}
+// 定义一个实现 FilterPlugin 接口的类型 Fit，确保 Fit 类型实现了 FilterPlugin 接口
+var _ framework.FilterPlugin = &Fit{}
+// 定义一个实现 EnqueueExtensions 接口的类型 Fit，确保 Fit 类型实现了 EnqueueExtensions 接口
+var _ framework.EnqueueExtensions = &Fit{}
+// 定义一个实现 PreScorePlugin 接口的类型 Fit，确保 Fit 类型实现了 PreScorePlugin 接口
+var _ framework.PreScorePlugin = &Fit{}
+// 定义一个实现 ScorePlugin 接口的类型 Fit，确保 Fit 类型实现了 ScorePlugin 接口
+var _ framework.ScorePlugin = &Fit{}
+
+const (
+	// Name 是插件在插件注册表和配置中使用的名称
+	Name = names.NodeResourcesFit
+	// preFilterStateKey 是 CycleState 中 NodeResourcesFit 预先计算的数据的键
+	// 使用插件的名称可能会帮助我们避免与其他插件发生冲突
+	preFilterStateKey = "PreFilter" + Name
+	// preScoreStateKey 是 CycleState 中用于评分的 NodeResourcesFit 预先计算的数据的键
+	preScoreStateKey = "PreScore" + Name
+)
+
+// Fit 是一个检查节点是否具有足够资源的插件
+type Fit struct {
+	ignoredResources                sets.Set[string] // 忽略的资源
+	ignoredResourceGroups           sets.Set[string] // 忽略的资源组
+	enableInPlacePodVerticalScaling bool              // 是否启用原地 Pod 垂直扩缩容
+	handle                          framework.Handle // 用于处理框架操作的句柄
+	resourceAllocationScorer                             // 分配资源打分器
+}
+
+// Name 返回插件的名称，用于日志等
+func (f *Fit) Name() string {
+	return Name
+}
+
+// NewFit 初始化一个新的插件并返回它
+func NewFit(plArgs runtime.Object, h framework.Handle, fts feature.Features) (framework.Plugin, error) {
+	args, ok := plArgs.(*config.NodeResourcesFitArgs)
+	if !ok {
+		return nil, fmt.Errorf("want args to be of type NodeResourcesFitArgs, got %T", plArgs)
+	}
+	if err := validation.ValidateNodeResourcesFitArgs(nil, args); err != nil {
+		return nil, err
+	}
+
+	if args.ScoringStrategy == nil {
+		return nil, fmt.Errorf("scoring strategy not specified")
+	}
+
+	strategy := args.ScoringStrategy.Type
+	scorePlugin, exists := nodeResourceStrategyTypeMap[strategy]
+	if !exists {
+		return nil, fmt.Errorf("scoring strategy %s is not supported", strategy)
+	}
+
+	return &Fit{
+		ignoredResources:                sets.New(args.IgnoredResources...),
+		ignoredResourceGroups:           sets.New(args.IgnoredResourceGroups...),
+		enableInPlacePodVerticalScaling: fts.EnableInPlacePodVerticalScaling,
+		handle:                          h,
+		resourceAllocationScorer:        *scorePlugin(args),
+	}, nil
+}
+```
+
+#### nodeResourceStrategyTypeMap
+
+```go
+// nodeResourceStrategyTypeMap 将策略映射到得分器实现
+var nodeResourceStrategyTypeMap = map[config.ScoringStrategyType]scorer{
+    // 最少分配
+	config.LeastAllocated: func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer {
+        // 获取得分策略资源
+		resources := args.ScoringStrategy.Resources
+        // 返回一个新的资源分配得分器，其名称为config.LeastAllocated，
+		// 使用leastResourceScorer函数计算分数，资源为resources
+		return &resourceAllocationScorer{
+			Name:      string(config.LeastAllocated),
+			scorer:    leastResourceScorer(resources),
+			resources: resources,
+		}
+	},
+    // 最多分配
+	config.MostAllocated: func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer {
+        // 获取得分策略资源
+		resources := args.ScoringStrategy.Resources
+        // 返回一个新的资源分配得分器，其名称为config.MostAllocated，
+		// 使用mostResourceScorer函数计算分数，资源为resources
+		return &resourceAllocationScorer{
+			Name:      string(config.MostAllocated),
+			scorer:    mostResourceScorer(resources),
+			resources: resources,
+		}
+	},
+    // 请求容量比率
+	config.RequestedToCapacityRatio: func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer {
+        // 获取得分策略资源
+		resources := args.ScoringStrategy.Resources
+        // 返回一个新的资源分配得分器，其名称为config.RequestedToCapacityRatio，
+        // 使用requestedToCapacityRatioScorer函数计算分数，资源为resources，
+        // 请求容量比率的形状为args.ScoringStrategy.RequestedToCapacityRatio.Shape。
+		return &resourceAllocationScorer{
+			Name:      string(config.RequestedToCapacityRatio),
+			scorer:    requestedToCapacityRatioScorer(resources, args.ScoringStrategy.RequestedToCapacityRatio.Shape),
+			resources: resources,
+		}
+	},
+}
+
+```
+
+#### leastResourceScorer
+
+```go
+// leastResourceScorer 是一个函数，它喜欢请求资源更少的节点。
+// 它计算了在节点上调度的 Pod 请求的内存、CPU 和其他资源所占比例，并根据请求到容量比例的平均值的最小值进行优先级排序。
+//
+// 详细信息：
+// (cpu((capacity-requested)MaxNodeScorecpuWeight/capacity) + memory((capacity-requested)MaxNodeScorememoryWeight/capacity) + ...)/weightSum
+func leastResourceScorer(resources []config.ResourceSpec) func([]int64, []int64) int64 {
+    return func(requested, allocable []int64) int64 {
+        var nodeScore, weightSum int64
+        for i := range requested {
+            if allocable[i] == 0 {
+                continue
+            }
+            // 权重
+            weight := resources[i].Weight
+            // 计算所请求资源占总可用资源的比例，然后计算它们的最小值
+            resourceScore := leastRequestedScore(requested[i], allocable[i])
+            // 加权求和
+            nodeScore += resourceScore * weight
+            weightSum += weight
+        }
+        if weightSum == 0 {
+        	return 0
+        }
+        // 返回平均加权分数
+        return nodeScore / weightSum
+    }
+}
+```
+
+##### leastRequestedScore
+
+```go
+// leastRequestedScore 函数计算出未使用资源的分数，范围为 0-MaxNodeScore。
+// 0 分最低，MaxNodeScore 分最高。
+// 未使用的资源越多，得分越高。
+func leastRequestedScore(requested, capacity int64) int64 {
+    if capacity == 0 {
+    	return 0
+    }
+    // 如果请求的资源量大于容量，则得分为 0
+    if requested > capacity {
+    	return 0
+    }
+    // 根据剩余容量与总容量的比例计算未使用容量得分
+    return ((capacity - requested) * framework.MaxNodeScore) / capacity
+}
+```
+
+### PreFilter&PreFilterExtensions
+
+```GO
+// PreFilter 在 prefilter 扩展点调用。
+func (f *Fit) PreFilter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+    // 将计算出的 pod 的资源请求存入 CycleState 中以备后续使用。
+    cycleState.Write(preFilterStateKey, computePodResourceRequest(pod))
+    return nil, nil
+}
+
+// PreFilterExtensions 返回预筛选扩展，包括添加和删除 pod。
+func (f *Fit) PreFilterExtensions() framework.PreFilterExtensions {
+	return nil
+}
+```
+
+#### computePodResourceRequest
+
+```go
+// computePodResourceRequest 返回覆盖每个资源维度最大宽度的 framework.Resource。
+// 因为 Init 容器是按顺序运行的，我们在每个维度上迭代地收集最大值。
+// 相反，对于正常容器，我们对资源向量进行求和，因为它们同时运行。
+//
+// # Overhead 定义的资源应添加到计算的请求总和中
+//
+// 示例：
+//
+// Pod:
+//
+// InitContainers
+// IC1:
+// CPU: 2
+// Memory: 1G
+// IC2:
+// CPU: 2
+// Memory: 3G
+// Containers
+// C1:
+// CPU: 2
+// Memory: 1G
+// C2:
+// CPU: 1
+// Memory: 1G
+//
+// Result: CPU: 3, Memory: 3G
+func computePodResourceRequest(pod *v1.Pod) *preFilterState {
+	// pod 尚未调度，因此我们不需要担心 InPlacePodVerticalScalingEnabled。
+    reqs := resource.PodRequests(pod, resource.PodResourcesOptions{})
+    result := &preFilterState{}
+    result.SetMaxResource(reqs)
+    return result
+}
+```
+
+#### preFilterState
+
+```go
+// preFilterState computed at PreFilter and used at Filter.
+type preFilterState struct {
+	framework.Resource
+}
+
+// Clone the prefilter state.
+func (s *preFilterState) Clone() framework.StateData {
+	return s
+}
+```
+
+### Filter
+
+```go
+// 在 filter 扩展点处调用过滤器。
+// 检查节点是否拥有足够的资源，如 cpu、内存、gpu、不透明的整数资源等，以运行 pod。
+// 如果为空，则返回不足资源的列表，否则节点具有 pod 请求的所有资源。
+func (f *Fit) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+    // 获取先前的过滤器状态
+    s, err := getPreFilterState(cycleState)
+    if err != nil {
+    	return framework.AsStatus(err)
+    }
+	// 检查资源是否足够
+    insufficientResources := fitsRequest(s, nodeInfo, f.ignoredResources, f.ignoredResourceGroups)
+
+    // 如果有不足资源，返回失败原因列表
+    if len(insufficientResources) != 0 {
+        failureReasons := make([]string, 0, len(insufficientResources))
+        for i := range insufficientResources {
+            failureReasons = append(failureReasons, insufficientResources[i].Reason)
+        }
+        return framework.NewStatus(framework.Unschedulable, failureReasons...)
+    }
+    return nil
+}
+```
+
+#### getPreFilterState
+
+```go
+// 根据周期状态获取先前的过滤器状态
+func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error) {
+    // 从周期状态中读取 preFilterState
+    c, err := cycleState.Read(preFilterStateKey)
+    if err != nil {
+        // preFilterState 不存在，可能 PreFilter 没有被调用。
+        return nil, fmt.Errorf("error reading %q from cycleState: %w", preFilterStateKey, err)
+    }
+    // 将 preFilterState 类型断言为 *preFilterState
+    s, ok := c.(*preFilterState)
+    if !ok {
+        // 如果类型断言失败，返回错误
+        return nil, fmt.Errorf("%+v  convert to NodeResourcesFit.preFilterState error", c)
+    }
+    return s, nil
+}
+```
+
+#### fitsRequest
+
+```go
+func fitsRequest(podRequest *preFilterState, nodeInfo *framework.NodeInfo, ignoredExtendedResources, ignoredResourceGroups sets.Set[string]) []InsufficientResource {
+	insufficientResources := make([]InsufficientResource, 0, 4)
+
+	allowedPodNumber := nodeInfo.Allocatable.AllowedPodNumber
+	// 检查节点是否超出允许的Pod数量
+	if len(nodeInfo.Pods)+1 > allowedPodNumber {
+		insufficientResources = append(insufficientResources, InsufficientResource{
+			ResourceName: v1.ResourcePods,
+			Reason:       "Too many pods",
+			Requested:    1,
+			Used:         int64(len(nodeInfo.Pods)),
+			Capacity:     int64(allowedPodNumber),
+		})
+	}
+
+	// 如果Pod请求的CPU、Memory、EphemeralStorage以及标量资源都为0，则返回不足资源列表
+	if podRequest.MilliCPU == 0 &&
+		podRequest.Memory == 0 &&
+		podRequest.EphemeralStorage == 0 &&
+		len(podRequest.ScalarResources) == 0 {
+		return insufficientResources
+	}
+
+	// 检查Pod请求的CPU是否大于节点可分配的CPU
+	if podRequest.MilliCPU > 0 && podRequest.MilliCPU > (nodeInfo.Allocatable.MilliCPU-nodeInfo.Requested.MilliCPU) {
+		insufficientResources = append(insufficientResources, InsufficientResource{
+			ResourceName: v1.ResourceCPU,
+			Reason:       "Insufficient cpu",
+			Requested:    podRequest.MilliCPU,
+			Used:         nodeInfo.Requested.MilliCPU,
+			Capacity:     nodeInfo.Allocatable.MilliCPU,
+		})
+	}
+
+	// 检查Pod请求的内存是否大于节点可分配的内存
+	if podRequest.Memory > 0 && podRequest.Memory > (nodeInfo.Allocatable.Memory-nodeInfo.Requested.Memory) {
+		insufficientResources = append(insufficientResources, InsufficientResource{
+			ResourceName: v1.ResourceMemory,
+			Reason:       "Insufficient memory",
+			Requested:    podRequest.Memory,
+			Used:         nodeInfo.Requested.Memory,
+			Capacity:     nodeInfo.Allocatable.Memory,
+		})
+	}
+
+	// 检查Pod请求的临时存储是否大于节点可分配的临时存储
+	if podRequest.EphemeralStorage > 0 &&
+		podRequest.EphemeralStorage > (nodeInfo.Allocatable.EphemeralStorage-nodeInfo.Requested.EphemeralStorage) {
+		insufficientResources = append(insufficientResources, InsufficientResource{
+			ResourceName: v1.ResourceEphemeralStorage,
+			Reason:       "Insufficient ephemeral-storage",
+			Requested:    podRequest.EphemeralStorage,
+			Used:         nodeInfo.Requested.EphemeralStorage,
+			Capacity:     nodeInfo.Allocatable.EphemeralStorage,
+		})
+	}
+
+	// 检查Pod请求的标量资源是否大于节点可分配的标量资源
+	for rName, rQuant := range podRequest.ScalarResources {
+		// 如果请求数量为0，则跳过
+		if rQuant == 0 {
+			continue
+		}
+
+		if v1helper.IsExtendedResourceName(rName) {
+            // 判断该资源名是否为扩展资源
+			// 如果该资源是需要被忽略的扩展资源，则跳过检查
+			var rNamePrefix string
+			if ignoredResourceGroups.Len() > 0 {
+				rNamePrefix = strings.Split(string(rName), "/")[0]
+			}
+			if ignoredExtendedResources.Has(string(rName)) || ignoredResourceGroups.Has(rNamePrefix) {
+				continue
+			}
+		}
+
+		if rQuant > (nodeInfo.Allocatable.ScalarResources[rName] - nodeInfo.Requested.ScalarResources[rName]) {
+            // 如果该资源的请求量大于该节点剩余可分配量，则将该资源添加到 insufficientResources 中，同时记录该资源的名称、请求量、已使用量和总容量。
+			insufficientResources = append(insufficientResources, InsufficientResource{
+				ResourceName: rName,
+				Reason:       fmt.Sprintf("Insufficient %v", rName),
+				Requested:    podRequest.ScalarResources[rName],
+				Used:         nodeInfo.Requested.ScalarResources[rName],
+				Capacity:     nodeInfo.Allocatable.ScalarResources[rName],
+			})
+		}
+	}
+	// 返回不足资源列表 insufficientResources
+	return insufficientResources
+}
+```
+
+#### InsufficientResource
+
+```go
+// InsufficientResource结构体用于描述Pod无法适配到节点的资源限制类型。
+type InsufficientResource struct {
+    ResourceName v1.ResourceName //资源名
+    Reason string //原因
+    Requested int64 //请求的资源量
+    Used int64 //已经使用的资源量
+    Capacity int64 //总容量
+}
+```
+
+### EventsToRegister
+
+```go
+// EventsToRegister 返回此插件可以使Pod失败的可能事件列表。
+func (f *Fit) EventsToRegister() []framework.ClusterEvent {
+    // 定义podActionType为删除类型
+    podActionType := framework.Delete
+    // 如果开启了InPlacePodVerticalScaling(KEP 1287)，则需要注册PodUpdate事件，
+    // 因为Pod更新可能会释放资源，从而使其他Pod可调度。
+    if f.enableInPlacePodVerticalScaling {
+        podActionType |= framework.Update
+    }
+    // 返回包含两个ClusterEvent的列表
+    return []framework.ClusterEvent{
+        {Resource: framework.Pod, ActionType: podActionType},
+        {Resource: framework.Node, ActionType: framework.Add | framework.Update},
+    }
+}
+```
+
+### PreScore
+
+```go
+// PreScore函数用于计算Pod资源请求并将其写入循环状态中。
+func (f *Fit) PreScore(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+    state := &preScoreState{
+    	podRequests: f.calculatePodResourceRequestList(pod, f.resources),
+    }
+    cycleState.Write(preScoreStateKey, state)
+    return nil
+}
+```
+
+#### preScoreState
+
+```go
+// preScoreState结构体在PreScore中计算，在Score中使用。
+type preScoreState struct {
+	podRequests []int64 //资源请求列表，与NodeResourcesBalancedAllocationArgs.Resources定义的资源列表的顺序相同。
+}
+
+// Clone函数实现了必要的Clone接口。我们不需要实际复制数据，因为没有必要。
+func (s *preScoreState) Clone() framework.StateData {
+	return s
+}
+```
+
+#### calculatePodResourceRequestList
+
+```go
+// calculatePodResourceRequestList函数计算Pod的资源请求，并将其存储在一个整数数组中返回。
+func (r *resourceAllocationScorer) calculatePodResourceRequestList(pod *v1.Pod, resources []config.ResourceSpec) []int64 {
+    podRequests := make([]int64, len(resources))
+    for i := range resources {
+    	podRequests[i] = r.calculatePodResourceRequest(pod, v1.ResourceName(resources[i].Name))
+    }
+    return podRequests
+}
+```
+
+### Score
+
+```go
+// Score 在评分扩展点调用。
+func (f *Fit) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+    // 获取节点信息
+    nodeInfo, err := f.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+    if err != nil {
+    	return 0, framework.AsStatus(fmt.Errorf("getting node %q from Snapshot: %w", nodeName, err))
+    }
+    // 获取PreScore阶段的状态信息
+    s, err := getPreScoreState(state)
+    if err != nil {
+        // 如果没有获取到PreScore阶段的状态信息，则重新计算Pod资源请求，并创建一个新的preScoreState
+        s = &preScoreState{
+            podRequests: f.calculatePodResourceRequestList(pod, f.resources),
+        }
+    }
+
+    // 调用score函数计算分数
+    return f.score(ctx, pod, nodeInfo, s.podRequests)
+}
+```
+
+#### getPreScoreState
+
+```go
+// getPreScoreState 用于获取PreScore阶段的状态信息
+func getPreScoreState(cycleState *framework.CycleState) (*preScoreState, error) {
+    c, err := cycleState.Read(preScoreStateKey) // 从CycleState中读取preScoreStateKey对应的状态信息
+    if err != nil {
+    	return nil, fmt.Errorf("reading %q from cycleState: %w", preScoreStateKey, err)
+    }
+    s, ok := c.(*preScoreState)
+    if !ok {
+        return nil, fmt.Errorf("invalid PreScore state, got type %T", c) // 如果获取到的状态信息不是*preScoreState类型，则返回错误
+    }
+    return s, nil
+}
+```
+
+## NodeUnschedulable
+
+### 作用
+
+Kubernetes调度器中的NodeUnschedulable插件是一个预定义的插件，用于控制节点的调度。
+
+当一个节点被标记为不可调度时，调度器将不会在该节点上创建新的Pod。这通常用于在节点上执行维护操作或其他不允许调度新Pod的情况下。
+
+### 结构
+
+```GO
+// NodeUnschedulable 插件筛选设置 node.Spec.Unschedulable=true 的节点，
+// 除非 pod 容忍 {key=node.kubernetes.io/unschedulable, effect:NoSchedule} 污点。
+type NodeUnschedulable struct {
+}
+
+// NodeUnschedulable 实现了 framework.FilterPlugin 接口
+// 和 framework.EnqueueExtensions 接口
+var _ framework.FilterPlugin = &NodeUnschedulable{}
+var _ framework.EnqueueExtensions = &NodeUnschedulable{}
+
+// Name 是插件在插件注册表和配置中使用的名称。
+const Name = names.NodeUnschedulable
+
+const (
+    // ErrReasonUnknownCondition 用于 NodeUnknownCondition 谓词错误。
+    ErrReasonUnknownCondition = "node(s) had unknown conditions"
+    // ErrReasonUnschedulable 用于 NodeUnschedulable 谓词错误。
+    ErrReasonUnschedulable = "node(s) were unschedulable"
+)
+
+// Name 返回插件的名称。
+func (pl *NodeUnschedulable) Name() string {
+	return Name
+}
+
+// New 初始化一个新的插件并返回它。
+func New(_ runtime.Object, _ framework.Handle) (framework.Plugin, error) {
+	return &NodeUnschedulable{}, nil
+}
+```
+
+### Filter
+
+```GO
+// 在过滤器扩展点处调用的过滤器。
+func (pl *NodeUnschedulable) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+    // 获取节点信息
+    node := nodeInfo.Node()
+    // 如果节点信息为空，则返回无法调度和无法解析的状态和错误原因。
+    if node == nil {
+    	return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonUnknownCondition)
+    }
+    // 如果 Pod 能容忍无法调度的污点，则也容忍 node.Spec.Unschedulable。
+    // 通过调用 v1helper.TolerationsTolerateTaint() 函数判断 Pod 是否容忍 Taint。
+    podToleratesUnschedulable := v1helper.TolerationsTolerateTaint(pod.Spec.Tolerations, &v1.Taint{
+        Key: v1.TaintNodeUnschedulable,
+        Effect: v1.TaintEffectNoSchedule,
+    })
+    // 如果节点处于无法调度状态且 Pod 无法容忍该状态，则返回无法调度和无法解析的状态和错误原因。
+    if node.Spec.Unschedulable && !podToleratesUnschedulable {
+    	return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonUnschedulable)
+    }
+    // 如果上述情况均不满足，则返回空。
+    return nil
+}
+```
+
+### EventsToRegister
+
+```GO
+// EventsToRegister 返回可能使 Pod 被此插件标记为无法调度的可能事件。
+func (pl *NodeUnschedulable) EventsToRegister() []framework.ClusterEvent {
+    return []framework.ClusterEvent{
+    	{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeTaint},
+    }
+}
+```
+
