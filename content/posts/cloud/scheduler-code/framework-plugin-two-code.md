@@ -1280,3 +1280,1129 @@ func (pl *NodeAffinity) EventsToRegister() []framework.ClusterEvent {
 }
 ```
 
+## NodeVolumeLimits
+
+### 作用
+
+限制节点上可用的本地磁盘（Local Volume）的使用量。在Kubernetes中，使用Local Volume来申请节点本地存储，它是一种无需网络存储即可访问的本地存储卷。但是，本地磁盘在不同的节点上有不同的容量和性能，如果不对它们进行限制，可能会导致节点资源不足，从而影响Pod的可用性和性能。
+
+### 结构
+
+```GO
+// CSILimits 是一个插件，用于检查节点的卷容量限制。
+type CSILimits struct {
+    // 用于从 Kubernetes API Server 获取 CSINode 列表。
+    csiNodeLister storagelisters.CSINodeLister
+    // 用于从 Kubernetes API Server 获取 PersistentVolume 列表。
+    pvLister corelisters.PersistentVolumeLister
+    // 用于从 Kubernetes API Server 获取 PersistentVolumeClaim 列表。
+    pvcLister corelisters.PersistentVolumeClaimLister
+    // 用于从 Kubernetes API Server 获取 StorageClass 列表。
+    scLister storagelisters.StorageClassLister
+    // 随机生成的 VolumeID 前缀。
+    randomVolumeIDPrefix string
+    // InTreeToCSITranslator 实现了 Kubernetes 的 InTree To CSI volume migration。
+    translator InTreeToCSITranslator
+}
+
+// 将 CSILimits 声明为 framework.PreFilterPlugin、framework.FilterPlugin 和 framework.EnqueueExtensions 接口的实现。
+var _ framework.PreFilterPlugin = &CSILimits{}
+var _ framework.FilterPlugin = &CSILimits{}
+var _ framework.EnqueueExtensions = &CSILimits{}
+
+// CSIName 是插件在插件注册表和配置中使用的名称。
+const CSIName = names.NodeVolumeLimits
+
+// Name 返回插件的名称，用于日志等。
+func (pl *CSILimits) Name() string {
+	return CSIName
+}
+
+// NewCSI 初始化一个新的插件并返回它。
+func NewCSI(_ runtime.Object, handle framework.Handle, fts feature.Features) (framework.Plugin, error) {
+    // 从 framework.Handle 中获取 SharedInformerFactory。
+    informerFactory := handle.SharedInformerFactory()
+    // 从 informerFactory 中获取 PersistentVolumeLister。
+    pvLister := informerFactory.Core().V1().PersistentVolumes().Lister()
+    // 从 informerFactory 中获取 PersistentVolumeClaimLister。
+    pvcLister := informerFactory.Core().V1().PersistentVolumeClaims().Lister()
+    // 从 informerFactory 中获取 CSINodeLister。
+    csiNodesLister := informerFactory.Storage().V1().CSINodes().Lister()
+    // 从 informerFactory 中获取 StorageClassLister。
+    scLister := informerFactory.Storage().V1().StorageClasses().Lister()
+    // 初始化 CSITranslator。
+    csiTranslator := csitrans.New()
+	
+    // 返回一个新的 CSILimits 插件实例。
+    return &CSILimits{
+        csiNodeLister:        csiNodesLister,
+        pvLister:             pvLister,
+        pvcLister:            pvcLister,
+        scLister:             scLister,
+        randomVolumeIDPrefix: rand.String(32),
+        translator:           csiTranslator,
+    }, nil
+}
+
+// InTreeToCSITranslator 包含了检查迁移状态和从 InTree PV 转换为 CSI 所需的方法。
+type InTreeToCSITranslator interface {
+    // 检查指定的 PersistentVolume 是否可迁移。
+    IsPVMigratable(pv *v1.PersistentVolume) bool
+    // 检查指定的 Volume 是否可迁移。
+    IsInlineMigratable(vol *v1.Volume) bool
+    // 检查指定的 InTree 插件名称是否可迁移。
+    IsMigratableIntreePluginByName(inTreePluginName string) bool
+    // 从指定的 PersistentVolume 和 Volume 中获取 InTree 插件名称。
+    GetInTreePluginNameFromSpec(pv *v1.PersistentVolume, vol *v1.Volume) (string, error)
+    // 根据指定的 InTree 插件名称获取 CSI 插件名称。
+    GetCSINameFromInTreeName(pluginName string) (string, error)
+    // 将指定的 InTree PV 转换为 CSI PV。
+    TranslateInTreePVToCSI(pv *v1.PersistentVolume) (*v1.PersistentVolume, error)
+    // 将指定的 InTree Inline Volume 转换为 CSI PV。
+    TranslateInTreeInlineVolumeToCSI(volume *v1.Volume, podNamespace string) (*v1.PersistentVolume, error)
+}
+```
+
+### PreFilter&PreFilterExtensions
+
+```go
+// PreFilter 在 PreFilter 扩展点调用。
+//
+// 如果 Pod 没有这些类型的 Volume，我们将跳过 Filter 阶段。
+func (pl *CSILimits) PreFilter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+    volumes := pod.Spec.Volumes
+    for i := range volumes {
+        vol := &volumes[i]
+        // 如果 Volume 是 PersistentVolumeClaim、Ephemeral 或者可迁移的 Inline Volume，跳过 Filter 阶段。
+        if vol.PersistentVolumeClaim != nil || vol.Ephemeral != nil || pl.translator.IsInlineMigratable(vol) {
+            return nil, nil
+        }
+	}
+    // 如果 Pod 没有这些类型的 Volume，返回 Skip 状态，跳过 Filter 阶段。
+    return nil, framework.NewStatus(framework.Skip)
+}
+
+// PreFilterExtensions 返回 PreFilter 扩展，包括 Pod 的添加和移除。
+func (pl *CSILimits) PreFilterExtensions() framework.PreFilterExtensions {
+	return nil
+}
+```
+
+### Filter
+
+```go
+// 该函数在过滤器扩展点处被调用
+func (pl *CSILimits) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+    // 如果新的 pod 没有任何附加的卷，那么谓词永远为真
+    if len(pod.Spec.Volumes) == 0 {
+    	return nil
+    }
+    // 获取 node 对象
+    node := nodeInfo.Node()
+    if node == nil {
+        return framework.NewStatus(framework.Error, "node not found") // 如果找不到 node 对象，则返回错误
+    }
+
+    // 如果 CSINode 不存在，则谓词可能从 Node 对象中读取限制
+    csiNode, err := pl.csiNodeLister.Get(node.Name) // 获取 CSINode 对象
+    if err != nil {
+        // TODO: 等 CSINode 默认创建后返回错误（两个版本）
+        klog.V(5).InfoS("Could not get a CSINode object for the node", "node", klog.KObj(node), "err", err) // 如果获取不到 CSINode 对象，则记录错误日志
+    }
+
+    // 用于存储新卷的名称和限制信息
+    newVolumes := make(map[string]string)
+    if err := pl.filterAttachableVolumes(pod, csiNode, true /* new pod */, newVolumes); err != nil { // 过滤掉不可附加的卷
+        return framework.AsStatus(err) // 如果有错误，则返回错误状态
+    }
+
+    // 如果 pod 没有新的 CSI 卷，则谓词永远为真
+    if len(newVolumes) == 0 {
+        return nil
+    }
+
+    // 如果节点没有卷限制，则谓词永远为真
+    nodeVolumeLimits := getVolumeLimits(nodeInfo, csiNode)
+    if len(nodeVolumeLimits) == 0 {
+        return nil
+    }
+
+    // 存储附加卷的名称和限制信息
+    attachedVolumes := make(map[string]string)
+    for _, existingPod := range nodeInfo.Pods {
+        if err := pl.filterAttachableVolumes(existingPod.Pod, csiNode, false /* existing pod */, attachedVolumes); err != nil { // 过滤掉不可附加的卷
+            return framework.AsStatus(err) // 如果有错误，则返回错误状态
+        }
+    }
+
+    // 统计每个卷的数量
+    attachedVolumeCount := map[string]int{}
+    for volumeUniqueName, volumeLimitKey := range attachedVolumes {
+        // 不要多次计算在多个 pod 中使用的单个卷
+        delete(newVolumes, volumeUniqueName)
+        attachedVolumeCount[volumeLimitKey]++
+    }
+
+    newVolumeCount := map[string]int{}
+    for _, volumeLimitKey := range newVolumes {
+        newVolumeCount[volumeLimitKey]++
+    }
+
+    // 比较卷数量与节点限制，并返回相应状态
+    for volumeLimitKey, count := range newVolumeCount {
+		maxVolumeLimit, ok := nodeVolumeLimits[v1.ResourceName(volumeLimitKey)]
+        // 如果能够获取到，则说明该限制类型的 CSI volume 的数量是有上限的，需要进行检查
+		if ok {
+			currentVolumeCount := attachedVolumeCount[volumeLimitKey]
+			klog.V(5).InfoS("Found plugin volume limits", "node", node.Name, "volumeLimitKey", volumeLimitKey,
+				"maxLimits", maxVolumeLimit, "currentVolumeCount", currentVolumeCount, "newVolumeCount", count,
+				"pod", klog.KObj(pod))
+            // 大于上限不可标度
+			if currentVolumeCount+count > int(maxVolumeLimit) {
+				return framework.NewStatus(framework.Unschedulable, ErrReasonMaxVolumeCountExceeded)
+			}
+		}
+	}
+
+	return nil
+}
+```
+
+#### filterAttachableVolumes
+
+```GO
+// filterAttachableVolumes 方法过滤 Pod 中的所有 volume，只选择可以附加到 CSI 节点的 volume，并将结果存储在一个 map 中
+func (pl *CSILimits) filterAttachableVolumes(
+	pod *v1.Pod, csiNode *storagev1.CSINode, newPod bool, result map[string]string) error {
+	// 对于 Pod 中的每个 volume
+	for _, vol := range pod.Spec.Volumes {
+		pvcName := ""      // 用于存储 PersistentVolumeClaim 的名称
+		isEphemeral := false  // 用于标记这个 volume 是否是临时的
+
+		// 根据 volume 的类型进行不同的处理
+		switch {
+		case vol.PersistentVolumeClaim != nil:  // PersistentVolumeClaim 类型的 volume
+			// 一般的 CSI volume 必须通过 PersistentVolumeClaim 来使用
+			pvcName = vol.PersistentVolumeClaim.ClaimName
+		case vol.Ephemeral != nil:  // Ephemeral 类型的 volume
+			// 临时的 inline volume 也使用一个 PVC，只是名称是由程序计算得到的，并且具有某些所有权。
+			// 在检索到 pvc 对象之后，会在下面检查。
+			pvcName = ephemeral.VolumeClaimName(pod, &vol)
+			isEphemeral = true
+		default:  // Inline Volume 类型的 volume
+			// Inline Volume 没有 PVC。需要检查是否为此 inline volume 启用了 CSI 迁移。
+			// - 如果 volume 是可迁移的，并且启用了 CSI 迁移，则需要将其计入。
+			// - 如果 volume 不可迁移，则将其计入 non_csi 过滤器中。
+			if err := pl.checkAttachableInlineVolume(&vol, csiNode, pod, result); err != nil {
+				return err
+			}
+			continue  // 继续下一个 volume 的处理
+		}
+
+		// 检查 PVC 名称是否为空
+		if pvcName == "" {
+			return fmt.Errorf("PersistentVolumeClaim had no name")
+		}
+
+		// 从 PersistentVolumeClaim 中检索对象
+		pvc, err := pl.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(pvcName)
+		if err != nil {
+			if newPod {
+				// 由于新的 Pod 在没有 PVC 的情况下无法运行，因此必须获取 PVC，以便继续进行调度。
+				// 如果无法获取 PVC，则立即返回错误。
+				return fmt.Errorf("looking up PVC %s/%s: %v", pod.Namespace, pvcName, err)
+			}
+			// 如果 PVC 无效，则不统计 volume，因为不能保证它属于运行的 predicate。
+			klog.V(5).InfoS("Unable to look up PVC info", "pod", klog.KObj(pod), "PVC", klog.KRef(pod.Namespace, pvcName))
+			continue
+		}
+
+		// 对于 ephemeral volume，其 PVC 必须由 Pod 拥有。
+		if isEphemeral {
+			if err := ephemeral.VolumeIsForPod(pod, pvc); err != nil {
+				return err
+			}
+		}
+		
+        // 获取与该 PVC 相关联的 CSI 驱动程序和卷处理程序的名称
+		driverName, volumeHandle := pl.getCSIDriverInfo(csiNode, pvc)
+		if driverName == "" || volumeHandle == "" {
+			klog.V(5).InfoS("Could not find a CSI driver name or volume handle, not counting volume")
+			continue
+		}
+
+		volumeUniqueName := fmt.Sprintf("%s/%s", driverName, volumeHandle)
+        // 获取 CSI 驱动程序的附加限制键，并将卷的唯一名称和附加限制键存储到 result
+		volumeLimitKey := volumeutil.GetCSIAttachLimitKey(driverName)
+		result[volumeUniqueName] = volumeLimitKey
+	}
+	return nil
+}
+```
+
+##### checkAttachableInlineVolume
+
+```GO
+// checkAttachableInlineVolume函数会检查一个内联卷是否可以被附加到Pod中，并将卷的唯一名称和附加限制添加到结果map中，只有当该卷可以迁移且此插件的CSI迁移已启用时才会添加。
+func (pl *CSILimits) checkAttachableInlineVolume(vol *v1.Volume, csiNode *storagev1.CSINode, pod *v1.Pod, result map[string]string) error {
+    // 如果该卷不支持迁移，则直接返回。
+    if !pl.translator.IsInlineMigratable(vol) {
+        return nil
+    }
+
+    // 检查intree provisioner的CSI迁移是否已启用。
+    inTreeProvisionerName, err := pl.translator.GetInTreePluginNameFromSpec(nil, vol)
+    if err != nil {
+        return fmt.Errorf("looking up provisioner name for volume %s: %w", vol.Name, err)
+    }
+
+    // 如果CSI迁移未启用，则记录一条日志并返回。
+    if !isCSIMigrationOn(csiNode, inTreeProvisionerName) {
+        csiNodeName := ""
+        if csiNode != nil {
+            csiNodeName = csiNode.Name
+        }
+        klog.V(5).InfoS("CSI Migration is not enabled for provisioner", "provisioner", inTreeProvisionerName,
+            "pod", klog.KObj(pod), "csiNode", csiNodeName)
+        return nil
+    }
+
+    // 将in-tree卷进行翻译。
+    translatedPV, err := pl.translator.TranslateInTreeInlineVolumeToCSI(vol, pod.Namespace)
+    if err != nil || translatedPV == nil {
+        return fmt.Errorf("converting volume(%s) from inline to csi: %w", vol.Name, err)
+    }
+
+    // 获取CSI驱动程序名称。
+    driverName, err := pl.translator.GetCSINameFromInTreeName(inTreeProvisionerName)
+    if err != nil {
+        return fmt.Errorf("looking up CSI driver name for provisioner %s: %w", inTreeProvisionerName, err)
+    }
+
+    // 如果TranslateInTreeInlineVolumeToCSI没有将内联卷翻译为CSI，则跳过计数。
+    if translatedPV.Spec.PersistentVolumeSource.CSI == nil {
+        return nil
+    }
+
+    // 获取该卷的唯一名称和附加限制，并将它们添加到结果map中。
+    volumeUniqueName := fmt.Sprintf("%s/%s", driverName, translatedPV.Spec.PersistentVolumeSource.CSI.VolumeHandle)
+    volumeLimitKey := volumeutil.GetCSIAttachLimitKey(driverName)
+    result[volumeUniqueName] = volumeLimitKey
+    return nil
+}
+```
+
+##### getCSIDriverInfo
+
+```GO
+// getCSIDriverInfo函数返回给定PVC的CSI驱动程序名称和卷ID。
+// 如果PVC来自已迁移的内部插件，则此函数将返回插件已迁移到的CSI驱动程序的信息。
+func (pl *CSILimits) getCSIDriverInfo(csiNode *storagev1.CSINode, pvc *v1.PersistentVolumeClaim) (string, string) {
+    // 获取PVC对应的PV名称
+    pvName := pvc.Spec.VolumeName
+    if pvName == "" {
+        // 如果PVC没有对应的PV名称，尝试从StorageClass获取CSI驱动程序信息
+        klog.V(5).InfoS("Persistent volume had no name for claim", "PVC", klog.KObj(pvc))
+        return pl.getCSIDriverInfoFromSC(csiNode, pvc)
+    }
+
+    // 获取PV信息
+    pv, err := pl.pvLister.Get(pvName)
+    if err != nil {
+        // 如果无法获取与PVC关联的PV，可能是PV已被删除或PVC预绑定到尚未创建的PVC。
+        // 回退到使用StorageClass进行卷计数
+        klog.V(5).InfoS("Unable to look up PV info for PVC and PV", "PVC", klog.KObj(pvc), "PV", klog.KRef("", pvName))
+        return pl.getCSIDriverInfoFromSC(csiNode, pvc)
+    }
+
+    // 获取CSI卷源信息
+    csiSource := pv.Spec.PersistentVolumeSource.CSI
+    if csiSource == nil {
+        // 对于非CSI卷和无法迁移的卷，我们进行快速处理
+        if !pl.translator.IsPVMigratable(pv) {
+            return "", ""
+        }
+
+        // 获取内部插件名称
+        pluginName, err := pl.translator.GetInTreePluginNameFromSpec(pv, nil)
+        if err != nil {
+            klog.V(5).InfoS("Unable to look up plugin name from PV spec", "err", err)
+            return "", ""
+        }
+
+        // 检查该插件是否支持CSI迁移
+        if !isCSIMigrationOn(csiNode, pluginName) {
+            klog.V(5).InfoS("CSI Migration of plugin is not enabled", "plugin", pluginName)
+            return "", ""
+        }
+
+        // 将内部卷翻译为CSI卷
+        csiPV, err := pl.translator.TranslateInTreePVToCSI(pv)
+        if err != nil {
+            klog.V(5).InfoS("Unable to translate in-tree volume to CSI", "err", err)
+            return "", ""
+        }
+
+        if csiPV.Spec.PersistentVolumeSource.CSI == nil {
+            klog.V(5).InfoS("Unable to get a valid volume source for translated PV", "PV", pvName)
+            return "", ""
+        }
+
+        csiSource = csiPV.Spec.PersistentVolumeSource.CSI
+    }
+
+    return csiSource.Driver, csiSource.VolumeHandle
+}
+```
+
+###### getCSIDriverInfoFromSC
+
+```GO
+// getCSIDriverInfoFromSC 返回给定 PVC 所属的 StorageClass 的 CSI 驱动程序名称和随机卷 ID。
+func (pl *CSILimits) getCSIDriverInfoFromSC(csiNode *storagev1.CSINode, pvc *v1.PersistentVolumeClaim) (string, string) {
+    // 获取 PVC 所属的 Namespace、PVC 名称和 StorageClass 名称。
+    namespace := pvc.Namespace
+    pvcName := pvc.Name
+    scName := storagehelpers.GetPersistentVolumeClaimClass(pvc)
+
+    // 如果 StorageClass 没有设置或者未找到，则 PVC 必须使用 immediate binding mode，并在调度前绑定。
+    // 因此不计算 PVC，是安全的。
+    if scName == "" {
+        klog.V(5).InfoS("PVC has no StorageClass", "PVC", klog.KObj(pvc))
+        return "", ""
+    }
+
+    // 根据 StorageClass 名称获取 StorageClass。
+    storageClass, err := pl.scLister.Get(scName)
+    if err != nil {
+        klog.V(5).InfoS("Could not get StorageClass for PVC", "PVC", klog.KObj(pvc), "err", err)
+        return "", ""
+    }
+
+    // 使用随机前缀来避免与卷 ID 冲突。
+    // 如果在谓词执行期间绑定了 PVC，且在同一节点上有另一个使用相同卷的 Pod，则我们将过多计数该卷，
+    // 并将两个卷视为不同的卷。
+    volumeHandle := fmt.Sprintf("%s-%s/%s", pl.randomVolumeIDPrefix, namespace, pvcName)
+
+    // 获取 Provisioner，如果 Provisioner 可迁移，则转换为 CSI 驱动程序。
+    provisioner := storageClass.Provisioner
+    if pl.translator.IsMigratableIntreePluginByName(provisioner) {
+        if !isCSIMigrationOn(csiNode, provisioner) {
+            klog.V(5).InfoS("CSI Migration of provisioner is not enabled", "provisioner", provisioner)
+            return "", ""
+        }
+
+        driverName, err := pl.translator.GetCSINameFromInTreeName(provisioner)
+        if err != nil {
+            klog.V(5).InfoS("Unable to look up driver name from provisioner name", "provisioner", provisioner, "err", err)
+            return "", ""
+        }
+        return driverName, volumeHandle
+    }
+
+    return provisioner, volumeHandle
+}
+```
+
+###### isCSIMigrationOn
+
+```GO
+// isCSIMigrationOn 返回一个布尔值，表示某个存储插件是否启用了 CSI 迁移功能。
+func isCSIMigrationOn(csiNode *storagev1.CSINode, pluginName string) bool {
+    if csiNode == nil || len(pluginName) == 0 {
+        return false
+    }
+
+    // 如果插件名称为空或 csiNode 为空，返回 false。
+    switch pluginName {
+    case csilibplugins.AWSEBSInTreePluginName:
+        return true
+        // 如果是 AWS EBS 存储插件，则返回 true。
+    case csilibplugins.PortworxVolumePluginName:
+        if !utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationPortworx) {
+            return false
+        }
+        // 如果是 Portworx 存储插件，需要检查 feature gate 是否启用。
+    case csilibplugins.GCEPDInTreePluginName:
+        if !utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationGCE) {
+            return false
+        }
+        // 如果是 GCE PD 存储插件，需要检查 feature gate 是否启用。
+    case csilibplugins.AzureDiskInTreePluginName:
+        return true
+        // 如果是 Azure Disk 存储插件，则返回 true。
+    case csilibplugins.CinderInTreePluginName:
+        return true
+        // 如果是 Cinder 存储插件，则返回 true。
+    case csilibplugins.RBDVolumePluginName:
+        if !utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationRBD) {
+            return false
+        }
+        // 如果是 RBD 存储插件，需要检查 feature gate 是否启用。
+    default:
+        return false
+        // 对于其他插件名称，返回 false。
+    }
+
+    // 下面的代码用于检查 CSINode 对象的注释是否包含了指定的存储插件名称。
+    csiNodeAnn := csiNode.GetAnnotations()
+    if csiNodeAnn == nil {
+        return false
+    }
+
+    var mpaSet sets.Set[string]
+    mpa := csiNodeAnn[v1.MigratedPluginsAnnotationKey]
+    if len(mpa) == 0 {
+        mpaSet = sets.New[string]()
+    } else {
+        tok := strings.Split(mpa, ",")
+        mpaSet = sets.New(tok...)
+    }
+
+    return mpaSet.Has(pluginName)
+}
+```
+
+### EventsToRegister
+
+```GO
+// EventsToRegister函数返回可能使该插件无法调度Pod的事件。
+func (pl *CSILimits) EventsToRegister() []framework.ClusterEvent {
+    // 返回一个包含两个ClusterEvent类型元素的切片
+    return []framework.ClusterEvent{
+        {Resource: framework.CSINode, ActionType: framework.Add},
+        {Resource: framework.Pod, ActionType: framework.Delete},
+    }
+}
+```
+
+## AzureDiskLimits
+
+### 作用
+
+限制Azure磁盘（Azure Disk）的使用量。在Kubernetes中，使用PersistentVolumeClaim（PVC）来申请持久存储。如果PVC绑定到Azure磁盘，则可以在Pod中使用它来存储数据。但是，Azure磁盘在不同的大小和性能层次上都有不同的限制。AzureDiskLimits插件可用于确保Pod使用的Azure磁盘满足要求。
+
+具体来说，AzureDiskLimits插件通过检查Pod中的容器配置和Azure磁盘的限制来判断是否可以将Pod调度到可用的节点上。如果Pod要求的磁盘容量或IOPS（每秒I/O操作数）超过了Azure磁盘的限制，插件将阻止该Pod被调度。
+
+### 结构
+
+```GO
+// AzureDiskName是在插件注册表和配置中使用的插件名称常量。
+const AzureDiskName = names.AzureDiskLimits
+
+// NewAzureDisk返回一个函数，该函数初始化一个新的插件并返回它。
+    func NewAzureDisk(_ runtime.Object, handle framework.Handle, fts feature.Features) (framework.Plugin, error) {
+    // 获取共享的InformerFactory
+    informerFactory := handle.SharedInformerFactory()
+    // 创建一个新的非CSI Limits插件，并使用给定的过滤器类型和InformerFactory
+    return newNonCSILimitsWithInformerFactory(azureDiskVolumeFilterType, informerFactory, fts), nil
+}
+
+// azureDiskVolumeFilterType定义了azureDiskVolumeFilter的过滤器名称。
+const azureDiskVolumeFilterType = "AzureDisk"
+```
+
+### newNonCSILimitsWithInformerFactory
+
+```go
+var _ framework.PreFilterPlugin = &nonCSILimits{}
+var _ framework.FilterPlugin = &nonCSILimits{}
+var _ framework.EnqueueExtensions = &nonCSILimits{}
+
+// newNonCSILimitsWithInformerFactory返回一个具有过滤器名称和informer factory的插件。
+func newNonCSILimitsWithInformerFactory(
+    filterName string,
+    informerFactory informers.SharedInformerFactory,
+    fts feature.Features,
+) framework.Plugin {
+    // 创建Lister对象，用于获取持久化存储卷、持久化存储卷声明、CSI节点和存储类的信息。
+    pvLister := informerFactory.Core().V1().PersistentVolumes().Lister()
+    pvcLister := informerFactory.Core().V1().PersistentVolumeClaims().Lister()
+    csiNodesLister := informerFactory.Storage().V1().CSINodes().Lister()
+    scLister := informerFactory.Storage().V1().StorageClasses().Lister()
+
+    // 创建一个新的非CSI Limits插件，并使用给定的Lister对象和特性对象。
+    return newNonCSILimits(filterName, csiNodesLister, scLister, pvLister, pvcLister, fts)
+}
+
+// newNonCSILimits 创建一个插件，用于评估 Pod 能否适合基于请求的过滤器匹配的卷的数量以及已经存在的卷。
+//
+// DEPRECATED
+// 此处定义的所有特定于云提供程序的谓词均已被弃用，以支持 CSI 卷限制谓词 - MaxCSIVolumeCountPred。
+//
+// 谓词查找直接使用的卷和由相关卷支持的 PVC 卷，计算唯一卷的数量，并在总数超过最大值时拒绝新的 Pod。
+func newNonCSILimits(
+	filterName string,
+	csiNodeLister storagelisters.CSINodeLister,
+	scLister storagelisters.StorageClassLister,
+	pvLister corelisters.PersistentVolumeLister,
+	pvcLister corelisters.PersistentVolumeClaimLister,
+	fts feature.Features,
+) framework.Plugin {
+	var filter VolumeFilter         // 声明变量 filter 的类型为 VolumeFilter
+	var volumeLimitKey v1.ResourceName   // 声明变量 volumeLimitKey 的类型为 v1.ResourceName
+	var name string                 // 声明变量 name 的类型为 string
+
+	// 根据不同的 filterName 类型来分别赋值
+	switch filterName {
+	case ebsVolumeFilterType:
+		name = EBSName
+		filter = ebsVolumeFilter
+		volumeLimitKey = v1.ResourceName(volumeutil.EBSVolumeLimitKey)
+	case gcePDVolumeFilterType:
+		name = GCEPDName
+		filter = gcePDVolumeFilter
+		volumeLimitKey = v1.ResourceName(volumeutil.GCEVolumeLimitKey)
+	case azureDiskVolumeFilterType:
+		name = AzureDiskName
+		filter = azureDiskVolumeFilter
+		volumeLimitKey = v1.ResourceName(volumeutil.AzureVolumeLimitKey)
+	case cinderVolumeFilterType:
+		name = CinderName
+		filter = cinderVolumeFilter
+		volumeLimitKey = v1.ResourceName(volumeutil.CinderVolumeLimitKey)
+	default:
+		klog.ErrorS(errors.New("wrong filterName"), "Cannot create nonCSILimits plugin")
+		return nil
+	}
+	pl := &nonCSILimits{
+		name:                 name,
+		filter:               filter,
+		volumeLimitKey:       volumeLimitKey,
+		maxVolumeFunc:        getMaxVolumeFunc(filterName),
+		csiNodeLister:        csiNodeLister,
+		pvLister:             pvLister,
+		pvcLister:            pvcLister,
+		scLister:             scLister,
+		randomVolumeIDPrefix: rand.String(32),
+	}
+
+	return pl
+}
+
+// Name 返回插件的名称。它在日志等中使用。
+func (pl *nonCSILimits) Name() string {
+	return pl.name
+}
+```
+
+#### VolumeFilter
+
+```go
+// VolumeFilter 包含了筛选 PD Volume caps 时需要用到的筛选信息。
+type VolumeFilter struct {
+    // FilterVolume 函数用于过滤正常的 volume。
+    FilterVolume func(vol *v1.Volume) (id string, relevant bool)
+    // FilterPersistentVolume 函数用于过滤持久化的 volume。
+    FilterPersistentVolume func(pv *v1.PersistentVolume) (id string, relevant bool)
+    // MatchProvisioner 函数用于判断 StorageClass provisioner 是否与当前条件匹配。
+    MatchProvisioner func(sc *storage.StorageClass) (relevant bool)
+    // IsMigrated 函数用于返回一个布尔值，指明该插件是否已迁移到 CSI 驱动器。
+    IsMigrated func(csiNode *storage.CSINode) bool
+}
+
+// 定义 VolumeFilter 结构体变量 ebsVolumeFilter
+var ebsVolumeFilter = VolumeFilter{
+    // 实现 FilterVolume 方法，用于过滤 v1.Volume 类型的数据
+    FilterVolume: func(vol *v1.Volume) (string, bool) {
+        if vol.AWSElasticBlockStore != nil {
+            return vol.AWSElasticBlockStore.VolumeID, true
+        }
+        return "", false
+    },
+    // 实现 FilterPersistentVolume 方法，用于过滤 v1.PersistentVolume 类型的数据
+    FilterPersistentVolume: func(pv *v1.PersistentVolume) (string, bool) {
+        if pv.Spec.AWSElasticBlockStore != nil {
+            return pv.Spec.AWSElasticBlockStore.VolumeID, true
+        }
+        return "", false
+    },
+    // 实现 MatchProvisioner 方法，用于匹配 storage.StorageClass 类型的数据中的 Provisioner 字段
+    MatchProvisioner: func(sc *storage.StorageClass) bool {
+        return sc.Provisioner == csilibplugins.AWSEBSInTreePluginName
+    },
+    // 实现 IsMigrated 方法，用于判断 csiNode 是否迁移完成
+    IsMigrated: func(csiNode *storage.CSINode) bool {
+        return isCSIMigrationOn(csiNode, csilibplugins.AWSEBSInTreePluginName)
+    },
+}
+
+// 定义 VolumeFilter 结构体变量 gcePDVolumeFilter
+var gcePDVolumeFilter = VolumeFilter{
+    // 实现 FilterVolume 方法，用于过滤 v1.Volume 类型的数据
+    FilterVolume: func(vol *v1.Volume) (string, bool) {
+        if vol.GCEPersistentDisk != nil {
+            return vol.GCEPersistentDisk.PDName, true
+        }
+        return "", false
+    },
+    // 实现 FilterPersistentVolume 方法，用于过滤 v1.PersistentVolume 类型的数据
+    FilterPersistentVolume: func(pv *v1.PersistentVolume) (string, bool) {
+        if pv.Spec.GCEPersistentDisk != nil {
+            return pv.Spec.GCEPersistentDisk.PDName, true
+        }
+        return "", false
+    },
+    // 实现 MatchProvisioner 方法，用于匹配 storage.StorageClass 类型的数据中的 Provisioner 字段
+    MatchProvisioner: func(sc *storage.StorageClass) bool {
+        return sc.Provisioner == csilibplugins.GCEPDInTreePluginName
+    },
+    // 实现 IsMigrated 方法，用于判断 csiNode 是否迁移完成
+    IsMigrated: func(csiNode *storage.CSINode) bool {
+    	return isCSIMigrationOn(csiNode, csilibplugins.GCEPDInTreePluginName)
+	},
+}
+
+// azureDiskVolumeFilter 是一个 VolumeFilter，用于过滤 Azure Disk Volumes。
+var azureDiskVolumeFilter = VolumeFilter{
+    FilterVolume: func(vol *v1.Volume) (string, bool) {
+        // 如果 Volume 对象中包含 AzureDisk 字段，则返回 AzureDisk.DiskName 和 true。
+        if vol.AzureDisk != nil {
+            return vol.AzureDisk.DiskName, true
+        }
+        // 如果 Volume 对象中不包含 AzureDisk 字段，则返回空字符串和 false。
+        return "", false
+    },
+    FilterPersistentVolume: func(pv *v1.PersistentVolume) (string, bool) {
+        // 如果 PersistentVolume 对象中包含 Spec.AzureDisk 字段，则返回 Spec.AzureDisk.DiskName 和 true。
+        if pv.Spec.AzureDisk != nil {
+            return pv.Spec.AzureDisk.DiskName, true
+        }
+        // 如果 PersistentVolume 对象中不包含 Spec.AzureDisk 字段，则返回空字符串和 false。
+        return "", false
+    },
+
+    MatchProvisioner: func(sc *storage.StorageClass) bool {
+        // 如果 StorageClass 对象中的 Provisioner 字段等于 csilibplugins.AzureDiskInTreePluginName，则返回 true。
+        return sc.Provisioner == csilibplugins.AzureDiskInTreePluginName
+    },
+
+    IsMigrated: func(csiNode *storage.CSINode) bool {
+        // 调用 isCSIMigrationOn 函数，并传入 csiNode 和 csilibplugins.AzureDiskInTreePluginName 作为参数，返回其结果。
+        return isCSIMigrationOn(csiNode, csilibplugins.AzureDiskInTreePluginName)
+    },
+}
+
+// cinderVolumeFilter 是一个 VolumeFilter，用于过滤 cinder Volumes。
+// 它将在从 in-tree 中移除 Openstack cloudprovider 后被弃用。
+var cinderVolumeFilter = VolumeFilter{
+    FilterVolume: func(vol *v1.Volume) (string, bool) {
+        // 如果 Volume 对象中包含 Cinder 字段，则返回 Cinder.VolumeID 和 true。
+        if vol.Cinder != nil {
+            return vol.Cinder.VolumeID, true
+        }
+        // 如果 Volume 对象中不包含 Cinder 字段，则返回空字符串和 false。
+        return "", false
+    },
+	FilterPersistentVolume: func(pv *v1.PersistentVolume) (string, bool) {
+        // 如果 PersistentVolume 对象中包含 Spec.Cinder 字段，则返回 Spec.Cinder.VolumeID 和 true。
+        if pv.Spec.Cinder != nil {
+            return pv.Spec.Cinder.VolumeID, true
+        }
+        // 如果 PersistentVolume 对象中不包含 Spec.Cinder 字段，则返回空字符串和 false。
+        return "", false
+    },
+
+    MatchProvisioner: func(sc *storage.StorageClass) bool {
+        // 如果 StorageClass 对象中的 Provisioner 字段等于 csilibplugins.CinderInTreePluginName，则返回 true。
+        return sc.Provisioner == csilibplugins.CinderInTreePluginName
+    },
+
+    IsMigrated: func(csiNode *storage.CSINode) bool {
+        // 调用 isCSIMigrationOn 函数，并传入 csiNode 和 csilibplugins.CinderInTreePluginName 作为参数，返回其结果。
+        return isCSIMigrationOn(csiNode, csilibplugins.CinderInTreePluginName)
+    },
+}
+```
+
+#### getMaxVolumeFunc
+
+```go
+// getMaxVolumeFunc 函数返回一个函数，该函数用于获取一个节点的最大 Volume 数量，具体的过滤类型由 filterName 决定。
+func getMaxVolumeFunc(filterName string) func(node *v1.Node) int {
+    // 返回一个匿名函数，该函数接受一个节点 node 作为参数，返回该节点的最大 Volume 数量。
+    return func(node *v1.Node) int {
+        // 获取环境变量中的最大 Volume 数量。
+        maxVolumesFromEnv := getMaxVolLimitFromEnv()
+        if maxVolumesFromEnv > 0 {
+            return maxVolumesFromEnv
+        }
+      	// 从节点的标签中获取节点实例类型。
+        var nodeInstanceType string
+        for k, v := range node.ObjectMeta.Labels {
+            if k == v1.LabelInstanceType || k == v1.LabelInstanceTypeStable {
+                nodeInstanceType = v
+                break
+            }
+        }
+
+        // 根据 filterName 的不同值，返回不同的最大 Volume 数量。
+        switch filterName {
+        case ebsVolumeFilterType:
+            return getMaxEBSVolume(nodeInstanceType)
+        case gcePDVolumeFilterType:
+            return defaultMaxGCEPDVolumes
+        case azureDiskVolumeFilterType:
+            return defaultMaxAzureDiskVolumes
+        case cinderVolumeFilterType:
+            return volumeutil.DefaultMaxCinderVolumes
+        default:
+            return -1
+        }
+    }
+}
+```
+
+##### getMaxVolLimitFromEnv
+
+```go
+// 从环境变量中获取最大 PD 卷数限制，否则返回默认值。
+func getMaxVolLimitFromEnv() int {
+    // 读取环境变量 KubeMaxPDVols 的值，赋给 rawMaxVols 变量
+    if rawMaxVols := os.Getenv(KubeMaxPDVols); rawMaxVols != "" {
+        // 将 rawMaxVols 变量的值转换为整数类型，并赋给 parsedMaxVols 变量
+        if parsedMaxVols, err := strconv.Atoi(rawMaxVols); err != nil {
+            // 如果转换失败，则输出错误日志，并使用默认值
+            klog.ErrorS(err, "Unable to parse maximum PD volumes value, using default")
+        // 如果转换成功，继续执行
+        } else if parsedMaxVols <= 0 {
+            // 如果转换后的值小于等于0，则输出错误日志，并使用默认值
+            klog.ErrorS(errors.New("maximum PD volumes is negative"), "Unable to parse maximum PD volumes value, using default")
+        } else {
+            // 如果转换后的值大于0，则返回该值
+            return parsedMaxVols
+        }
+    }
+    // 如果无法从环境变量中获取值，则返回默认值 -1
+    return -1
+}
+```
+
+##### getMaxEBSVolume
+
+```go
+// getMaxEBSVolume 函数用于获取指定节点的最大 EBS Volume 数量。
+func getMaxEBSVolume(nodeInstanceType string) int {
+    // 判断节点是否支持 EBS Nitro 实例类型。
+    if ok, _ := regexp.MatchString(volumeutil.EBSNitroLimitRegex, nodeInstanceType); ok {
+    	return volumeutil.DefaultMaxEBSNitroVolumeLimit
+    }
+    // 返回默认的最大 EBS Volume 数量。
+    return volumeutil.DefaultMaxEBSVolumes
+}
+```
+
+### PreFilter&**PreFilterExtensions**
+
+```GO
+// PreFilter 在预过滤器扩展点被调用
+//
+// 如果 Pod 没有这些类型的卷，我们将跳过过滤器阶段
+func (pl *nonCSILimits) PreFilter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+    // 获取 Pod 的所有卷
+    volumes := pod.Spec.Volumes
+    // 遍历所有卷
+    for i := range volumes {
+        vol := &volumes[i]
+        // 使用过滤器检查该卷是否应该被过滤
+        _, ok := pl.filter.FilterVolume(vol)
+        // 如果该卷应该被过滤或者该卷是一个持久卷或临时卷，那么跳过 Filter 阶段
+        if ok || vol.PersistentVolumeClaim != nil || vol.Ephemeral != nil {
+        	return nil, nil
+        }
+    }
+
+    // 返回 nil，表示不需要进行其他过滤器扩展点的处理，且该 Pod 可以进入 Filter 阶段
+    return nil, framework.NewStatus(framework.Skip)
+}
+
+// PreFilterExtensions 返回预过滤器扩展点，即 Pod 的添加和移除
+func (pl *nonCSILimits) PreFilterExtensions() framework.PreFilterExtensions {
+	return nil
+}
+```
+
+### Filter
+
+```GO
+// 在过滤器扩展点处调用的过滤器。
+func (pl *nonCSILimits) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+    // 如果一个Pod没有任何存储卷附加到它上面，谓词将始终为真。
+    // 因此，我们对其进行快速路径处理，以避免在这种情况下进行不必要的计算。
+    if len(pod.Spec.Volumes) == 0 {
+    	return nil // 如果Pod没有存储卷，则直接返回 nil。
+    }
+    newVolumes := sets.New[string]()
+    if err := pl.filterVolumes(pod, true /* new pod */, newVolumes); err != nil {
+        return framework.AsStatus(err)
+    }
+
+    // 快速返回
+    if len(newVolumes) == 0 {
+        return nil
+    }
+
+    node := nodeInfo.Node()
+    if node == nil {
+        return framework.NewStatus(framework.Error, "node not found") // 节点不存在，返回错误。
+    }
+
+    var csiNode *storage.CSINode
+    var err error
+    if pl.csiNodeLister != nil {
+        csiNode, err = pl.csiNodeLister.Get(node.Name)
+        if err != nil {
+            // 我们不在这里失败，因为 CSINode 对象仅用于确定迁移是否启用。
+            klog.V(5).InfoS("Could not get a CSINode object for the node", "node", klog.KObj(node), "err", err) // 日志记录
+        }
+    }
+
+    // 如果插件已迁移到 CSI 驱动程序，则转而使用 CSI 谓词。
+    if pl.filter.IsMigrated(csiNode) {
+        return nil
+    }
+
+    // 计算唯一的存储卷数量
+    existingVolumes := sets.New[string]()
+    for _, existingPod := range nodeInfo.Pods {
+        if err := pl.filterVolumes(existingPod.Pod, false /* existing pod */, existingVolumes); err != nil {
+            return framework.AsStatus(err)
+        }
+    }
+    numExistingVolumes := len(existingVolumes)
+
+    // 过滤掉已经挂载的存储卷
+    for k := range existingVolumes {
+        delete(newVolumes, k)
+    }
+
+    numNewVolumes := len(newVolumes)
+    maxAttachLimit := pl.maxVolumeFunc(node) // 获取节点的最大挂载数量
+    volumeLimits := volumeLimits(nodeInfo)
+    if maxAttachLimitFromAllocatable, ok := volumeLimits[pl.volumeLimitKey]; ok {
+        maxAttachLimit = int(maxAttachLimitFromAllocatable) // 如果节点分配的资源中指定了最大挂载数量，那么将其设为节点的最大挂载数量。
+    }
+
+    if numExistingVolumes+numNewVolumes > maxAttachLimit {
+        return framework.NewStatus(framework.Unschedulable, ErrReasonMaxVolumeCountExceeded) // 如果超过了节点的最大挂载数量，返回错误。
+    }
+    return nil // 如果未超过节点的最大挂载数量，则返回 nil。
+}
+```
+
+#### filterVolumes
+
+```GO
+func (pl *nonCSILimits) filterVolumes(pod *v1.Pod, newPod bool, filteredVolumes sets.Set[string]) error {
+	// 获取 Pod 的所有 Volumes
+	volumes := pod.Spec.Volumes
+	// 遍历 Volumes
+	for i := range volumes {
+		// 获取第 i 个 Volume
+		vol := &volumes[i]
+		// 如果该 Volume 不符合过滤条件，则跳过
+		if id, ok := pl.filter.FilterVolume(vol); ok {
+			filteredVolumes.Insert(id)
+			continue
+		}
+
+		pvcName := ""
+		isEphemeral := false
+		switch {
+		// 如果 Volume 是一个持久化 Volume
+		case vol.PersistentVolumeClaim != nil:
+			// 获取该 Volume 对应的 PVC 的名称
+			pvcName = vol.PersistentVolumeClaim.ClaimName
+		// 如果 Volume 是一个临时 Volume
+		case vol.Ephemeral != nil:
+			// 生成一个与该 Volume 相关的 PVC 的名称
+			// 在后面的代码中会根据这个 PVC 的名称获取相应的 PVC 对象
+			pvcName = ephemeral.VolumeClaimName(pod, vol)
+			// 标记该 Volume 为临时 Volume
+			isEphemeral = true
+		// 如果 Volume 既不是持久化 Volume 也不是临时 Volume，则跳过
+		default:
+			continue
+		}
+		// 如果 PVC 的名称为空，则返回一个错误
+		if pvcName == "" {
+			return fmt.Errorf("PersistentVolumeClaim had no name")
+		}
+
+		// 生成一个假的 Volume ID
+		pvID := fmt.Sprintf("%s-%s/%s", pl.randomVolumeIDPrefix, pod.Namespace, pvcName)
+
+		// 获取对应 PVC 的对象
+		pvc, err := pl.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(pvcName)
+		if err != nil {
+			// 如果是新 Pod，并且 PVC 不存在，则无法调度该 Pod，返回一个错误
+			if newPod {
+				return fmt.Errorf("looking up PVC %s/%s: %v", pod.Namespace, pvcName, err)
+			}
+			// 如果 PVC 不存在或无效，则跳过该 Volume 的处理
+			klog.V(4).InfoS("Unable to look up PVC info, assuming PVC doesn't match predicate when counting limits", "pod", klog.KObj(pod), "PVC", klog.KRef(pod.Namespace, pvcName), "err", err)
+			continue
+		}
+
+		// 如果是临时 Volume，则需要检查 PVC 是否属于该 Pod 所有
+		if isEphemeral {
+			if err := ephemeral.VolumeIsForPod(pod, pvc); err != nil {
+				return err
+			}
+		}
+
+		// 获取该 PVC 对应的 PV 的名称
+		pvName := pvc.Spec.VolumeName
+		if pvName == "" {
+			// PVC未绑定。它可能已被删除并重新创建，或者被管理员强制解除绑定。
+            // Pod仍然可以使用其绑定的原始PV，因此，如果该卷属	于正在运行的谓词，则计算该卷。
+			if pl.matchProvisioner(pvc) {
+				klog.V(4).InfoS("PVC is not bound, assuming PVC matches predicate when counting limits", "pod", klog.KObj(pod), "PVC", klog.KRef(pod.Namespace, pvcName))
+				filteredVolumes.Insert(pvID)
+			}
+			continue
+		}
+
+		pv, err := pl.pvLister.Get(pvName)
+		if err != nil {
+			// 如果PV无效且PVC属于正在运行的谓词，则记录错误并将PV计入PV限制。
+			if pl.matchProvisioner(pvc) {
+				klog.V(4).InfoS("Unable to look up PV, assuming PV matches predicate when counting limits", "pod", klog.KObj(pod), "PVC", klog.KRef(pod.Namespace, pvcName), "PV", klog.KRef("", pvName), "err", err)
+				filteredVolumes.Insert(pvID)
+			}
+			continue
+		}
+
+		if id, ok := pl.filter.FilterPersistentVolume(pv); ok {
+			filteredVolumes.Insert(id)
+		}
+	}
+
+	return nil
+}
+```
+
+##### matchProvisioner
+
+```go
+// matchProvisioner helps identify if the given PVC belongs to the running predicate.
+// matchProvisioner 帮助判断给定的 PVC 是否属于当前的筛选器。
+func (pl *nonCSILimits) matchProvisioner(pvc *v1.PersistentVolumeClaim) bool {
+    // If the PVC doesn't have a storage class, it can't belong to the running predicate.
+    // 如果 PVC 没有存储类，则不能属于当前的筛选器。
+    if pvc.Spec.StorageClassName == nil {
+        return false
+    }
+
+    // Try to fetch the StorageClass object that corresponds to the PVC's storage class.
+    // 尝试获取与 PVC 存储类对应的 StorageClass 对象。
+    storageClass, err := pl.scLister.Get(*pvc.Spec.StorageClassName)
+    if err != nil || storageClass == nil {
+        // If there is an error fetching the StorageClass object, or if the object doesn't exist,
+        // then the PVC can't belong to the running predicate.
+        // 如果获取 StorageClass 对象时出错，或者对象不存在，则 PVC 不能属于当前的筛选器。
+        return false
+    }
+
+    // If the filter's provisioner matches the storage class's provisioner, then the PVC belongs to the running predicate.
+    // 如果筛选器的 provisioner 与 StorageClass 的 provisioner 匹配，则 PVC 属于当前的筛选器。
+    return pl.filter.MatchProvisioner(storageClass)
+}
+```
+
+#### volumeLimits
+
+```go
+// volumeLimits函数返回与节点相关的卷资源限制。
+func volumeLimits(n *framework.NodeInfo) map[v1.ResourceName]int64 {
+    // 初始化一个空的map，用于存储卷资源限制。
+    volumeLimits := map[v1.ResourceName]int64{}
+    // 遍历节点的可分配资源，过滤出卷资源。
+    for k, v := range n.Allocatable.ScalarResources {
+        if v1helper.IsAttachableVolumeResourceName(k) {
+            volumeLimits[k] = v
+        }
+    }
+    return volumeLimits
+}
+```
+
+### EventsToRegister
+
+```go
+// EventsToRegister返回可能使该插件无法调度Pod失败的可能事件。
+func (pl *nonCSILimits) EventsToRegister() []framework.ClusterEvent {
+    // 返回一个包含两个元素的切片，每个元素都是一个ClusterEvent类型的结构体，
+    // 分别指定了资源类型和操作类型。
+    return []framework.ClusterEvent{
+        {Resource: framework.Node, ActionType: framework.Add},
+        {Resource: framework.Pod, ActionType: framework.Delete},
+    }
+}
+```
+
+## CinderLimits
+
+### 作用
+
+限制OpenStack Cinder卷（OpenStack Cinder Volume）的使用量。在Kubernetes中，使用PersistentVolumeClaim（PVC）来申请持久存储。如果PVC绑定到OpenStack Cinder卷，则可以在Pod中使用它来存储数据。但是，OpenStack Cinder卷在不同的大小和性能层次上都有不同的限制。CinderLimits插件可用于确保Pod使用的OpenStack Cinder卷满足要求。
+
+### 结构
+
+```GO
+// CinderName 是插件在插件注册表和配置中使用的名称。
+const CinderName = names.CinderLimits
+
+// NewCinder 返回一个函数，该函数初始化一个新的插件并将其返回。
+func NewCinder(_ runtime.Object, handle framework.Handle, fts feature.Features) (framework.Plugin, error) {
+    // 获取 shared informer 工厂
+    informerFactory := handle.SharedInformerFactory()
+    // 使用 cinderVolumeFilterType 和 informerFactory 创建一个新的非 CSI volume 插件，并返回该插件。
+    return newNonCSILimitsWithInformerFactory(cinderVolumeFilterType, informerFactory, fts), nil
+}
+```
+
+## EBSLimits
+
+### 作用
+
+限制Amazon Elastic Block Store（EBS）卷的使用量。在Kubernetes中，使用PersistentVolumeClaim（PVC）来申请持久存储。如果PVC绑定到Amazon Elastic Block Store（EBS）卷，则可以在Pod中使用它来存储数据。但是，EBS卷在不同的大小和性能层次上都有不同的限制。EBSLimits插件可用于确保Pod使用的EBS卷满足要求。
+
+### 结构
+
+```GO
+// EBSName 是插件在插件注册表和配置中使用的名称。
+const EBSName = names.EBSLimits
+
+// NewEBS 返回一个函数，该函数初始化一个新插件并返回它。
+// _ 表示不使用此参数。
+func NewEBS(_ runtime.Object, handle framework.Handle, fts feature.Features) (framework.Plugin, error) {
+    // 获取共享 InformerFactory 对象。
+    informerFactory := handle.SharedInformerFactory()
+    // 使用 InformerFactory 创建新的插件，并返回它。
+    return newNonCSILimitsWithInformerFactory(ebsVolumeFilterType, informerFactory, fts), nil
+}
+```
+
+## GCEPDLimits
+
+### 作用
+
+限制Google Compute Engine持久磁盘（Google Compute Engine Persistent Disk）的使用量。在Kubernetes中，使用PersistentVolumeClaim（PVC）来申请持久存储。如果PVC绑定到Google Compute Engine持久磁盘，则可以在Pod中使用它来存储数据。但是，Google Compute Engine持久磁盘在不同的大小和性能层次上都有不同的限制。GCEPDLimits插件可用于确保Pod使用的Google Compute Engine持久磁盘满足要求。
+
+### 结构
+
+```go
+// GCEPDName 是插件在插件注册表和配置中使用的名称。
+const GCEPDName = names.GCEPDLimits
+
+// NewGCEPD 返回一个函数，该函数初始化一个新插件并返回它。
+// _ 表示不使用此参数。
+func NewGCEPD(_ runtime.Object, handle framework.Handle, fts feature.Features) (framework.Plugin, error) {
+    // 获取共享 InformerFactory 对象。
+    informerFactory := handle.SharedInformerFactory()
+    // 使用 InformerFactory 创建新的插件，并返回它。
+    return newNonCSILimitsWithInformerFactory(gcePDVolumeFilterType, informerFactory, fts), nil
+}
+```
+
