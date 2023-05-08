@@ -11,7 +11,7 @@ tags:
   - controller
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/scheduler/scheduler-framework.jpg
+featuredImagePreview: /img/preview/scheduler/scheduler-plugin-1.jpg
 ---
 
 ## 插件
