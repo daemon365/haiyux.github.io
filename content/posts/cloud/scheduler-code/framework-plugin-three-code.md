@@ -1347,3 +1347,864 @@ func countMatchingPods(namespace string, selector labels.Selector, nodeInfo *fra
 }
 ```
 
+## TaintToleration
+
+### 作用
+
+用于实现Taint和Toleration机制的核心组件之一。它的作用是在节点的Taint和Pod的Toleration之间建立映射关系，从而实现节点与Pod的匹配。具体来说，TaintToleration插件会检查每个Pod的Toleration，然后根据节点上的Taint进行匹配，找到一个可以容忍Pod的节点。
+
+通过TaintToleration插件，管理员可以对集群中的节点进行更细粒度的控制，例如限制节点上运行的Pod数量，避免故障节点被不适合的Pod占用等。同时，通过Taint和Toleration的组合使用，可以实现对不同节点的不同Pod的调度策略，从而更好地满足应用程序的需求。
+
+### 结构
+
+```GO
+// TaintToleration是一个插件，用于检查Pod是否容忍节点的污点。
+type TaintToleration struct {
+	handle framework.Handle
+}
+
+// 实现 framework.FilterPlugin、framework.PreScorePlugin、framework.ScorePlugin 和 framework.EnqueueExtensions 接口
+var _ framework.FilterPlugin = &TaintToleration{}
+var _ framework.PreScorePlugin = &TaintToleration{}
+var _ framework.ScorePlugin = &TaintToleration{}
+var _ framework.EnqueueExtensions = &TaintToleration{}
+
+// 声明常量
+const (
+    // Name 是在插件注册表和配置中使用的插件名称。
+    Name = names.TaintToleration
+    // preScoreStateKey 是 CycleState 中 TaintToleration 预计算评分数据的键。
+    preScoreStateKey = "PreScore" + Name
+    // ErrReasonNotMatch 是在不匹配时 Filter 的原因状态。
+    ErrReasonNotMatch = "node(s) had taints that the pod didn't tolerate"
+)
+
+// Name 返回插件的名称。它在日志等中使用。
+func (pl *TaintToleration) Name() string {
+	return Name
+}
+
+// New 初始化一个新的插件并返回它。
+func New(_ runtime.Object, h framework.Handle) (framework.Plugin, error) {
+	return &TaintToleration{handle: h}, nil
+}
+```
+
+### Filter
+
+```go
+// Filter 方法是 FilterPlugin 接口的方法，用于在筛选阶段调用。
+func (pl *TaintToleration) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+    // 获取 Node 对象
+    node := nodeInfo.Node()
+    if node == nil {
+        // 如果获取到的 Node 对象为空，返回错误状态
+        return framework.AsStatus(fmt.Errorf("invalid nodeInfo"))
+    }
+    // 查找该 Pod 可容忍的 Taint
+    taint, isUntolerated := v1helper.FindMatchingUntoleratedTaint(node.Spec.Taints, pod.Spec.Tolerations, helper.DoNotScheduleTaintsFilterFunc())
+    if !isUntolerated {
+        // 如果不存在未容忍的 Taint，返回 nil，表示该 Node 可被筛选
+        return nil
+    }
+
+    // 如果存在未容忍的 Taint，返回一个新的错误状态，提示无法调度
+    errReason := fmt.Sprintf("node(s) had untolerated taint {%s: %s}", taint.Key, taint.Value)
+    return framework.NewStatus(framework.UnschedulableAndUnresolvable, errReason)
+}
+```
+
+### PreScore
+
+```go
+// PreScore 函数用于构建并写入状态，用于 Score 和 NormalizeScore 计算
+func (pl *TaintToleration) PreScore(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+	// 如果 nodes 列表为空则直接返回 nil
+	if len(nodes) == 0 {
+		return nil
+	}
+	// 获取 pod 中所有的 PreferNoSchedule Tolerations
+	tolerationsPreferNoSchedule := getAllTolerationPreferNoSchedule(pod.Spec.Tolerations)
+	// 构建 preScoreState 对象，包含 PreferNoSchedule Tolerations
+	state := &preScoreState{
+		tolerationsPreferNoSchedule: tolerationsPreferNoSchedule,
+	}
+	// 写入 cycleState 状态
+	cycleState.Write(preScoreStateKey, state)
+	return nil
+}
+```
+
+#### preScoreState
+
+```go
+// preScoreState 在 PreScore 计算后使用于 Score 计算
+type preScoreState struct {
+	// tolerationsPreferNoSchedule 是 v1.Toleration 类型的切片
+	tolerationsPreferNoSchedule []v1.Toleration
+}
+
+// Clone 实现了必须的 Clone 接口。我们实际上并不复制数据，因为没有必要。
+// Clone 方法用于实现 Clone 接口，返回当前对象的引用
+func (s *preScoreState) Clone() framework.StateData {
+	return s
+}
+```
+
+#### getAllTolerationPreferNoSchedule
+
+```go
+// getAllTolerationPreferNoSchedule 获取所有 PreferNoSchedule 和没有 effect 的 Tolerations
+func getAllTolerationPreferNoSchedule(tolerations []v1.Toleration) (tolerationList []v1.Toleration) {
+	// 遍历 tolerations 切片
+	for _, toleration := range tolerations {
+		// 空 effect 表示包括 PreferNoSchedule，因此需要收集所有
+		if len(toleration.Effect) == 0 || toleration.Effect == v1.TaintEffectPreferNoSchedule {
+			tolerationList = append(tolerationList, toleration)
+		}
+	}
+	return
+}
+```
+
+### Score&NormalizeScore
+
+```go
+// 定义一个 Score 方法，该方法在 Score 扩展点被调用。
+func (pl *TaintToleration) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+	// 从 Snapshot 中获取 nodeName 对应的 NodeInfo。
+	nodeInfo, err := pl.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+	if err != nil {
+		// 如果获取 NodeInfo 失败，返回一个包含错误信息的 Status。
+		return 0, framework.AsStatus(fmt.Errorf("getting node %q from Snapshot: %w", nodeName, err))
+	}
+	// 从 NodeInfo 中获取 Node。
+	node := nodeInfo.Node()
+
+	// 获取 state 的预处理状态。
+	s, err := getPreScoreState(state)
+	if err != nil {
+		// 如果获取预处理状态失败，返回一个包含错误信息的 Status。
+		return 0, framework.AsStatus(err)
+	}
+
+	// 统计 Pod 中 Effect 为 PreferNoSchedule 的 Taints 中不可容忍的 Taints 的数量。
+	score := int64(countIntolerableTaintsPreferNoSchedule(node.Spec.Taints, s.tolerationsPreferNoSchedule))
+	return score, nil
+}
+
+// NormalizeScore invoked after scoring all nodes.
+func (pl *TaintToleration) NormalizeScore(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+	return helper.DefaultNormalizeScore(framework.MaxNodeScore, true, scores)
+}
+
+// ScoreExtensions of the Score plugin.
+func (pl *TaintToleration) ScoreExtensions() framework.ScoreExtensions {
+	return pl
+}
+```
+
+#### getPreScoreState
+
+```go
+func getPreScoreState(cycleState *framework.CycleState) (*preScoreState, error) {
+	// 从 cycleState 中读取 preScoreState 状态
+	c, err := cycleState.Read(preScoreStateKey)
+	if err != nil {
+		// 如果读取失败则返回错误信息
+		return nil, fmt.Errorf("failed to read %q from cycleState: %w", preScoreStateKey, err)
+	}
+
+	// 将读取到的状态转换为 preScoreState 类型
+	s, ok := c.(*preScoreState)
+	if !ok {
+		// 如果转换失败则返回错误信息
+		return nil, fmt.Errorf("%+v convert to tainttoleration.preScoreState error", c)
+	}
+	// 如果转换成功则返回状态值
+	return s, nil
+}
+```
+
+#### countIntolerableTaintsPreferNoSchedule
+
+```go
+// CountIntolerableTaintsPreferNoSchedule 方法用于计算 Effect 为 PreferNoSchedule 的 Taints 中不可容忍的 Taints 的数量。
+func countIntolerableTaintsPreferNoSchedule(taints []v1.Taint, tolerations []v1.Toleration) (intolerableTaints int) {
+	// 遍历 Pod 中所有的 Taint。
+	for _, taint := range taints {
+		// 只检查 Effect 为 PreferNoSchedule 的 Taint。
+		if taint.Effect != v1.TaintEffectPreferNoSchedule {
+			continue
+		}
+
+		// 判断当前 Taint 是否可以被 tolerations 中的 Toleration 容忍。
+		if !v1helper.TolerationsTolerateTaint(tolerations, &taint) {
+			intolerableTaints++
+		}
+	}
+	return
+}
+```
+
+### EventsToRegister
+
+```go
+// EventsToRegister 方法用于返回可能导致 Pod 无法被调度的事件。
+func (pl *TaintToleration) EventsToRegister() []framework.ClusterEvent {
+	// 返回一个包含 Node 资源的 Add 和 Update 事件的 ClusterEvent 数组。
+	return []framework.ClusterEvent{
+		{Resource: framework.Node, ActionType: framework.Add | framework.Update},
+	}
+}
+```
+
+## VolumeRestrictions
+
+### 作用
+
+用于实现对Pod中Volume的限制。它的作用是检查Pod中使用的Volume是否符合管理员设定的限制条件，从而避免因为Pod中Volume的使用不当导致系统资源的浪费或安全隐患。
+
+在Kubernetes中，Volume是用于持久化容器中的数据的一种机制。Pod可以挂载多个Volume，并且可以使用不同类型的Volume，例如hostPath、emptyDir、configMap等。VolumeRestrictions插件的作用是检查Pod中使用的Volume的类型、大小、数量等限制条件，确保Pod不会超出预设的限制，保证集群的安全和稳定。
+
+例如，管理员可以设置Pod中最多只能使用一个hostPath类型的Volume，或者Volume的大小不能超过一定的限制，或者Pod中使用的Volume必须符合一定的命名规则等。当Pod的Volume使用不符合这些限制条件时，VolumeRestrictions插件会拒绝调度该Pod，并且输出相关的警告信息。
+
+### 结构
+
+```GO
+// VolumeRestrictions 是一个检查卷限制的插件。
+type VolumeRestrictions struct {
+	pvcLister              corelisters.PersistentVolumeClaimLister
+	sharedLister           framework.SharedLister
+	enableReadWriteOncePod bool
+}
+
+// 实现 PreFilterPlugin 接口和 FilterPlugin 接口以及 EnqueueExtensions 接口和 StateData 接口
+var _ framework.PreFilterPlugin = &VolumeRestrictions{}
+var _ framework.FilterPlugin = &VolumeRestrictions{}
+var _ framework.EnqueueExtensions = &VolumeRestrictions{}
+var _ framework.StateData = &preFilterState{}
+
+const (
+	// Name 是插件在插件注册表和配置中使用的名称。
+	Name = names.VolumeRestrictions
+	// preFilterStateKey is the key in CycleState to VolumeRestrictions pre-computed data for Filtering.
+	// Using the name of the plugin will likely help us avoid collisions with other plugins.
+	preFilterStateKey = "PreFilter" + Name
+
+	// ErrReasonDiskConflict 是 NoDiskConflict 谓词错误的原因。
+	ErrReasonDiskConflict = "node(s) had no available disk"
+
+	// ErrReasonReadWriteOncePodConflict 是当发现使用相同 PVC 且访问模式为 ReadWriteOncePod 的 Pod 时使用的原因。
+	ErrReasonReadWriteOncePodConflict = "node has pod using PersistentVolumeClaim with the same name and ReadWriteOncePod access mode"
+)
+
+// New 初始化一个新的插件并返回它。
+func New(_ runtime.Object, handle framework.Handle, fts feature.Features) (framework.Plugin, error) {
+	// 获取 SharedInformerFactory 和 Listers
+	informerFactory := handle.SharedInformerFactory()
+	pvcLister := informerFactory.Core().V1().PersistentVolumeClaims().Lister()
+	sharedLister := handle.SnapshotSharedLister()
+
+	// 返回 VolumeRestrictions 插件实例
+	return &VolumeRestrictions{
+		pvcLister:              pvcLister,
+		sharedLister:           sharedLister,
+		enableReadWriteOncePod: fts.EnableReadWriteOncePod,
+	}, nil
+}
+```
+
+### PreFilter
+
+```GO
+// PreFilter computes and stores cycleState containing details for enforcing ReadWriteOncePod.
+func (pl *VolumeRestrictions) PreFilter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+	needsCheck := false
+	// 检查 Pod 使用的 Volume 是否需要进行限制检查
+	for i := range pod.Spec.Volumes {
+		if needsRestrictionsCheck(pod.Spec.Volumes[i]) {
+			needsCheck = true
+			break
+		}
+	}
+
+	// 如果未启用 ReadWriteOncePod，则跳过限制检查
+	if !pl.enableReadWriteOncePod {
+		if needsCheck {
+			return nil, nil
+		}
+		return nil, framework.NewStatus(framework.Skip)
+	}
+
+	// 获取 Pod 使用的 PersistentVolumeClaim 列表
+	pvcs, err := pl.readWriteOncePodPVCsForPod(ctx, pod)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// 如果 Pod 使用的 PersistentVolumeClaim 不存在，则返回 UnschedulableAndUnresolvable 状态
+			return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
+		}
+		// 如果出现其他错误，则返回错误状态
+		return nil, framework.AsStatus(err)
+	}
+
+	// 计算 preFilterState
+	s, err := pl.calPreFilterState(ctx, pod, pvcs)
+	if err != nil {
+		return nil, framework.AsStatus(err)
+	}
+
+	// 如果不需要限制检查且没有冲突，则跳过限制检查
+	if !needsCheck && s.conflictingPVCRefCount == 0 {
+		return nil, framework.NewStatus(framework.Skip)
+	}
+	// 将计算出的 preFilterState 存储到 cycleState 中
+	cycleState.Write(preFilterStateKey, s)
+	return nil, nil
+}
+
+func (pl *VolumeRestrictions) PreFilterExtensions() framework.PreFilterExtensions {
+	return pl
+}
+
+// AddPod from pre-computed data in cycleState.
+func (pl *VolumeRestrictions) AddPod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podInfoToAdd *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
+	if !pl.enableReadWriteOncePod {
+		return nil
+	}
+	state, err := getPreFilterState(cycleState)
+	if err != nil {
+		return framework.AsStatus(err)
+	}
+	state.updateWithPod(podInfoToAdd, 1)
+	return nil
+}
+
+// RemovePod from pre-computed data in cycleState.
+func (pl *VolumeRestrictions) RemovePod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podInfoToRemove *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
+	if !pl.enableReadWriteOncePod {
+		return nil
+	}
+	state, err := getPreFilterState(cycleState)
+	if err != nil {
+		return framework.AsStatus(err)
+	}
+	state.updateWithPod(podInfoToRemove, -1)
+	return nil
+}
+```
+
+#### preFilterState
+
+```go
+// 定义了 preFilterState 结构体，用于在 PreFilter 中计算，Filter 中使用。
+type preFilterState struct {
+    // Names of the pod's volumes using the ReadWriteOncePod access mode.
+    // 使用 ReadWriteOncePod 访问模式的 Pod 卷的名称。
+    readWriteOncePodPVCs sets.Set[string]
+    // The number of references to these ReadWriteOncePod volumes by scheduled pods.
+    // 已调度 Pod 引用这些 ReadWriteOncePod 卷的数量。
+    conflictingPVCRefCount int
+}
+
+// 在 preFilterState 结构体上定义了 updateWithPod 方法，用于更新 conflictingPVCRefCount 字段。
+func (s *preFilterState) updateWithPod(podInfo *framework.PodInfo, multiplier int) {
+    s.conflictingPVCRefCount += multiplier * s.conflictingPVCRefCountForPod(podInfo)
+}
+
+// 在 preFilterState 结构体上定义了 conflictingPVCRefCountForPod 方法，用于计算 podInfo 中所有卷的冲突数量。
+func (s *preFilterState) conflictingPVCRefCountForPod(podInfo *framework.PodInfo) int {
+    conflicts := 0
+    for _, volume := range podInfo.Pod.Spec.Volumes {
+        if volume.PersistentVolumeClaim == nil {
+            continue
+        }
+        if s.readWriteOncePodPVCs.Has(volume.PersistentVolumeClaim.ClaimName) {
+            conflicts += 1
+        }
+    }
+    return conflicts
+}
+
+// 在 preFilterState 结构体上定义了 Clone 方法，用于复制 preFilterState。
+func (s *preFilterState) Clone() framework.StateData {
+    if s == nil {
+        return nil
+    }
+    return &preFilterState{
+        readWriteOncePodPVCs:   s.readWriteOncePodPVCs,
+        conflictingPVCRefCount: s.conflictingPVCRefCount,
+    }
+}
+```
+
+#### needsRestrictionsCheck
+
+```go
+// 判断一个v1.Volume对象是否包含某些字段，如果包含则返回true，否则返回false。
+func needsRestrictionsCheck(v v1.Volume) bool {
+	return v.GCEPersistentDisk != nil || v.AWSElasticBlockStore != nil || v.RBD != nil || v.ISCSI != nil
+}
+```
+
+#### readWriteOncePodPVCsForPod
+
+```go
+// 定义VolumeRestrictions类型的一个方法，用于获取Pod的ReadWriteOnce类型的PVC
+func (pl *VolumeRestrictions) readWriteOncePodPVCsForPod(ctx context.Context, pod *v1.Pod) (sets.Set[string], error) {
+    // 创建一个空的字符串Set，用于存储Pod使用的ReadWriteOnce类型的PVC
+	pvcs := sets.New[string]()
+    // 遍历Pod中的所有Volume
+	for _, volume := range pod.Spec.Volumes {
+        // 如果Volume不是持久化存储卷，则跳过
+		if volume.PersistentVolumeClaim == nil {
+			continue
+		}
+
+        // 获取PVC
+		pvc, err := pl.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(volume.PersistentVolumeClaim.ClaimName)
+		if err != nil {
+			return nil, err
+		}
+
+        // 如果PVC的访问模式不是ReadWriteOncePod，则跳过
+		if !v1helper.ContainsAccessMode(pvc.Spec.AccessModes, v1.ReadWriteOncePod) {
+			continue
+		}
+        // 将PVC的名称插入pvcs Set中
+		pvcs.Insert(pvc.Name)
+	}
+	return pvcs, nil
+}
+```
+
+#### calPreFilterState
+
+```go
+// calPreFilterState计算preFilterState，描述哪些PVC使用ReadWriteOncePod，以及集群中有哪些Pod冲突。
+func (pl *VolumeRestrictions) calPreFilterState(ctx context.Context, pod *v1.Pod, pvcs sets.Set[string]) (*preFilterState, error) {
+    // 定义冲突PVC的计数器
+	conflictingPVCRefCount := 0
+    // 遍历所有的ReadWriteOncePod类型的PVC
+	for pvc := range pvcs {
+        // 获取PVC的key
+		key := framework.GetNamespacedName(pod.Namespace, pvc)
+        // 如果PVC被其他Pod使用，则将冲突PVC的计数器加1
+		if pl.sharedLister.StorageInfos().IsPVCUsedByPods(key) {
+			// 只能有一个Pod使用ReadWriteOncePod类型的PVC。
+			conflictingPVCRefCount += 1
+		}
+	}
+    // 返回preFilterState结构体的指针，其中包含了使用ReadWriteOncePod类型的PVC以及冲突PVC的计数器
+	return &preFilterState{
+		readWriteOncePodPVCs:   pvcs,
+		conflictingPVCRefCount: conflictingPVCRefCount,
+	}, nil
+}
+```
+
+#### getPreFilterState
+
+```go
+// getPreFilterState函数用于从cycleState中获取preFilterState状态对象，即预过滤状态对象
+func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error) {
+    c, err := cycleState.Read(preFilterStateKey) // 从cycleState中获取preFilterState
+    if err != nil {
+        // 若获取失败，则说明没有进行预过滤
+        return nil, fmt.Errorf("cannot read %q from cycleState", preFilterStateKey)
+    }
+
+    s, ok := c.(*preFilterState) // 类型断言，判断获取的对象是否是preFilterState
+    if !ok {
+        // 如果获取的对象不是preFilterState类型，则返回错误
+        return nil, fmt.Errorf("%+v convert to volumerestrictions.state error", c)
+    }
+    return s, nil // 如果获取成功，返回preFilterState对象
+}
+```
+
+### Filter
+
+```go
+// Filter函数为过滤器的扩展点。它用于判断Pod是否可以被调度。
+// 如果已经有一个卷挂载在节点上，那么另一个使用相同卷的Pod就不能在此节点上调度。
+// 目前这个函数只适用于GCE，Amazon EBS，ISCSI和Ceph RBD：
+// - GCE PD允许多个挂载只要它们都是只读的。
+// - AWS EBS禁止任何两个Pod挂载相同的卷ID。
+// - Ceph RBD禁止如果任何两个Pod共享至少一个监视器，并匹配池和映像，且映像是只读的。
+// - 如果任何两个Pod共享至少一个IQN并且iSCSI卷是只读的，则ISCSI禁止。
+// 如果Pod使用的PVC是ReadWriteOncePod访问模式，它会评估这些PVC是否已经被使用，以及抢占是否有所帮助。
+func (pl *VolumeRestrictions) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+    // 检查Pod是否满足卷冲突条件
+    if !satisfyVolumeConflicts(pod, nodeInfo) {
+    // 如果不满足卷冲突条件，则返回不可调度状态和错误信息
+    	return framework.NewStatus(framework.Unschedulable, ErrReasonDiskConflict)
+    }
+    // 如果不支持ReadWriteOncePod访问模式，则直接返回
+    if !pl.enableReadWriteOncePod {
+    	return nil
+    }
+    // 获取预过滤状态对象
+    state, err := getPreFilterState(cycleState)
+    if err != nil {
+    	return framework.AsStatus(err)
+    }
+    // 检查是否满足ReadWriteOncePod访问模式的条件
+    return satisfyReadWriteOncePod(ctx, state)
+}
+```
+
+#### satisfyVolumeConflicts
+
+```go
+// 判断在此节点上调度该Pod是否会与现有卷产生冲突
+func satisfyVolumeConflicts(pod *v1.Pod, nodeInfo *framework.NodeInfo) bool {
+    // 遍历该Pod所有的Volume
+    for i := range pod.Spec.Volumes {
+        v := pod.Spec.Volumes[i]
+        // 如果该Volume不需要检查限制，则跳过
+        if !needsRestrictionsCheck(v) {
+        	continue
+        }
+        // 遍历该节点上已经运行的Pod
+        for _, ev := range nodeInfo.Pods {
+            // 判断该Pod是否与现有Pod使用的Volume产生了冲突
+            if isVolumeConflict(&v, ev.Pod) {
+            	return false
+            }
+        }
+    }
+    return true
+}
+```
+
+#### satisfyReadWriteOncePod
+
+```go
+// 判断在此节点上调度该Pod是否会与现有ReadWriteOncePod PVC的访问模式产生冲突
+func satisfyReadWriteOncePod(ctx context.Context, state *preFilterState) *framework.Status {
+    if state == nil {
+    	return nil
+    }
+    // 如果存在多个Pod使用同一个ReadWriteOncePod PVC，则该Pod无法调度到此节点
+    if state.conflictingPVCRefCount > 0 {
+    	return framework.NewStatus(framework.Unschedulable, ErrReasonReadWriteOncePodConflict)
+    }
+    return nil
+}
+```
+
+### EventsToRegister
+
+```go
+// 返回可能导致由此插件导致的Pod调度失败的事件。
+func (pl *VolumeRestrictions) EventsToRegister() []framework.ClusterEvent {
+    return []framework.ClusterEvent{
+        // Pods可能无法调度，因为其卷与同一节点上的其他Pod产生冲突。
+        // 一旦运行的Pod被删除并且卷已被释放，不可调度的Pod将变为可调度。
+        // 由于不可变的字段spec.volumes，因此忽略Pod更新事件。
+        {Resource: framework.Pod, ActionType: framework.Delete},
+        // 新的Node可能会使Pod可调度。
+        {Resource: framework.Node, ActionType: framework.Add},
+        // Pods可能无法调度，因为它使用的PVC尚未创建。
+        // 需要确保PVC存在才能检查其访问模式。
+        {Resource: framework.PersistentVolumeClaim, ActionType: framework.Add | framework.Update},
+    }
+}
+```
+
+## VolumeZone
+
+### 作用
+
+用于将节点和Volume绑定在同一可用区（Availability Zone）内，以提高Pod的可靠性和容错性。在Kubernetes中，可用区是指一个物理数据中心内部的逻辑区域，通常由不同的电源、网络和硬件组成。将节点和Volume绑定在同一可用区内可以保证在节点或Volume故障时，系统可以快速地进行故障切换，从而保证应用程序的高可用性。
+
+具体来说，VolumeZone插件会根据管理员设定的规则将节点和Volume绑定在同一可用区内。例如，管理员可以通过标签（label）或者注解（annotation）的方式，将某个节点和某个Volume绑定在同一可用区内。然后，当调度器需要为Pod分配节点和Volume时，VolumeZone插件会检查节点和Volume是否在同一可用区内，如果不在，则会拒绝调度该Pod。
+
+除了提高Pod的可靠性和容错性，将节点和Volume绑定在同一可用区内还可以减少数据中心内部的网络流量，提高系统的性能和稳定性。
+
+总之，VolumeZone插件是Kubernetes调度器中的一个重要组件，用于将节点和Volume绑定在同一可用区内，从而提高Pod的可靠性和容错性，减少数据中心内部的网络流量，提高系统的性能和稳定性。
+
+### 结构
+
+```GO
+// VolumeZone 是一个检查卷区域的插件。
+type VolumeZone struct {
+    pvLister corelisters.PersistentVolumeLister
+    pvcLister corelisters.PersistentVolumeClaimLister
+    scLister storagelisters.StorageClassLister
+}
+
+var _ framework.FilterPlugin = &VolumeZone{}
+var _ framework.PreFilterPlugin = &VolumeZone{}
+var _ framework.EnqueueExtensions = &VolumeZone{}
+
+const (
+    // Name 是插件在插件注册表和配置中使用的名称。
+    Name = names.VolumeZone
+    // preFilterStateKey 是用于在状态存储中标识 PreFilter 的键。
+    preFilterStateKey framework.StateKey = "PreFilter" + Name
+
+    // ErrReasonConflict 用于 NoVolumeZoneConflict 断言错误。
+    ErrReasonConflict = "node(s) had no available volume zone"
+)
+
+// Name 返回插件的名称，用于日志等。
+func (pl *VolumeZone) Name() string {
+	return Name
+}
+
+// New 初始化一个新的插件并返回它。
+func New(_ runtime.Object, handle framework.Handle) (framework.Plugin, error) {
+    // 获取 informerFactory
+    informerFactory := handle.SharedInformerFactory()
+    // 获取 PersistentVolumeLister
+    pvLister := informerFactory.Core().V1().PersistentVolumes().Lister()
+    // 获取 PersistentVolumeClaimLister
+    pvcLister := informerFactory.Core().V1().PersistentVolumeClaims().Lister()
+    // 获取 StorageClassLister
+    scLister := informerFactory.Storage().V1().StorageClasses().Lister()
+    // 返回 VolumeZone 实例
+    return &VolumeZone{
+        pvLister,
+        pvcLister,
+        scLister,
+    }, nil
+}
+```
+
+### PreFilter&PreFilterExtensions
+
+```GO
+// # 它查找与 Pod 请求的卷对应的 PersistentVolumes 的拓扑结构
+//
+// 目前，它仅支持 PersistentVolumeClaims，并且仅查找绑定的 PersistentVolume。
+func (pl *VolumeZone) PreFilter(ctx context.Context, cs *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+    // 获取 Pod 请求的卷的拓扑结构
+    podPVTopologies, status := pl.getPVbyPod(ctx, pod)
+    if !status.IsSuccess() {
+    	return nil, status
+    }
+    // 如果没有拓扑结构，则跳过
+    if len(podPVTopologies) == 0 {
+    	return nil, framework.NewStatus(framework.Skip)
+    }
+    // 将拓扑结构写入状态存储
+    cs.Write(preFilterStateKey, &stateData{podPVTopologies: podPVTopologies})
+	return nil, nil
+}
+// PreFilterExtensions returns prefilter extensions, pod add and remove.
+func (pl *VolumeZone) PreFilterExtensions() framework.PreFilterExtensions {
+	return nil
+}
+```
+
+#### stateData
+
+```GO
+// pvTopology 存储了一个 PV 的拓扑标签的值
+type pvTopology struct {
+    pvName string
+    key string
+    values sets.Set[string]
+}
+
+// stateData 在 PreFilter 阶段初始化状态。
+// 因为我们将指针保存在 framework.CycleState 中，所以在后续阶段中我们不需要调用 Write 方法更新值。
+type stateData struct {
+    // podPVTopologies 保存我们需要的 PV 信息
+    // 在 PreFilter 阶段初始化
+    podPVTopologies []pvTopology
+}
+
+func (d *stateData) Clone() framework.StateData {
+	return d
+}
+```
+
+
+
+```GO
+func (pl *VolumeZone) getPVbyPod(ctx context.Context, pod *v1.Pod) ([]pvTopology, *framework.Status) {
+	podPVTopologies := make([]pvTopology, 0) // 创建存储PV拓扑信息的切片
+
+	// 遍历Pod的所有Volume
+	for i := range pod.Spec.Volumes {
+		volume := pod.Spec.Volumes[i] // 获取Volume
+		if volume.PersistentVolumeClaim == nil { // 如果Volume没有关联PVC，则跳过
+			continue
+		}
+		pvcName := volume.PersistentVolumeClaim.ClaimName // 获取PVC名称
+		if pvcName == "" { // 如果PVC没有名称，则返回错误状态
+			return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, "PersistentVolumeClaim had no name")
+		}
+		pvc, err := pl.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(pvcName) // 获取PVC对象
+		if s := getErrorAsStatus(err); !s.IsSuccess() { // 如果获取PVC对象出错，则返回错误状态
+			return nil, s
+		}
+
+		pvName := pvc.Spec.VolumeName // 获取PVC对应的PV名称
+		if pvName == "" { // 如果PV没有名称，则需要根据PVC的StorageClass信息进行处理
+			scName := storagehelpers.GetPersistentVolumeClaimClass(pvc) // 获取PVC对应的StorageClass名称
+			if len(scName) == 0 { // 如果StorageClass名称为空，则返回错误状态
+				return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, "PersistentVolumeClaim had no pv name and storageClass name")
+			}
+
+			class, err := pl.scLister.Get(scName) // 获取StorageClass对象
+			if s := getErrorAsStatus(err); !s.IsSuccess() { // 如果获取StorageClass对象出错，则返回错误状态
+				return nil, s
+			}
+			if class.VolumeBindingMode == nil { // 如果StorageClass中VolumeBindingMode未设置，则返回错误状态
+				return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("VolumeBindingMode not set for StorageClass %q", scName))
+			}
+			if *class.VolumeBindingMode == storage.VolumeBindingWaitForFirstConsumer { // 如果VolumeBindingMode等于VolumeBindingWaitForFirstConsumer，则跳过未绑定的PV
+				// Skip unbound volumes
+				continue
+			}
+
+			return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, "PersistentVolume had no name") // 如果PV没有名称，则返回错误状态
+		}
+
+		pv, err := pl.pvLister.Get(pvName) // 获取PV对象
+		if s := getErrorAsStatus(err); !s.IsSuccess() { // 如果获取PV对象出错，则返回错误状态
+			return nil, s
+		}
+
+		// 遍历拓扑标签列表，获取PV的拓扑信息，并将其存储到podPVTopologies中
+		for _, key := range topologyLabels {
+			if value, ok := pv.ObjectMeta.Labels[key]; ok { // 如果PV的标签中包含该拓扑标签，则解析其对应的拓扑信息
+				volumeVSet, err := volumehelpers.LabelZonesToSet(value)
+				if err != nil {
+					klog.InfoS("Failed to parse label, ignoring the label", "label", fmt.Sprintf("%s:%s", key, value), "err", err)
+					continue
+				}
+                // 添加拓扑信息
+				podPVTopologies = append(podPVTopologies, pvTopology{
+					pvName: pv.Name,
+					key:    key,
+					values: sets.Set[string](volumeVSet),
+				})
+			}
+		}
+	}
+	return podPVTopologies, nil
+}
+```
+
+##### getErrorAsStatus
+
+````GO
+func getErrorAsStatus(err error) *framework.Status {
+	// 如果 err 不为 nil，说明出现了错误
+	if err != nil {
+		// 如果错误是因为对象未找到，就返回一个特定的 framework.Status 对象
+		if apierrors.IsNotFound(err) {
+			return framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
+		}
+		// 否则，将错误转换为 framework.Status 对象
+		return framework.AsStatus(err)
+	}
+	// 如果 err 为 nil，说明没有出现错误，返回 nil
+	return nil
+}
+````
+
+### Filter
+
+```GO
+// Filter 在 filter 扩展点被调用。
+// 它评估 Pod 是否适合于所请求的卷，考虑到一些卷可能有区域调度约束。要求是任何卷区域标签必须与节点上的等效区域标签匹配。节点具有更多的区域标签约束是可以接受的（例如，一个假想的复制卷可能允许全区域访问）。
+// 目前，此功能仅支持 PersistentVolumeClaims，并且只查看已绑定的 PersistentVolume 上的标签。
+// 在 Pod 规范中声明内联的卷（即不使用 PersistentVolume）可能更难，因为这将需要在调度期间确定卷的区域，这可能需要调用云提供程序。无论如何，似乎我们正在摆脱内联卷声明。
+func (pl *VolumeZone) Filter(ctx context.Context, cs *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	// 如果 Pod 没有任何挂载的卷，则直接返回 nil，即不对该节点进行过滤
+	// 这是为了在该情况下避免进行不必要的计算
+	if len(pod.Spec.Volumes) == 0 {
+		return nil
+	}
+	// 获取 Pod 挂载的 PV（持久化卷）的拓扑信息
+	var podPVTopologies []pvTopology
+	state, err := getStateData(cs)
+	if err != nil {
+		// 如果获取状态数据失败，则回退到计算 PV 列表的方式
+		var status *framework.Status
+		podPVTopologies, status = pl.getPVbyPod(ctx, pod)
+		if !status.IsSuccess() {
+			return status
+		}
+	} else {
+		podPVTopologies = state.podPVTopologies
+	}
+
+	// 获取当前节点对象
+	node := nodeInfo.Node()
+	// 判断当前节点是否有任何拓扑约束（Topology Constraints）
+	hasAnyNodeConstraint := false
+	for _, topologyLabel := range topologyLabels {
+		// 如果节点标签中包含任何一个拓扑约束，则认为节点有拓扑约束
+		if _, ok := node.Labels[topologyLabel]; ok {
+			hasAnyNodeConstraint = true
+			break
+		}
+	}
+
+	// 如果节点没有任何拓扑约束，则直接返回 nil，即不对该节点进行过滤
+	// 这是为了处理单区域（Single Zone）的场景，即节点可能没有任何拓扑标签
+	if !hasAnyNodeConstraint {
+		return nil
+	}
+
+	// 遍历 Pod 挂载的 PV 列表，依次检查节点是否符合拓扑约束要求
+	for _, pvTopology := range podPVTopologies {
+		v, ok := node.Labels[pvTopology.key]
+		// 如果当前节点没有该 PV 所需的拓扑标签，则直接返回不可调度的错误
+		if !ok || !pvTopology.values.Has(v) {
+			klog.V(10).InfoS("Won't schedule pod onto node due to volume (mismatch on label key)", "pod", klog.KObj(pod), "node", klog.KObj(node), "PV", klog.KRef("", pvTopology.pvName), "PVLabelKey", pvTopology.key)
+			return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonConflict)
+		}
+	}
+
+	return nil
+}
+```
+
+#### getStateData
+
+```GO
+func getStateData(cs *framework.CycleState) (*stateData, error) {
+	// 从CycleState中读取key为preFilterStateKey的状态
+	state, err := cs.Read(preFilterStateKey)
+	if err != nil {
+		return nil, err
+	}
+	// 将状态转换为stateData类型，如果转换失败则返回错误
+	s, ok := state.(*stateData)
+	if !ok {
+		return nil, errors.New("unable to convert state into stateData")
+	}
+	// 返回转换后的stateData类型状态
+	return s, nil
+}
+```
+
+### EventsToRegister
+
+```GO
+// 返回一个包含可能导致Pod被调度程序标记为失败的事件列表
+func (pl *VolumeZone) EventsToRegister() []framework.ClusterEvent {
+	// 返回包含四个ClusterEvent类型的切片，这四个事件可能导致Pod被调度程序标记为失败
+	return []framework.ClusterEvent{
+		// 如果有新的storageClass的bind mode为VolumeBindingWaitForFirstConsumer，则Pod可以被调度程序调度
+		// 由于storageClass.volumeBindingMode字段是不可变的，所以忽略storageClass的update事件。
+		{Resource: framework.StorageClass, ActionType: framework.Add},
+		// 如果有新的Node或更新了Node的volume zone标签，则Pod可以被调度程序调度。
+		{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeLabel},
+		// 如果有新的PVC，则Pod可以被调度程序调度。
+		// 由于除了spec.resources之外的所有字段都是不可变的，因此忽略pvc的update事件。
+		{Resource: framework.PersistentVolumeClaim, ActionType: framework.Add},
+		// 如果有新的PV或更新了PV的volume zone标签，则Pod可以被调度程序调度。
+		{Resource: framework.PersistentVolume, ActionType: framework.Add | framework.Update},
+	}
+}
+```
+
