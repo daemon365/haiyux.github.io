@@ -2208,3 +2208,778 @@ func (pl *VolumeZone) EventsToRegister() []framework.ClusterEvent {
 }
 ```
 
+## VolumeBinding
+
+### 作用
+
+Kubernetes (k8s) 调度器 VolumeBinding 插件的作用是在 Pod 调度期间为 Pod 绑定合适的持久卷（Persistent Volume，PV）。
+
+在 Kubernetes 中，持久卷是用于存储 Pod 数据的持久化存储资源。VolumeBinding 插件负责将 Pod 中声明的持久卷声明（Persistent Volume Claim，PVC）与可用的 PV 进行匹配和绑定。
+
+具体来说，VolumeBinding 插件执行以下操作：
+
+1. 监听 Pod 的调度事件：当 Pod 被调度到一个节点上时，VolumeBinding 插件会监听这个事件。
+2. 寻找匹配的 PV：插件会根据 Pod 中 PVC 的要求（例如存储类、大小等）和集群中可用的 PV 的属性，寻找匹配的 PV。
+3. 绑定 PV 和 PVC：一旦找到匹配的 PV，VolumeBinding 插件会将其与 Pod 中的 PVC 进行绑定。这意味着 Pod 可以使用该 PV 来实现持久化存储。
+4. 更新调度决策：在绑定成功后，VolumeBinding 插件会更新调度决策，以确保将 Pod 调度到支持所需 PV 的节点上。
+
+需要注意的是，VolumeBinding 插件通常与动态卷配置（Dynamic Volume Provisioning）结合使用，以便根据需要自动创建新的 PV。这使得在 PVC 和 PV 之间的绑定更加灵活和自动化。
+
+### 结构
+
+```GO
+// VolumeBinding是一个绑定调度中pod卷的插件。
+// 在过滤阶段，为pod创建卷绑定缓存并在Reserve和PreBind阶段使用。
+type VolumeBinding struct {
+    Binder SchedulerVolumeBinder // Binder实现了卷绑定。
+    PVCLister corelisters.PersistentVolumeClaimLister // PVCLister用于获取PersistentVolumeClaim对象的列表。
+    scorer volumeCapacityScorer // scorer是一个函数，用于评分。
+    fts feature.Features // fts是一个结构体，表示Kubernetes集群的特性。
+}
+
+var _ framework.PreFilterPlugin = &VolumeBinding{}
+var _ framework.FilterPlugin = &VolumeBinding{}
+var _ framework.ReservePlugin = &VolumeBinding{}
+var _ framework.PreBindPlugin = &VolumeBinding{}
+var _ framework.ScorePlugin = &VolumeBinding{}
+var _ framework.EnqueueExtensions = &VolumeBinding{}
+
+// Name是插件在注册表和配置中使用的名称。
+const Name = names.VolumeBinding
+
+// Name返回插件的名称，用于记录等。
+func (pl *VolumeBinding) Name() string {
+	return Name
+}
+
+// New初始化一个新的插件并返回它。
+func New(plArgs runtime.Object, fh framework.Handle, fts feature.Features) (framework.Plugin, error) {
+    // 从plArgs中获取VolumeBindingArgs对象，并进行类型检查。
+    args, ok := plArgs.(*config.VolumeBindingArgs)
+    if !ok {
+    	return nil, fmt.Errorf("want args to be of type VolumeBindingArgs, got %T", plArgs)
+    }
+    // 对VolumeBindingArgs对象进行验证。
+    if err := validation.ValidateVolumeBindingArgsWithOptions(nil, args, validation.VolumeBindingArgsValidationOptions{
+    	AllowVolumeCapacityPriority: fts.EnableVolumeCapacityPriority,
+    }); err != nil {
+    return nil, err
+    }
+    // 获取informers和binder。
+    podInformer := fh.SharedInformerFactory().Core().V1().Pods()
+    nodeInformer := fh.SharedInformerFactory().Core().V1().Nodes()
+    pvcInformer := fh.SharedInformerFactory().Core().V1().PersistentVolumeClaims()
+    pvInformer := fh.SharedInformerFactory().Core().V1().PersistentVolumes()
+    storageClassInformer := fh.SharedInformerFactory().Storage().V1().StorageClasses()
+    csiNodeInformer := fh.SharedInformerFactory().Storage().V1().CSINodes()
+    capacityCheck := CapacityCheck{
+        CSIDriverInformer: fh.SharedInformerFactory().Storage().V1().CSIDrivers(),
+        CSIStorageCapacityInformer: fh.SharedInformerFactory().Storage().V1().CSIStorageCapacities(),
+    }
+    binder := NewVolumeBinder(fh.ClientSet(), podInformer, nodeInformer, csiNodeInformer, pvcInformer, pvInformer, storageClassInformer, capacityCheck, time.Duration(args.BindTimeoutSeconds)*time.Second)
+    // 构建评分函数。
+    var scorer volumeCapacityScorer
+    if fts.EnableVolumeCapacityPriority {
+        shape := make(helper.FunctionShape, 0, len(args.Shape))
+        for _, point := range args.Shape {
+            shape = append(shape, helper.FunctionShapePoint{
+                Utilization: int64(point.Utilization),
+                Score:       int64(point.Score) * (framework.MaxNodeScore / config.MaxCustomPriorityScore),
+            })
+        }
+        scorer = buildScorerFunction(shape)
+    }
+	return &VolumeBinding{
+		Binder:    binder,
+		PVCLister: pvcInformer.Lister(),
+		scorer:    scorer,
+		fts:       fts,
+	}, nil
+}
+```
+
+### SchedulerVolumeBinder
+
+```GO
+// SchedulerVolumeBinder由调度器的VolumeBinding插件用于处理PVC/PV的绑定和动态供应。绑定决策与Pod的其他调度要求一起集成到Pod调度工作流中，因此还考虑了PV的节点亲和性。
+
+// 它与现有调度器工作流集成如下：
+// 1. 调度器从调度器队列中取出一个Pod并逐个处理：
+// a. 调用所有的前过滤插件。在此处调用GetPodVolumeClaims()，将保存当前调度周期状态中的Pod卷信息供后续使用。如果Pod有已绑定的立即使用的PVC，则调用GetEligibleNodes()以根据已绑定PV的节点亲和性（如果有）可能减少符合条件的节点列表。
+// b. 调用所有的过滤插件，跨节点并行执行。在此处调用FindPodVolumes()。
+// c. 调用所有的评分插件。未来/待定。
+// d. 选择最佳节点用于Pod。
+// e. 调用所有的预留插件。在此处调用AssumePodVolumes()。
+// i. 如果需要PVC绑定，则仅缓存在内存中：
+// * 对于手动绑定：更新PV对象以预绑定到相应的PVC。
+// * 对于动态供应：更新PVC对象，选择来自c)的一个节点。
+// * 对于Pod，需要进行API更新的PVC和PV。
+// ii. 然后，主调度器将Pod->Node绑定缓存到调度器的Pod缓存中，这是在调度器中处理的，而不是在这里。
+// f. 在单独的goroutine中异步绑定卷和Pod。
+// i. 首先在PreBind阶段调用BindPodVolumes()。它进行所有必要的API更新，并等待PV控制器完全绑定和提供PVC。如果绑定失败，Pod将被发送回调度器。
+// ii. 在BindPodVolumes()完成后，调度器执行最终的Pod->Node绑定。
+// 2. 在e)中完成所有的假设操作后，调度器处理调度器队列中的下一个Pod，同时实际的绑定操作在后台进行。
+type SchedulerVolumeBinder interface {
+    // GetPodVolumeClaims将Pod的PVC分为已绑定的、延迟绑定的未绑定（包括供应）、立即绑定的未绑定（包括预绑定）以及属于延迟绑定的未绑定PVC的存储类PV。
+    GetPodVolumeClaims(pod *v1.Pod) (podVolumeClaims *PodVolumeClaims, err error)
+    // GetEligibleNodes检查Pod的现有已绑定声明，确定节点列表是否可以根据已绑定的声明可能减少为符合条件的节点子集，然后在后续的调度阶段中使用。
+    //
+    // 如果eligibleNodes为'nil'，则表示无法进行这种节点减少，并且应考虑所有节点。
+    GetEligibleNodes(boundClaims []*v1.PersistentVolumeClaim) (eligibleNodes sets.Set[string])
+
+    // FindPodVolumes检查Pod的所有PVC是否可以由节点满足，并返回Pod的卷信息。
+    //
+    // 如果PVC已绑定，则检查PV的节点亲和性是否与节点匹配。
+    // 否则，尝试找到一个可用的PV来绑定到PVC。
+    //
+    // 如果发生错误或节点（当前）对Pod不可用，则返回错误列表。
+    //
+    // 如果启用了CSIStorageCapacity功能，则还会检查仍需要创建的卷的足够存储空间。
+    //
+    // 此函数由调度器的VolumeBinding插件调用，可以并行调用。
+    FindPodVolumes(pod *v1.Pod, podVolumeClaims *PodVolumeClaims, node *v1.Node) (podVolumes *PodVolumes, reasons ConflictReasons, err error)
+
+    // AssumePodVolumes将：
+    // 1. 获取未绑定PVC的PV匹配项，并假设PV预先绑定到PVC，并更新PV缓存。
+    // 2. 获取需要供应的PVC，并更新PVC缓存中的相关注释。
+    //
+    // 如果所有卷都完全绑定，则返回true。
+    //
+    // 此函数按顺序调用。
+    AssumePodVolumes(assumedPod *v1.Pod, nodeName string, podVolumes *PodVolumes) (allFullyBound bool, err error)
+
+    // RevertAssumedPodVolumes将还原假设的PV和PVC缓存。
+    RevertAssumedPodVolumes(podVolumes *PodVolumes)
+
+    // BindPodVolumes将：
+    // 1. 通过API调用启动卷绑定，将PV预绑定到其匹配的PVC。
+    // 2. 通过API调用设置PVC上的相关注释，触发卷供应。
+    // 3. 等待PVC被PV控制器完全绑定。
+    //
+    // 此函数可以并行调用。
+    BindPodVolumes(ctx context.Context, assumedPod *v1.Pod, podVolumes *PodVolumes) error
+}
+```
+
+#### volumeBinder
+
+```GO
+type volumeBinder struct {
+    kubeClient clientset.Interface
+
+    classLister   storagelisters.StorageClassLister
+    podLister     corelisters.PodLister
+    nodeLister    corelisters.NodeLister
+    csiNodeLister storagelisters.CSINodeLister
+
+    pvcCache PVCAssumeCache
+    pvCache  PVAssumeCache
+
+    // 等待绑定操作成功的时间
+    bindTimeout time.Duration
+
+    translator InTreeToCSITranslator
+
+    csiDriverLister          storagelisters.CSIDriverLister
+    csiStorageCapacityLister storagelisters.CSIStorageCapacityLister
+}
+```
+
+##### AssumeCache
+
+```GO
+// AssumeCache 是在 informer 之上构建的缓存，用于更新对象，还可以还原 informer 缓存中的对象。
+// 假设对象是实现了 meta.Interface 的 Kubernetes API 对象。
+type AssumeCache interface {
+    // Assume 仅在内存中更新对象
+    Assume(obj interface{}) error
+    // 还原 informer 缓存中的对象
+    Restore(objName string)
+    // 根据名称获取对象
+    Get(objName string) (interface{}, error)
+    // 根据名称获取 API 对象
+    GetAPIObj(objName string) (interface{}, error)
+    // 列出缓存中的所有对象
+    List(indexObj interface{}) []interface{}
+}
+
+// assumeCache 存储两个指针以表示单个对象：
+// - 指向 informer 对象的指针。
+// - 指向最新对象的指针，可以是与 informer 对象相同的对象，也可以是内存中的对象。
+//
+// informer 更新始终会覆盖最新对象指针。
+//
+// Assume() 只会更新最新对象指针。
+// Restore() 将最新对象指针设置回 informer 对象。
+// Get/List() 总是返回最新对象指针。
+type assumeCache struct {
+    // 用于同步对存储的更新
+    rwMutex sync.RWMutex
+    // 描述存储的对象
+    description string
+    // 存储 objInfo 指针
+    store cache.Indexer
+    // 对象的索引函数
+    indexFunc cache.IndexFunc
+    indexName string
+}
+
+// NewAssumeCache 创建一个通用对象的 assume cache。
+func NewAssumeCache(informer cache.SharedIndexInformer, description, indexName string, indexFunc cache.IndexFunc) AssumeCache {
+    c := &assumeCache{
+    description: description,
+    indexFunc: indexFunc,
+    indexName: indexName,
+    }
+    indexers := cache.Indexers{}
+    if indexName != "" && indexFunc != nil {
+    	indexers[indexName] = c.objInfoIndexFunc
+    }
+    c.store = cache.NewIndexer(objInfoKeyFunc, indexers)
+
+    // 单元测试不使用 informers
+    if informer != nil {
+        informer.AddEventHandler(
+            cache.ResourceEventHandlerFuncs{
+                AddFunc:    c.add,
+                UpdateFunc: c.update,
+                DeleteFunc: c.delete,
+            },
+        )
+    }
+    return c
+}
+
+func (c *assumeCache) add(obj interface{}) {
+    // 如果对象为空，则直接返回
+    if obj == nil {
+    	return
+    }
+    // 获取对象的名称
+    name, err := cache.MetaNamespaceKeyFunc(obj)
+    if err != nil {
+        klog.ErrorS(&errObjectName{err}, "Add failed")
+        return
+    }
+
+    // 加锁以进行并发保护
+    c.rwMutex.Lock()
+    defer c.rwMutex.Unlock()
+
+    // 检查对象是否已存在于缓存中
+    if objInfo, _ := c.getObjInfo(name); objInfo != nil {
+        // 获取新对象和已存储对象的版本号
+        newVersion, err := c.getObjVersion(name, obj)
+        if err != nil {
+            klog.ErrorS(err, "Add failed: couldn't get object version")
+            return
+        }
+
+        storedVersion, err := c.getObjVersion(name, objInfo.latestObj)
+        if err != nil {
+            klog.ErrorS(err, "Add failed: couldn't get stored object version")
+            return
+        }
+
+        // 只有在新版本较新时才更新对象
+        // 这样我们就不会因为 informer 的重新同步而覆盖已假设的对象
+        if newVersion <= storedVersion {
+            klog.V(10).InfoS("Skip adding object to assume cache because version is not newer than storedVersion", "description", c.description, "cacheKey", name, "newVersion", newVersion, "storedVersion", storedVersion)
+            return
+        }
+    }
+
+    // 创建一个新的 objInfo 对象，并更新存储
+    objInfo := &objInfo{name: name, latestObj: obj, apiObj: obj}
+    if err = c.store.Update(objInfo); err != nil {
+        klog.InfoS("Error occurred while updating stored object", "err", err)
+    } else {
+        klog.V(10).InfoS("Adding object to assume cache", "description", c.description, "cacheKey", name, "assumeCache", obj)
+    }
+}
+
+func (c *assumeCache) update(oldObj interface{}, newObj interface{}) {
+    // 调用 add 方法来处理更新的对象
+    c.add(newObj)
+}
+
+func (c *assumeCache) delete(obj interface{}) {
+    // 如果对象为空，则直接返回
+    if obj == nil {
+    	return
+    }
+    // 获取对象的名称
+    name, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+    if err != nil {
+        klog.ErrorS(&errObjectName{err}, "Failed to delete")
+        return
+    }
+
+    // 加锁以进行并发保护
+    c.rwMutex.Lock()
+    defer c.rwMutex.Unlock()
+
+    // 创建一个包含对象名称的 objInfo 对象，并进行删除操作
+    objInfo := &objInfo{name: name}
+    err = c.store.Delete(objInfo)
+    if err != nil {
+        klog.ErrorS(err, "Failed to delete", "description", c.description, "cacheKey", name)
+    }
+}
+
+func (c *assumeCache) getObjVersion(name string, obj interface{}) (int64, error) {
+    // 获取对象的访问器
+    objAccessor, err := meta.Accessor(obj)
+    if err != nil {
+    	return -1, err
+    }
+
+    // 解析对象的资源版本号
+    objResourceVersion, err := strconv.ParseInt(objAccessor.GetResourceVersion(), 10, 64)
+    if err != nil {
+        return -1, fmt.Errorf("error parsing ResourceVersion %q for %v %q: %s", objAccessor.GetResourceVersion(), c.description, name, err)
+    }
+    return objResourceVersion, nil
+}
+
+func (c *assumeCache) getObjInfo(name string) (*objInfo, error) {
+    // 根据对象名称从缓存中获取对象
+    obj, ok, err := c.store.GetByKey(name)
+    if err != nil {
+    	return nil, err
+    }
+    if !ok {
+    	return nil, &errNotFound{c.description, name}
+    }
+
+    // 将获取到的对象转换为 objInfo 类型
+    objInfo, ok := obj.(*objInfo)
+    if !ok {
+        return nil, &errWrongType{"objInfo", obj}
+    }
+    return objInfo, nil
+}
+
+func (c *assumeCache) Get(objName string) (interface{}, error) {
+    // 加读锁以进行并发保护
+    c.rwMutex.RLock()
+    defer c.rwMutex.RUnlock()
+
+    // 获取对象信息
+    objInfo, err := c.getObjInfo(objName)
+    if err != nil {
+        return nil, err
+    }
+    return objInfo.latestObj, nil
+}
+
+func (c *assumeCache) GetAPIObj(objName string) (interface{}, error) {
+    // 加读锁以进行并发保护
+    c.rwMutex.RLock()
+    defer c.rwMutex.RUnlock()
+    // 获取对象信息
+    objInfo, err := c.getObjInfo(objName)
+    if err != nil {
+        return nil, err
+    }
+    return objInfo.apiObj, nil
+}
+
+func (c *assumeCache) List(indexObj interface{}) []interface{} {
+    // 加读锁以进行并发保护
+    c.rwMutex.RLock()
+    defer c.rwMutex.RUnlock()
+
+    // 存储所有对象的切片
+    allObjs := []interface{}{}
+
+    // 通过索引获取匹配的对象
+    objs, err := c.store.Index(c.indexName, &objInfo{latestObj: indexObj})
+    if err != nil {
+        klog.ErrorS(err, "List index error")
+        return nil
+    }
+
+    // 遍历匹配的对象，并将 latestObj 添加到 allObjs 中
+    for _, obj := range objs {
+        objInfo, ok := obj.(*objInfo)
+        if !ok {
+            klog.ErrorS(&errWrongType{"objInfo", obj}, "List error")
+            continue
+        }
+        allObjs = append(allObjs, objInfo.latestObj)
+    }
+    return allObjs
+}
+
+func (c *assumeCache) Assume(obj interface{}) error {
+    // 获取对象的名称和错误
+    name, err := cache.MetaNamespaceKeyFunc(obj)
+    if err != nil {
+    	return &errObjectName{err}
+    }
+    // 加写锁以进行并发保护
+    c.rwMutex.Lock()
+    defer c.rwMutex.Unlock()
+
+    // 获取对象信息
+    objInfo, err := c.getObjInfo(name)
+    if err != nil {
+        return err
+    }
+
+    // 获取对象的版本号
+    newVersion, err := c.getObjVersion(name, obj)
+    if err != nil {
+        return err
+    }
+
+    // 获取存储的对象版本号
+    storedVersion, err := c.getObjVersion(name, objInfo.latestObj)
+    if err != nil {
+        return err
+    }
+
+    // 如果新版本号小于存储的版本号，则表示对象不同步
+    if newVersion < storedVersion {
+        return fmt.Errorf("%v %q is out of sync (stored: %d, assume: %d)", c.description, name, storedVersion, newVersion)
+	}
+
+	// 只更新缓存中的对象
+	objInfo.latestObj = obj
+	klog.V(4).InfoS("Assumed object", "description", c.description, "cacheKey", name, "version", newVersion)
+	return nil
+}
+
+func (c *assumeCache) Restore(objName string) {
+    // 加写锁以进行并发保护
+    c.rwMutex.Lock()
+    defer c.rwMutex.Unlock()
+    // 获取对象信息
+    objInfo, err := c.getObjInfo(objName)
+    if err != nil {
+        // 如果对象已被删除，可能会出现此情况
+        klog.V(5).InfoS("Restore object", "description", c.description, "cacheKey", objName, "err", err)
+	} else {
+        // 将 latestObj 恢复为 apiObj
+		objInfo.latestObj = objInfo.apiObj
+		klog.V(4).InfoS("Restored object", "description", c.description, "cacheKey", objName)
+	}
+}
+
+type objInfo struct {
+    // 对象的名称
+    name string
+    // 最新版本的对象，可以是仅存在于缓存中的对象或来自 informer 的对象
+    latestObj interface{}
+    // 来自 informer 的最新对象
+    apiObj interface{}
+}
+
+func objInfoKeyFunc(obj interface{}) (string, error) {
+    objInfo, ok := obj.(*objInfo)
+    if !ok {
+    	return "", &errWrongType{"objInfo", obj}
+    }
+    return objInfo.name, nil
+}
+
+func (c *assumeCache) objInfoIndexFunc(obj interface{}) ([]string, error) {
+    objInfo, ok := obj.(*objInfo)
+    if !ok {
+    	return []string{""}, &errWrongType{"objInfo", obj}
+    }
+    return c.indexFunc(objInfo.latestObj)
+}
+```
+
+##### pvcAssumeCache
+
+```GO
+// PVCAssumeCache 是用于 PersistentVolumeClaim 对象的 AssumeCache 接口
+type PVCAssumeCache interface {
+	AssumeCache
+	// GetPVC 从缓存中返回具有给定 pvcKey 的 PVC。
+    // pvcKey 是对 PVC 对象的 MetaNamespaceKeyFunc 的结果
+    GetPVC(pvcKey string) (*v1.PersistentVolumeClaim, error)
+    GetAPIPVC(pvcKey string) (*v1.PersistentVolumeClaim, error)
+}
+
+// 定义一个名为 pvcAssumeCache 的结构体类型，该类型包含一个 AssumeCache 类型的成员变量。
+type pvcAssumeCache struct {
+	AssumeCache
+}
+
+// NewPVCAssumeCache 创建一个 PVC assume cache。
+// 该函数接收一个 SharedIndexInformer 对象，并返回一个 PVCAssumeCache 类型的指针。
+// 具体实现是创建一个 pvcAssumeCache 类型的对象，并调用 NewAssumeCache 函数初始化其 AssumeCache 成员变量。
+func NewPVCAssumeCache(informer cache.SharedIndexInformer) PVCAssumeCache {
+	return &pvcAssumeCache{NewAssumeCache(informer, "v1.PersistentVolumeClaim", "", nil)}
+}
+
+func (c *pvcAssumeCache) GetPVC(pvcKey string) (*v1.PersistentVolumeClaim, error) {
+    // 使用结构体类型 pvcAssumeCache 的指针 c 调用其成员函数 Get 并传入参数 pvcKey，将结果保存在变量 obj 中，同时返回错误值 err。
+    obj, err := c.Get(pvcKey)
+    if err != nil {
+    // 如果 Get 函数返回的错误值 err 不为 nil，则直接返回 nil 和 err。
+    	return nil, err
+    }
+
+    // 将变量 obj 转换为类型 v1.PersistentVolumeClaim，并将结果保存在变量 pvc 中。如果转换失败，则返回错误值 &errWrongType{"v1.PersistentVolumeClaim", obj}。
+    pvc, ok := obj.(*v1.PersistentVolumeClaim)
+    if !ok {
+    	return nil, &errWrongType{"v1.PersistentVolumeClaim", obj}
+    }
+    // 返回转换成功的 pvc 和 nil。
+    return pvc, nil
+}
+
+// 方法 GetAPIPVC 与 GetPVC 类似，但使用的是 c.GetAPIObj 函数，其它部分相同。
+func (c *pvcAssumeCache) GetAPIPVC(pvcKey string) (*v1.PersistentVolumeClaim, error) {
+    obj, err := c.GetAPIObj(pvcKey)
+    if err != nil {
+    	return nil, err
+    }
+    pvc, ok := obj.(*v1.PersistentVolumeClaim)
+    if !ok {
+    	return nil, &errWrongType{"v1.PersistentVolumeClaim", obj}
+    }
+    return pvc, nil
+}
+```
+
+##### PVAssumeCache
+
+```go
+// PVAssumeCache is a AssumeCache for PersistentVolume objects
+type PVAssumeCache interface {
+	AssumeCache
+
+	GetPV(pvName string) (*v1.PersistentVolume, error)
+	GetAPIPV(pvName string) (*v1.PersistentVolume, error)
+	ListPVs(storageClassName string) []*v1.PersistentVolume
+}
+
+type pvAssumeCache struct {
+	AssumeCache
+}
+
+func pvStorageClassIndexFunc(obj interface{}) ([]string, error) {
+	if pv, ok := obj.(*v1.PersistentVolume); ok {
+		return []string{storagehelpers.GetPersistentVolumeClass(pv)}, nil
+	}
+	return []string{""}, fmt.Errorf("object is not a v1.PersistentVolume: %v", obj)
+}
+
+// NewPVAssumeCache creates a PV assume cache.
+func NewPVAssumeCache(informer cache.SharedIndexInformer) PVAssumeCache {
+	return &pvAssumeCache{NewAssumeCache(informer, "v1.PersistentVolume", "storageclass", pvStorageClassIndexFunc)}
+}
+
+func (c *pvAssumeCache) GetPV(pvName string) (*v1.PersistentVolume, error) {
+	// 调用 `c.Get` 方法获取 `pvName` 对应的对象及错误
+	obj, err := c.Get(pvName)
+	if err != nil {
+		return nil, err
+	}
+
+	// 将获取到的对象转换成 `*v1.PersistentVolume` 类型
+	pv, ok := obj.(*v1.PersistentVolume)
+	if !ok {
+		return nil, &errWrongType{"v1.PersistentVolume", obj}
+	}
+	// 返回获取到的 `*v1.PersistentVolume` 类型的对象及错误
+	return pv, nil
+}
+
+func (c *pvAssumeCache) GetAPIPV(pvName string) (*v1.PersistentVolume, error) {
+	// 调用 `c.GetAPIObj` 方法获取 `pvName` 对应的 API 对象及错误
+	obj, err := c.GetAPIObj(pvName)
+	if err != nil {
+		return nil, err
+	}
+	// 将获取到的 API 对象转换成 `*v1.PersistentVolume` 类型
+	pv, ok := obj.(*v1.PersistentVolume)
+	if !ok {
+		return nil, &errWrongType{"v1.PersistentVolume", obj}
+	}
+	// 返回获取到的 `*v1.PersistentVolume` 类型的对象及错误
+	return pv, nil
+}
+
+func (c *pvAssumeCache) ListPVs(storageClassName string) []*v1.PersistentVolume {
+	// 构造一个 `*v1.PersistentVolume` 类型的对象，用来过滤符合条件的持久卷
+	objs := c.List(&v1.PersistentVolume{
+		Spec: v1.PersistentVolumeSpec{
+			StorageClassName: storageClassName,
+		},
+	})
+	// 创建一个空的 `[]*v1.PersistentVolume` 类型的切片，用来存储符合条件的持久卷
+	pvs := []*v1.PersistentVolume{}
+	// 遍历过滤后的对象列表，将符合条件的对象添加到 `pvs` 切片中
+	for _, obj := range objs {
+		pv, ok := obj.(*v1.PersistentVolume)
+		if !ok {
+            // 如果获取到的对象不是 PersistentVolume
+			klog.ErrorS(&errWrongType{"v1.PersistentVolume", obj}, "ListPVs")
+			continue
+		}
+		pvs = append(pvs, pv)
+	}
+	return pvs
+}
+```
+
+#### NewVolumeBinder
+
+```GO
+// NewVolumeBinder设置所有为调度器做出卷绑定决策所需的缓存。
+//
+// capacityCheck确定如何检查存储容量（CSIStorageCapacity功能）。
+func NewVolumeBinder(
+    kubeClient clientset.Interface,
+    podInformer coreinformers.PodInformer,
+    nodeInformer coreinformers.NodeInformer,
+    csiNodeInformer storageinformers.CSINodeInformer,
+    pvcInformer coreinformers.PersistentVolumeClaimInformer,
+    pvInformer coreinformers.PersistentVolumeInformer,
+    storageClassInformer storageinformers.StorageClassInformer,
+    capacityCheck CapacityCheck,
+    bindTimeout time.Duration) SchedulerVolumeBinder {
+    b := &volumeBinder{
+        kubeClient: kubeClient,
+        podLister: podInformer.Lister(),
+        classLister: storageClassInformer.Lister(),
+        nodeLister: nodeInformer.Lister(),
+        csiNodeLister: csiNodeInformer.Lister(),
+        pvcCache: NewPVCAssumeCache(pvcInformer.Informer()),
+        pvCache: NewPVAssumeCache(pvInformer.Informer()),
+        bindTimeout: bindTimeout,
+        translator: csitrans.New(),
+	}
+    b.csiDriverLister = capacityCheck.CSIDriverInformer.Lister()
+	b.csiStorageCapacityLister = capacityCheck.CSIStorageCapacityInformer.Lister()
+
+	return b
+}
+```
+
+
+
+
+
+### PreFilter&PreFilterExtensions
+
+```GO
+// PreFilter在预过滤扩展点调用，用于检查是否所有立即使用的PVC都已绑定。如果不是所有立即使用的PVC都已绑定，则返回UnschedulableAndUnresolvable。
+func (pl *VolumeBinding) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+    // 如果pod没有引用任何PVC，我们不需要做任何处理。
+    if hasPVC, err := pl.podHasPVCs(pod); err != nil {
+    	return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
+    } else if !hasPVC {
+        state.Write(stateKey, &stateData{})
+        return nil, framework.NewStatus(framework.Skip)
+    }
+    // 获取pod的卷声明。
+    podVolumeClaims, err := pl.Binder.GetPodVolumeClaims(pod)
+    if err != nil {
+    	return nil, framework.AsStatus(err)
+    }
+    if len(podVolumeClaims.unboundClaimsImmediate) > 0 {
+        // 如果立即使用的声明未绑定，则返回UnschedulableAndUnresolvable错误。这些声明在PV控制器绑定后，将将Pod移至活动/退避队列。
+        status := framework.NewStatus(framework.UnschedulableAndUnresolvable)
+        status.AppendReason("pod has unbound immediate PersistentVolumeClaims")
+        return nil, status
+    }
+    // 如果pod有绑定的声明，则尝试减少后续调度阶段要考虑的节点数量。
+    var result *framework.PreFilterResult
+    if eligibleNodes := pl.Binder.GetEligibleNodes(podVolumeClaims.boundClaims); eligibleNodes != nil {
+            result = &framework.PreFilterResult{
+            NodeNames: eligibleNodes,
+    	}
+    }
+    state.Write(stateKey, &stateData{
+        podVolumesByNode: make(map[string]*PodVolumes),
+        podVolumeClaims: &PodVolumeClaims{
+            boundClaims:                podVolumeClaims.boundClaims,
+            unboundClaimsDelayBinding:  podVolumeClaims.unboundClaimsDelayBinding,
+            unboundVolumesDelayBinding: podVolumeClaims.unboundVolumesDelayBinding,
+        },
+	})
+	return result, nil
+}
+
+func (pl *VolumeBinding) PreFilterExtensions() framework.PreFilterExtensions {
+	return nil
+}
+```
+
+#### podHasPVCs
+
+```GO
+// podHasPVCs 函数返回 2 个值：
+// - 第一个值用于表示给定的 “pod” 是否定义了任何 PVC。
+// - 第二个值用于返回任何错误，如果请求的 PVC 不合法。
+func (pl *VolumeBinding) podHasPVCs(pod *v1.Pod) (bool, error) {
+    hasPVC := false // 初始化变量 hasPVC 为 false
+    for _, vol := range pod.Spec.Volumes { // 遍历 Pod 的 Volumes
+        var pvcName string
+        isEphemeral := false
+        switch {
+            case vol.PersistentVolumeClaim != nil: // 如果 Volume 是使用了 PersistentVolumeClaim
+                pvcName = vol.PersistentVolumeClaim.ClaimName // 获取 PVC 的名称
+            case vol.Ephemeral != nil: // 如果 Volume 是使用了 EphemeralVolumeSource
+                pvcName = ephemeral.VolumeClaimName(pod, &vol) // 获取 Ephemeral VolumeClaim 的名称
+                isEphemeral = true
+            default:
+                // Volume 不使用 PVC，忽略
+                continue
+        }
+        hasPVC = true // 标记 Pod 中有 PVC
+        pvc, err := pl.PVCLister.PersistentVolumeClaims(pod.Namespace).Get(pvcName) // 获取 PVC 对象
+        if err != nil {
+            // 错误通常已经有足够的上下文信息（"persistentvolumeclaim "myclaim" not found"），
+            // 但对于普通的临时内联卷，在创建 Pod 后直接出现这种情况是正常的，
+            // 因此我们可以做得更好。
+            if isEphemeral && apierrors.IsNotFound(err) {
+                err = fmt.Errorf("waiting for ephemeral volume controller to create the persistentvolumeclaim %q", pvcName)
+            }
+            return hasPVC, err // 返回错误
+        }
+
+        if pvc.Status.Phase == v1.ClaimLost {  // 如果 PVC 的状态为 ClaimLost
+            return hasPVC, fmt.Errorf("persistentvolumeclaim %q bound to non-existent persistentvolume %q", pvc.Name, pvc.Spec.VolumeName)  // 返回错误
+        }
+
+        if pvc.DeletionTimestamp != nil {  // 如果 PVC 被删除
+            return hasPVC, fmt.Errorf("persistentvolumeclaim %q is being deleted", pvc.Name)  // 返回错误
+        }
+
+        if isEphemeral {  // 如果是临时内联卷
+            if err := ephemeral.VolumeIsForPod(pod, pvc); err != nil {  // 判断该 PVC 是否属于该 Pod
+                return hasPVC, err  // 返回错误
+            }
+        }
+    }
+	return hasPVC, nil  // 返回是否存在 PVC 和错误信息（没有错误时为 nil）
+}
+```
+
+#### stateData
+
+```GO
+// 状态在PreFilter阶段初始化。因为我们将指针保存在framework.CycleState中，在后续阶段中不需要调用Write方法来更新值。
+type stateData struct {
+    allBound bool
+    // podVolumesByNode保存在过滤阶段为每个节点找到的Pod的卷信息
+    // 它在PreFilter阶段进行初始化
+    podVolumesByNode map[string]*PodVolumes
+    podVolumeClaims *PodVolumeClaims
+    sync.Mutex
+}
+
+func (d *stateData) Clone() framework.StateData {
+	return d
+}
+```
+
