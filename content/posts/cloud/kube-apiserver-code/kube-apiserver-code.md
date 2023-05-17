@@ -1799,3 +1799,609 @@ ctx := req.Context()
 }
 ```
 
+### CreateKubeAPIServer
+
+```go
+func CreateKubeAPIServer(kubeAPIServerConfig *controlplane.Config, delegateAPIServer genericapiserver.DelegationTarget) (*controlplane.Instance, error) {
+	return kubeAPIServerConfig.Complete().New(delegateAPIServer)
+}
+
+// New 方法根据给定的配置返回一个 Master 实例。
+// 如果未设置某些配置字段，则会设置为默认值。
+// 必须指定某些配置字段，包括：KubeletClientConfig。
+func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*Instance, error) {
+    if reflect.DeepEqual(c.ExtraConfig.KubeletClientConfig, kubeletclient.KubeletClientConfig{}) {
+    	return nil, fmt.Errorf("Master.New() called with empty config.KubeletClientConfig")
+    }
+    // 调用 GenericConfig 的 New 方法创建 GenericAPIServer 实例
+    s, err := c.GenericConfig.New("kube-apiserver", delegationTarget)
+    if err != nil {
+        return nil, err
+    }
+
+    if c.ExtraConfig.EnableLogsSupport {
+        routes.Logs{}.Install(s.Handler.GoRestfulContainer)
+    }
+
+    // 创建 serviceaccount.OpenIDMetadata 实例
+    md, err := serviceaccount.NewOpenIDMetadata(
+        c.ExtraConfig.ServiceAccountIssuerURL,
+        c.ExtraConfig.ServiceAccountJWKSURI,
+        c.GenericConfig.ExternalAddress,
+        c.ExtraConfig.ServiceAccountPublicKeys,
+    )
+    if err != nil {
+        // 如果发生错误，则跳过安装 endpoints 并记录错误日志，但继续执行。
+        // 不返回错误是因为 metadata 响应需要对命令行选项进行附加的、不兼容的验证。
+        msg := fmt.Sprintf("Could not construct pre-rendered responses for"+
+            " ServiceAccountIssuerDiscovery endpoints. Endpoints will not be"+
+            " enabled. Error: %v", err)
+        if c.ExtraConfig.ServiceAccountIssuerURL != "" {
+            // 如果用户期望启用该功能，则记录错误日志
+            klog.Error(msg)
+        } else {
+            // 如果用户未设置 ServiceAccountIssuerURL，则记录信息日志
+            klog.Info(msg)
+        }
+    } else {
+        // 安装 OpenIDMetadataServer
+        routes.NewOpenIDMetadataServer(md.ConfigJSON, md.PublicKeysetJSON).
+            Install(s.Handler.GoRestfulContainer)
+    }
+
+    // 创建 Instance 实例
+    m := &Instance{
+        GenericAPIServer:          s,
+        ClusterAuthenticationInfo: c.ExtraConfig.ClusterAuthenticationInfo,
+    }
+
+    // 安装传统的 REST 存储
+    if err := m.InstallLegacyAPI(&c, c.GenericConfig.RESTOptionsGetter); err != nil {
+        return nil, err
+    }
+
+    clientset, err := kubernetes.NewForConfig(c.GenericConfig.LoopbackClientConfig)
+    if err != nil {
+        return nil, err
+    }
+
+    // 获取 admissionregistration 的 discovery client
+    discoveryClientForAdmissionRegistration := clientset.Discovery()
+
+    // 定义 REST 存储提供程序的顺序
+    restStorageProviders := []RESTStorageProvider{
+        apiserverinternalrest.StorageProvider{},
+        authenticationrest.RESTStorageProvider{Authenticator: c.GenericConfig.Authentication.Authenticator, APIAudiences: c.GenericConfig.Authentication.APIAudiences},
+        authorizationrest.RESTStorageProvider{Authorizer: c.GenericConfig.Authorization.Authorizer, RuleResolver: c.GenericConfig.RuleResolver},
+        autoscalingrest.RESTStorageProvider{},
+        batchrest.RESTStorageProvider{},
+        certificatesrest.RESTStorageProvider{},
+        coordinationrest.RESTStorageProvider{},
+        discoveryrest.StorageProvider{},
+        networkingrest.RESTStorageProvider{},
+		noderest.RESTStorageProvider{},
+		policyrest.RESTStorageProvider{},
+		rbacrest.RESTStorageProvider{Authorizer: c.GenericConfig.Authorization.Authorizer},
+		schedulingrest.RESTStorageProvider{},
+		storagerest.RESTStorageProvider{},
+		flowcontrolrest.RESTStorageProvider{InformerFactory: c.GenericConfig.SharedInformerFactory},
+		// 将 apps 放在 extensions 之后，以便传统客户端解析共享资源名称的扩展版本。
+		// See https://github.com/kubernetes/kubernetes/issues/42392
+		appsrest.StorageProvider{},
+		admissionregistrationrest.RESTStorageProvider{Authorizer: c.GenericConfig.Authorization.Authorizer, DiscoveryClient: discoveryClientForAdmissionRegistration},
+		eventsrest.RESTStorageProvider{TTL: c.ExtraConfig.EventTTL},
+		resourcerest.RESTStorageProvider{},
+	}
+    // 安装 API
+    if err := m.InstallAPIs(c.ExtraConfig.APIResourceConfigSource, c.GenericConfig.RESTOptionsGetter, restStorageProviders...); err != nil {
+        return nil, err
+    }
+
+    // 添加启动后的钩子函数 start-cluster-authentication-info-controller
+    m.GenericAPIServer.AddPostStartHookOrDie("start-cluster-authentication-info-controller", func(hookContext genericapiserver.PostStartHookContext) error {
+        kubeClient, err := kubernetes.NewForConfig(hookContext.LoopbackClientConfig)
+        if err != nil {
+            return err
+        }
+        controller := clusterauthenticationtrust.NewClusterAuthenticationTrustController(m.ClusterAuthenticationInfo, kubeClient)
+
+        // 从 stopCh 创建上下文，以避免修改依赖于 apiserver 的文件。
+        // TODO: 看看是否可以将 ctx 传递给当前方法。
+        ctx := wait.ContextForChannel(hookContext.StopCh)
+
+        // 设置初始值并启动监听器
+        if m.ClusterAuthenticationInfo.ClientCA != nil {
+            m.ClusterAuthenticationInfo.ClientCA.AddListener(controller)
+            if controller, ok := m.ClusterAuthenticationInfo.ClientCA.(dynamiccertificates.ControllerRunner); ok {
+                // 运行一次以确保我们有一个值。
+                if err := controller.RunOnce(ctx); err != nil {
+                    runtime.HandleError(err)
+                }
+                go controller.Run(ctx, 1)
+            }
+        }
+        if m.ClusterAuthenticationInfo.RequestHeaderCA != nil {
+            m.ClusterAuthenticationInfo.RequestHeaderCA.AddListener(controller)
+            if controller, ok := m.ClusterAuthenticationInfo.RequestHeaderCA.(dynamiccertificates.ControllerRunner); ok {
+                // 运行一次以确保我们有一个值。
+                if err := controller.RunOnce(ctx); err != nil {
+                    runtime.HandleError(err)
+                }
+                go controller.Run(ctx, 1)
+            }
+        }
+
+        go controller.Run(ctx, 1)
+        return nil
+    })
+
+    // 如果启用了 APIServerIdentity 特性，则添加启动后的钩子函数 start-kube-apiserver-identity-lease-controller
+    if utilfeature.DefaultFeatureGate.Enabled(apiserverfeatures.APIServerIdentity) {
+        m.GenericAPIServer.AddPostStartHookOrDie("start-kube-apiserver-identity-lease-controller", func(hookContext genericapiserver.PostStartHookContext) error {
+            kubeClient, err := kubernetes.NewForConfig(hookContext.LoopbackClientConfig)
+            if err != nil {
+                return err
+			}
+			
+            // 从 stopCh 创建上下文，以避免修改依赖于 apiserver 的文件。
+            // TODO: 看看是否可以将 ctx 传递给当前方法
+            ctx := wait.ContextForChannel(hookContext.StopCh)
+
+            leaseName := m.GenericAPIServer.APIServerID
+            holderIdentity := m.GenericAPIServer.APIServerID + "_" + string(uuid.NewUUID())
+
+            controller := lease.NewController(
+                clock.RealClock{},
+                kubeClient,
+                holderIdentity,
+                int32(IdentityLeaseDurationSeconds),
+                nil,
+                IdentityLeaseRenewIntervalPeriod,
+                leaseName,
+                metav1.NamespaceSystem,
+                // TODO: 在将后启动钩子移动到通用 apiserver 时，接收身份标签值作为参数
+                labelAPIServerHeartbeatFunc(KubeAPIServer))
+            go controller.Run(ctx)
+            return nil
+        })
+        // 为了兼容性，在一段时间内同时垃圾回收具有两个标签的租约，其中一个是 k8s.io/component=kube-apiserver，另一个是 apiserver.kubernetes.io/identity=kube-apiserver。
+        // TODO: 在 Kubernetes 1.28 中移除
+        m.GenericAPIServer.AddPostStartHookOrDie("start-deprecated-kube-apiserver-identity-lease-garbage-collector", func(hookContext genericapiserver.PostStartHookContext) error {
+            kubeClient, err := kubernetes.NewForConfig(hookContext.LoopbackClientConfig)
+            if err != nil {
+                return err
+            }
+            go apiserverleasegc.NewAPIServerLeaseGC(
+                kubeClient,
+                IdentityLeaseGCPeriod,
+                metav1.NamespaceSystem,
+                DeprecatedKubeAPIServerIdentityLeaseLabelSelector,
+            ).Run(hookContext.StopCh)
+            return nil
+        })
+        // TODO: 将其移动到通用 apiserver 中，并使租约标识值可配置
+        m.GenericAPIServer.AddPostStartHookOrDie("start-kube-apiserver-identity-lease-garbage-collector", func(hookContext genericapiserver.PostStartHookContext) error {
+            kubeClient, err := kubernetes.NewForConfig(hookContext.LoopbackClientConfig)
+            if err != nil {
+                return err
+            }
+            go apiserverleasegc.NewAPIServerLeaseGC(
+                kubeClient,
+                IdentityLeaseGCPeriod,
+                metav1.NamespaceSystem,
+                KubeAPIServerIdentityLeaseLabelSelector,
+            ).Run(hookContext.StopCh)
+            return nil
+        })
+    }
+	// 添加启动后的钩子函数 start-legacy-token-tracking-controller
+    m.GenericAPIServer.AddPostStartHookOrDie("start-legacy-token-tracking-controller", func(hookContext genericapiserver.PostStartHookContext) error {
+        kubeClient, err := kubernetes.NewForConfig(hookContext.LoopbackClientConfig)
+        if err != nil {
+            return err
+        }
+        go legacytokentracking.NewController(kubeClient).Run(hookContext.StopCh)
+        return nil
+    })
+
+    return m, nil
+}
+```
+
+#### InstallLegacyAPI
+
+```go
+// InstallLegacyAPI函数将为restStorageProviders安装遗留API（如果启用）。
+func (m *Instance) InstallLegacyAPI(c *completedConfig, restOptionsGetter generic.RESTOptionsGetter) error {
+    // 创建LegacyRESTStorageProvider实例，传入相关配置参数。
+    legacyRESTStorageProvider := corerest.LegacyRESTStorageProvider{
+    StorageFactory: c.ExtraConfig.StorageFactory, // 存储工厂对象
+    ProxyTransport: c.ExtraConfig.ProxyTransport, // 代理传输对象
+    KubeletClientConfig: c.ExtraConfig.KubeletClientConfig, // Kubelet客户端配置对象
+    EventTTL: c.ExtraConfig.EventTTL, // 事件TTL（生存时间）
+    ServiceIPRange: c.ExtraConfig.ServiceIPRange, // 服务IP地址范围
+    SecondaryServiceIPRange: c.ExtraConfig.SecondaryServiceIPRange, // 次要服务IP地址范围
+    ServiceNodePortRange: c.ExtraConfig.ServiceNodePortRange, // 服务节点端口范围
+    LoopbackClientConfig: c.GenericConfig.LoopbackClientConfig, // 回环客户端配置对象
+    ServiceAccountIssuer: c.ExtraConfig.ServiceAccountIssuer, // 服务账户发行方
+    ExtendExpiration: c.ExtraConfig.ExtendExpiration, // 是否扩展过期时间
+    ServiceAccountMaxExpiration: c.ExtraConfig.ServiceAccountMaxExpiration, // 服务账户最大过期时间
+    APIAudiences: c.GenericConfig.Authentication.APIAudiences, // API观众
+    Informers: c.ExtraConfig.VersionedInformers, // 告知器
+    }
+    // 创建遗留REST存储对象，获取API组信息和错误
+    legacyRESTStorage, apiGroupInfo, err := legacyRESTStorageProvider.NewLegacyRESTStorage(c.ExtraConfig.APIResourceConfigSource, restOptionsGetter)
+    if err != nil {
+    	return fmt.Errorf("error building core storage: %v", err) // 返回构建核心存储错误信息
+    }
+    if len(apiGroupInfo.VersionedResourcesStorageMap) == 0 { // 如果所有核心存储都被禁用，则返回
+    	return nil
+    }
+    // 定义控制器名称和客户端对象
+    controllerName := "bootstrap-controller"
+    client := kubernetes.NewForConfigOrDie(c.GenericConfig.LoopbackClientConfig)
+    // Kubernetes集群包含以下系统名称空间：kube-system，kube-node-lease，kube-public，default
+    // 在系统名称空间控制器中，新建控制器对象，传入客户端和版本化的名称空间告知器，然后在后台运行该控制器
+    m.GenericAPIServer.AddPostStartHookOrDie("start-system-namespaces-controller", func(hookContext genericapiserver.PostStartHookContext) error {
+        go systemnamespaces.NewController(client, c.ExtraConfig.VersionedInformers.Core().V1().Namespaces()).Run(hookContext.StopCh)
+        return nil
+    })
+
+    // 创建引导控制器对象，传入遗留REST存储和客户端对象
+    bootstrapController, err := c.NewBootstrapController(legacyRESTStorage, client)
+    if err != nil {
+        return fmt.Errorf("error creating bootstrap controller: %v", err) // 返回创建引导控制器错误信息
+    }
+    // 将引导控制器的PostStartHook和PreShutdownHook添加到GenericAPIServer的钩子列表中
+    m.GenericAPIServer.AddPostStartHookOrDie(controllerName, bootstrapController.PostStartHook)
+    m.GenericAPIServer.AddPreShutdownHookOrDie(controllerName, bootstrapController.PreShutdownHook)
+	// 安装遗留API组，传入默认的遗留API前缀和API组信息
+    if err := m.GenericAPIServer.InstallLegacyAPIGroup(genericapiserver.DefaultLegacyAPIPrefix, &apiGroupInfo); err != nil {
+        return fmt.Errorf("error in registering group versions: %v", err) // 返回注册组版本错误信息
+    }
+    return nil
+}
+```
+
+##### NewLegacyRESTStorage
+
+```go
+func (c LegacyRESTStorageProvider) NewLegacyRESTStorage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (LegacyRESTStorage, genericapiserver.APIGroupInfo, error) {
+	apiGroupInfo := genericapiserver.APIGroupInfo{
+		PrioritizedVersions:          legacyscheme.Scheme.PrioritizedVersionsForGroup(""),
+		VersionedResourcesStorageMap: map[string]map[string]rest.Storage{},
+		Scheme:                       legacyscheme.Scheme,
+		ParameterCodec:               legacyscheme.ParameterCodec,
+		NegotiatedSerializer:         legacyscheme.Codecs,
+	}
+
+	podDisruptionClient, err := policyclient.NewForConfig(c.LoopbackClientConfig)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+	restStorage := LegacyRESTStorage{}
+
+	podTemplateStorage, err := podtemplatestore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	eventStorage, err := eventstore.NewREST(restOptionsGetter, uint64(c.EventTTL.Seconds()))
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+	limitRangeStorage, err := limitrangestore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	resourceQuotaStorage, resourceQuotaStatusStorage, err := resourcequotastore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+	secretStorage, err := secretstore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+	persistentVolumeStorage, persistentVolumeStatusStorage, err := pvstore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+	persistentVolumeClaimStorage, persistentVolumeClaimStatusStorage, err := pvcstore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+	configMapStorage, err := configmapstore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	namespaceStorage, namespaceStatusStorage, namespaceFinalizeStorage, err := namespacestore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	endpointsStorage, err := endpointsstore.NewREST(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	nodeStorage, err := nodestore.NewStorage(restOptionsGetter, c.KubeletClientConfig, c.ProxyTransport)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	podStorage, err := podstore.NewStorage(
+		restOptionsGetter,
+		nodeStorage.KubeletConnectionInfo,
+		c.ProxyTransport,
+		podDisruptionClient,
+	)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	var serviceAccountStorage *serviceaccountstore.REST
+	if c.ServiceAccountIssuer != nil {
+		serviceAccountStorage, err = serviceaccountstore.NewREST(restOptionsGetter, c.ServiceAccountIssuer, c.APIAudiences, c.ServiceAccountMaxExpiration, podStorage.Pod.Store, secretStorage.Store, c.ExtendExpiration)
+	} else {
+		serviceAccountStorage, err = serviceaccountstore.NewREST(restOptionsGetter, nil, nil, 0, nil, nil, false)
+	}
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	var serviceClusterIPRegistry rangeallocation.RangeRegistry
+	serviceClusterIPRange := c.ServiceIPRange
+	if serviceClusterIPRange.IP == nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, fmt.Errorf("service clusterIPRange is missing")
+	}
+
+	serviceStorageConfig, err := c.StorageFactory.NewConfig(api.Resource("services"))
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+	var serviceClusterIPAllocator, secondaryServiceClusterIPAllocator ipallocator.Interface
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRServiceAllocator) {
+		serviceClusterIPAllocator, err = ipallocator.New(&serviceClusterIPRange, func(max int, rangeSpec string, offset int) (allocator.Interface, error) {
+			var mem allocator.Snapshottable
+			mem = allocator.NewAllocationMapWithOffset(max, rangeSpec, offset)
+			// TODO etcdallocator package to return a storage interface via the storageFactory
+			etcd, err := serviceallocator.NewEtcd(mem, "/ranges/serviceips", serviceStorageConfig.ForResource(api.Resource("serviceipallocations")))
+			if err != nil {
+				return nil, err
+			}
+			serviceClusterIPRegistry = etcd
+			return etcd, nil
+		})
+		if err != nil {
+			return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, fmt.Errorf("cannot create cluster IP allocator: %v", err)
+		}
+	} else {
+		networkingv1alphaClient, err := networkingv1alpha1client.NewForConfig(c.LoopbackClientConfig)
+		if err != nil {
+			return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+		}
+		serviceClusterIPAllocator, err = ipallocator.NewIPAllocator(&serviceClusterIPRange, networkingv1alphaClient, c.Informers.Networking().V1alpha1().IPAddresses())
+		if err != nil {
+			return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, fmt.Errorf("cannot create cluster IP allocator: %v", err)
+		}
+	}
+
+	serviceClusterIPAllocator.EnableMetrics()
+	restStorage.ServiceClusterIPAllocator = serviceClusterIPRegistry
+
+	// allocator for secondary service ip range
+	if c.SecondaryServiceIPRange.IP != nil {
+		var secondaryServiceClusterIPRegistry rangeallocation.RangeRegistry
+		if !utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRServiceAllocator) {
+			secondaryServiceClusterIPAllocator, err = ipallocator.New(&c.SecondaryServiceIPRange, func(max int, rangeSpec string, offset int) (allocator.Interface, error) {
+				var mem allocator.Snapshottable
+				mem = allocator.NewAllocationMapWithOffset(max, rangeSpec, offset)
+				// TODO etcdallocator package to return a storage interface via the storageFactory
+				etcd, err := serviceallocator.NewEtcd(mem, "/ranges/secondaryserviceips", serviceStorageConfig.ForResource(api.Resource("serviceipallocations")))
+				if err != nil {
+					return nil, err
+				}
+				secondaryServiceClusterIPRegistry = etcd
+				return etcd, nil
+			})
+			if err != nil {
+				return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, fmt.Errorf("cannot create cluster secondary IP allocator: %v", err)
+			}
+		} else {
+			networkingv1alphaClient, err := networkingv1alpha1client.NewForConfig(c.LoopbackClientConfig)
+			if err != nil {
+				return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+			}
+			secondaryServiceClusterIPAllocator, err = ipallocator.NewIPAllocator(&c.SecondaryServiceIPRange, networkingv1alphaClient, c.Informers.Networking().V1alpha1().IPAddresses())
+			if err != nil {
+				return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, fmt.Errorf("cannot create cluster secondary IP allocator: %v", err)
+			}
+		}
+		secondaryServiceClusterIPAllocator.EnableMetrics()
+		restStorage.SecondaryServiceClusterIPAllocator = secondaryServiceClusterIPRegistry
+	}
+
+	var serviceNodePortRegistry rangeallocation.RangeRegistry
+	serviceNodePortAllocator, err := portallocator.New(c.ServiceNodePortRange, func(max int, rangeSpec string, offset int) (allocator.Interface, error) {
+		mem := allocator.NewAllocationMapWithOffset(max, rangeSpec, offset)
+		// TODO etcdallocator package to return a storage interface via the storageFactory
+		etcd, err := serviceallocator.NewEtcd(mem, "/ranges/servicenodeports", serviceStorageConfig.ForResource(api.Resource("servicenodeportallocations")))
+		if err != nil {
+			return nil, err
+		}
+		serviceNodePortRegistry = etcd
+		return etcd, nil
+	})
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, fmt.Errorf("cannot create cluster port allocator: %v", err)
+	}
+	serviceNodePortAllocator.EnableMetrics()
+	restStorage.ServiceNodePortAllocator = serviceNodePortRegistry
+
+	controllerStorage, err := controllerstore.NewStorage(restOptionsGetter)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	serviceIPAllocators := map[api.IPFamily]ipallocator.Interface{
+		serviceClusterIPAllocator.IPFamily(): serviceClusterIPAllocator,
+	}
+	if secondaryServiceClusterIPAllocator != nil {
+		serviceIPAllocators[secondaryServiceClusterIPAllocator.IPFamily()] = secondaryServiceClusterIPAllocator
+	}
+
+	serviceRESTStorage, serviceStatusStorage, serviceRESTProxy, err := servicestore.NewREST(
+		restOptionsGetter,
+		serviceClusterIPAllocator.IPFamily(),
+		serviceIPAllocators,
+		serviceNodePortAllocator,
+		endpointsStorage,
+		podStorage.Pod,
+		c.ProxyTransport)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	storage := map[string]rest.Storage{}
+	if resource := "pods"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = podStorage.Pod
+		storage[resource+"/attach"] = podStorage.Attach
+		storage[resource+"/status"] = podStorage.Status
+		storage[resource+"/log"] = podStorage.Log
+		storage[resource+"/exec"] = podStorage.Exec
+		storage[resource+"/portforward"] = podStorage.PortForward
+		storage[resource+"/proxy"] = podStorage.Proxy
+		storage[resource+"/binding"] = podStorage.Binding
+		if podStorage.Eviction != nil {
+			storage[resource+"/eviction"] = podStorage.Eviction
+		}
+		storage[resource+"/ephemeralcontainers"] = podStorage.EphemeralContainers
+
+	}
+	if resource := "bindings"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = podStorage.LegacyBinding
+	}
+
+	if resource := "podtemplates"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = podTemplateStorage
+	}
+
+	if resource := "replicationcontrollers"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = controllerStorage.Controller
+		storage[resource+"/status"] = controllerStorage.Status
+		if legacyscheme.Scheme.IsVersionRegistered(schema.GroupVersion{Group: "autoscaling", Version: "v1"}) {
+			storage[resource+"/scale"] = controllerStorage.Scale
+		}
+	}
+
+	if resource := "services"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = serviceRESTStorage
+		storage[resource+"/proxy"] = serviceRESTProxy
+		storage[resource+"/status"] = serviceStatusStorage
+	}
+
+	if resource := "endpoints"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = endpointsStorage
+	}
+
+	if resource := "nodes"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = nodeStorage.Node
+		storage[resource+"/proxy"] = nodeStorage.Proxy
+		storage[resource+"/status"] = nodeStorage.Status
+	}
+
+	if resource := "events"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = eventStorage
+	}
+
+	if resource := "limitranges"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = limitRangeStorage
+	}
+
+	if resource := "resourcequotas"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = resourceQuotaStorage
+		storage[resource+"/status"] = resourceQuotaStatusStorage
+	}
+
+	if resource := "namespaces"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = namespaceStorage
+		storage[resource+"/status"] = namespaceStatusStorage
+		storage[resource+"/finalize"] = namespaceFinalizeStorage
+	}
+
+	if resource := "secrets"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = secretStorage
+	}
+
+	if resource := "serviceaccounts"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = serviceAccountStorage
+		if serviceAccountStorage.Token != nil {
+			storage[resource+"/token"] = serviceAccountStorage.Token
+		}
+	}
+
+	if resource := "persistentvolumes"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = persistentVolumeStorage
+		storage[resource+"/status"] = persistentVolumeStatusStorage
+	}
+
+	if resource := "persistentvolumeclaims"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = persistentVolumeClaimStorage
+		storage[resource+"/status"] = persistentVolumeClaimStatusStorage
+	}
+
+	if resource := "configmaps"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = configMapStorage
+	}
+
+	if resource := "componentstatuses"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		storage[resource] = componentstatus.NewStorage(componentStatusStorage{c.StorageFactory}.serversToValidate)
+	}
+
+	if len(storage) > 0 {
+		apiGroupInfo.VersionedResourcesStorageMap["v1"] = storage
+	}
+
+	return restStorage, apiGroupInfo, nil
+}
+```
+
+###### InstallLegacyAPIGroup
+
+```go
+// InstallLegacyAPIGroup 在 API 中公开给定的旧版 API 组。
+// 此函数中传入的 <apiGroupInfo> 不应在其他地方使用，因为在服务器关闭时底层存储将被销毁。
+func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo *APIGroupInfo) error {
+    // 检查 apiPrefix 是否在允许的旧版 API 前缀列表中
+    if !s.legacyAPIGroupPrefixes.Has(apiPrefix) {
+    	return fmt.Errorf("%q 不在允许的旧版 API 前缀列表中：%v", apiPrefix, s.legacyAPIGroupPrefixes.List())
+    }
+    // 获取 openAPIModels
+    openAPIModels, err := s.getOpenAPIModels(apiPrefix, apiGroupInfo)
+    if err != nil {
+        return fmt.Errorf("无法获取 openapi models：%v", err)
+    }
+
+    // 安装 API 资源
+    if err := s.installAPIResources(apiPrefix, apiGroupInfo, openAPIModels); err != nil {
+        return err
+    }
+
+    // 安装版本处理程序。
+    // 在 /<apiPrefix> 上添加一个处理程序以列举支持的 API 版本。
+    legacyRootAPIHandler := discovery.NewLegacyRootAPIHandler(s.discoveryAddresses, s.Serializer, apiPrefix)
+    if utilfeature.DefaultFeatureGate.Enabled(features.AggregatedDiscoveryEndpoint) {
+        wrapped := discoveryendpoint.WrapAggregatedDiscoveryToHandler(legacyRootAPIHandler, s.AggregatedLegacyDiscoveryGroupManager)
+        s.Handler.GoRestfulContainer.Add(wrapped.GenerateWebService("/api", metav1.APIVersions{}))
+    } else {
+        s.Handler.GoRestfulContainer.Add(legacyRootAPIHandler.WebService())
+    }
+
+    return nil
+}
+```
+
+#### InstallAPIs
