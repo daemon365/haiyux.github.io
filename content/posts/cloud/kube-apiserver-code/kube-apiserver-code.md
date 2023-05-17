@@ -943,5 +943,859 @@ func (cfg *Config) Complete() CompletedConfig {
     // ... 设置一些 默认config
 	return CompletedConfig{&c}
 }
+
+// New从给定的配置中返回CustomResourceDefinitions的新实例。
+func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
+	// 从配置中创建GenericServer实例
+	genericServer, err := c.GenericConfig.New("apiextensions-apiserver", delegationTarget)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建一个通道hasCRDInformerSyncedSignal，当CRD informer完全同步时关闭该通道。
+	// 这确保在服务器尚未安装所有已知HTTP路径时，对潜在自定义资源端点的请求会得到503错误而不是404错误。
+	hasCRDInformerSyncedSignal := make(chan struct{})
+	if err := genericServer.RegisterMuxAndDiscoveryCompleteSignal("CRDInformerHasNotSynced", hasCRDInformerSyncedSignal); err != nil {
+		return nil, err
+	}
+
+	// 创建CustomResourceDefinitions实例
+	s := &CustomResourceDefinitions{
+		GenericAPIServer: genericServer,
+	}
+
+	// 获取API资源配置和API组信息
+	apiResourceConfig := c.GenericConfig.MergedResourceConfig
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiextensions.GroupName, Scheme, metav1.ParameterCodec, Codecs)
+	storage := map[string]rest.Storage{}
+	
+	// 处理customresourcedefinitions
+	if resource := "customresourcedefinitions"; apiResourceConfig.ResourceEnabled(v1.SchemeGroupVersion.WithResource(resource)) {
+		// 创建customResourceDefinitionStorage
+		customResourceDefinitionStorage, err := customresourcedefinition.NewREST(Scheme, c.GenericConfig.RESTOptionsGetter)
+		if err != nil {
+			return nil, err
+		}
+		storage[resource] = customResourceDefinitionStorage
+		storage[resource+"/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefinitionStorage)
+	}
+	if len(storage) > 0 {
+		apiGroupInfo.VersionedResourcesStorageMap[v1.SchemeGroupVersion.Version] = storage
+	}
+
+	// 安装API组
+	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
+		return nil, err
+	}
+
+	// 创建CRD客户端
+	crdClient, err := clientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %v", err)
+	}
+	s.Informers = externalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
+
+	// 设置委托处理程序
+	delegateHandler := delegationTarget.UnprotectedHandler()
+	if delegateHandler == nil {
+		delegateHandler = http.NotFoundHandler()
+	}
+
+	// 创建版本和组的发现处理程序
+	versionDiscoveryHandler := &versionDiscoveryHandler{
+		discovery: map[schema.GroupVersion]*discovery.APIVersionHandler{},
+		delegate:  delegateHandler,
+	}
+	groupDiscoveryHandler := &groupDiscoveryHandler{
+		discovery: map[string]*discovery.APIGroupHandler{},
+		delegate:  delegateHandler,
+	}
+
+	// 创建establishingController和crdHandler等
+	establishingController := establish.NewEstablishingController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+    // 创建crdHandler
+    crdHandler, err := NewCustomResourceDefinitionHandler(
+        versionDiscoveryHandler,
+        groupDiscoveryHandler,
+        s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
+        delegateHandler,
+        c.ExtraConfig.CRDRESTOptionsGetter,
+        c.GenericConfig.AdmissionControl,
+        establishingController,
+        c.ExtraConfig.ServiceResolver,
+        c.ExtraConfig.AuthResolverWrapper,
+        c.ExtraConfig.MasterCount,
+        s.GenericAPIServer.Authorizer,
+        c.GenericConfig.RequestTimeout,
+        time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
+        apiGroupInfo.StaticOpenAPISpec,
+        c.GenericConfig.MaxRequestBodyBytes,
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    // 将crdHandler注册到GenericAPIServer的处理程序中
+    s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
+    s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
+    s.GenericAPIServer.RegisterDestroyFunc(crdHandler.destroy)
+
+    // 创建aggregatedDiscoveryManager
+    aggregatedDiscoveryManager := genericServer.AggregatedDiscoveryGroupManager
+    if aggregatedDiscoveryManager != nil {
+        aggregatedDiscoveryManager = aggregatedDiscoveryManager.WithSource(aggregated.CRDSource)
+    }
+
+    // 创建discoveryController、namingController、nonStructuralSchemaController、apiApprovalController和finalizingController
+    discoveryController := NewDiscoveryController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler, aggregatedDiscoveryManager)
+    namingController := status.NewNamingConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+    nonStructuralSchemaController := nonstructuralschema.NewConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+    apiApprovalController := apiapproval.NewKubernetesAPIApprovalPolicyConformantConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+    finalizingController := finalizer.NewCRDFinalizer(
+        s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
+        crdClient.ApiextensionsV1(),
+        crdHandler,
+    )
+
+    // 添加PostStartHook，用于在API server启动后执行一些操作
+    s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-informers", func(context genericapiserver.PostStartHookContext) error {
+        s.Informers.Start(context.StopCh)
+        return nil
+    })
+    s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-controllers", func(context genericapiserver.PostStartHookContext) error {
+        // OpenAPIVersionedService和StaticOpenAPISpec是在generic apiserver的PrepareRun()中设置的。
+        // 它们一起在通用apiserver上为/openapi/v2端点提供服务。通用apiserver可以选择通过具有空openAPIConfig来禁用OpenAPI，
+        // 因此OpenAPIVersionedService和StaticOpenAPISpec都为空。在这种情况下，我们不运行CRD OpenAPI控制器。
+        if s.GenericAPIServer.StaticOpenAPISpec != nil {
+            if s.GenericAPIServer.OpenAPIVersionedService != nil {
+                openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+                go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
+}
+            if s.GenericAPIServer.OpenAPIV3VersionedService != nil && utilfeature.DefaultFeatureGate.Enabled(features.OpenAPIV3) {
+                openapiv3Controller := openapiv3controller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+                go openapiv3Controller.Run(s.GenericAPIServer.OpenAPIV3VersionedService, context.StopCh)
+            }
+        }
+        
+        go namingController.Run(context.StopCh)
+        go establishingController.Run(context.StopCh)
+        go nonStructuralSchemaController.Run(5, context.StopCh)
+        go apiApprovalController.Run(5, context.StopCh)
+        go finalizingController.Run(5, context.StopCh)
+
+        discoverySyncedCh := make(chan struct{})
+        go discoveryController.Run(context.StopCh, discoverySyncedCh)
+        select {
+        case <-context.StopCh:
+        case <-discoverySyncedCh:
+        }
+
+        return nil
+    })
+    
+	// 添加PostStartHook，用于在CRD Informer同步完成后发送信号
+    s.GenericAPIServer.AddPostStartHookOrDie("crd-informer-synced", func(context genericapiserver.PostStartHookContext) error {
+        return wait.PollImmediateUntil(100*time.Millisecond, func() (bool, error) {
+            // 等待CRD Informer完成同步
+            if s.Informers.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() {
+                close(hasCRDInformerSyncedSignal)
+                return true, nil
+            }
+            return false, nil
+        }, context.StopCh)
+    })
+
+    return s, nil
+}
+```
+
+#### c.GenericConfig.New
+
+```go
+// New函数创建一个新的服务器，将处理链与传入的服务器逻辑上结合在一起。
+// name用于区分日志记录。特别是处理链在开始委托时可能很复杂。
+// delegationTarget不能为nil。
+func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
+	// 检查参数是否有效
+    if c.Serializer == nil {
+    	return nil, fmt.Errorf("Genericapiserver.New() called with config.Serializer == nil")
+    }
+    if c.LoopbackClientConfig == nil {
+    	return nil, fmt.Errorf("Genericapiserver.New() called with config.LoopbackClientConfig == nil")
+    }
+    if c.EquivalentResourceRegistry == nil {
+    	return nil, fmt.Errorf("Genericapiserver.New() called with config.EquivalentResourceRegistry == nil")
+    }
+    // 定义一个handlerChainBuilder函数，用于构建处理器链
+    handlerChainBuilder := func(handler http.Handler) http.Handler {
+        return c.BuildHandlerChainFunc(handler, c.Config)
+    }
+
+    // 创建一个DebugSocket实例
+    var debugSocket *routes.DebugSocket
+    if c.DebugSocketPath != "" {
+        debugSocket = routes.NewDebugSocket(c.DebugSocketPath)
+    }
+
+    // 创建一个APIServerHandler实例
+    apiServerHandler := NewAPIServerHandler(name, c.Serializer, handlerChainBuilder, delegationTarget.UnprotectedHandler())
+
+    // 创建GenericAPIServer实例
+    s := &GenericAPIServer{
+        discoveryAddresses:             c.DiscoveryAddresses,
+        LoopbackClientConfig:           c.LoopbackClientConfig,
+        legacyAPIGroupPrefixes:         c.LegacyAPIGroupPrefixes,
+        admissionControl:               c.AdmissionControl,
+        Serializer:                     c.Serializer,
+        AuditBackend:                   c.AuditBackend,
+        Authorizer:                     c.Authorization.Authorizer,
+        delegationTarget:               delegationTarget,
+        EquivalentResourceRegistry:     c.EquivalentResourceRegistry,
+        NonLongRunningRequestWaitGroup: c.NonLongRunningRequestWaitGroup,
+        WatchRequestWaitGroup:          c.WatchRequestWaitGroup,
+        Handler:                        apiServerHandler,
+        UnprotectedDebugSocket:         debugSocket,
+        listedPathProvider:             apiServerHandler,
+        minRequestTimeout:              time.Duration(c.MinRequestTimeout) * time.Second,
+        ShutdownTimeout:                c.RequestTimeout,
+        ShutdownDelayDuration:          c.ShutdownDelayDuration,
+        ShutdownWatchTerminationGracePeriod: c.ShutdownWatchTerminationGracePeriod,
+        SecureServingInfo:                   c.SecureServing,
+        ExternalAddress:                     c.ExternalAddress,
+        openAPIConfig:           c.OpenAPIConfig,
+        openAPIV3Config:         c.OpenAPIV3Config,
+        skipOpenAPIInstallation: c.SkipOpenAPIInstallation,
+        postStartHooks:         map[string]postStartHookEntry{},
+        preShutdownHooks:       map[string]preShutdownHookEntry{},
+        disabledPostStartHooks: c.DisabledPostStartHooks,
+        healthzChecks:          c.HealthzChecks,
+        livezChecks:            c.LivezChecks,
+        readyzChecks:           c.ReadyzChecks,
+        livezGracePeriod:       c.LivezGracePeriod,
+        DiscoveryGroupManager:  discovery.NewRootAPIsHandler(c.DiscoveryAddresses, c.Serializer),
+        maxRequestBodyBytes:    c.MaxRequestBodyBytes,
+        livezClock:             clock.RealClock{},
+        lifecycleSignals:      c.lifecycleSignals,
+        ShutdownSendRetryAfter: c.ShutdownSendRetryAfter,
+        APIServerID: c.APIServerID,
+        StorageVersionManager: c.StorageVersionManager,
+        Version: c.Version,
+        muxAndDiscoveryCompleteSignals: map[string]<-chan struct{}{},
+    }
+
+	// 如果启用了AggregatedDiscoveryEndpoint特性，则注册AggregatedDiscoveryGroupManager
+    if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
+        manager := c.AggregatedDiscoveryGroupManager
+        if manager == nil {
+            manager = discoveryendpoint.NewResourceManager("apis")
+        }
+        s.AggregatedDiscoveryGroupManager = manager
+        s.AggregatedLegacyDiscoveryGroupManager = discoveryendpoint.NewResourceManager("api")
+    }
+
+    // 更新JSONPatchMaxCopyBytes的限制
+    for {
+        if c.JSONPatchMaxCopyBytes <= 0 {
+            break
+        }
+        existing := atomic.LoadInt64(&jsonpatch.AccumulatedCopySizeLimit)
+        if existing > 0 && existing < c.JSONPatchMaxCopyBytes {
+            break
+        }
+        if atomic.CompareAndSwapInt64(&jsonpatch.AccumulatedCopySizeLimit, existing, c.JSONPatchMaxCopyBytes) {
+            break
+        }
+    }
+
+    // 添加委托目标的poststarthooks
+    for k, v := range delegationTarget.PostStartHooks() {
+        s.postStartHooks[k] = v
+    }
+
+    // 添加委托目标的PreShutdownHooks
+    for k, v := range delegationTarget.PreShutdownHooks() {
+        s.preShutdownHooks[k] = v
+    }
+
+    // 添加预配置的poststarthooks
+    for name, preconfiguredPostStartHook := range c.PostStartHooks {
+        if err := s.AddPostStartHook(name, preconfiguredPostStartHook.hook); err != nil {
+            return nil, err
+        }
+    }
+
+    // 注册委托服务器的mux信号
+    for k, v := range delegationTarget.MuxAndDiscoveryCompleteSignals() {
+        if err := s.RegisterMuxAndDiscoveryCompleteSignal(k, v); err != nil {
+            return nil, err
+        }
+    }
+
+    // 如果存在SharedInformerFactory，则添加名为generic-apiserver-start-informers的poststarthook
+    genericApiServerHookName := "generic-apiserver-start-informers"
+    if c.SharedInformerFactory != nil {
+        if !s.isPostStartHookRegistered(genericApiServerHookName) {
+            err := s.AddPostStartHook(genericApiServerHookName, func(context PostStartHookContext) error {
+                c.SharedInformerFactory.Start(context.StopCh)
+                return nil
+            })
+            if err != nil {
+                return nil, err
+            }
+        }
+        // 添加ReadyzChecks以确保在Informer同步之后运行
+        err := s.AddReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
+        if err != nil {
+            return nil, err
+        }
+    }
+
+    // 如果存在FlowControl，则添加priority-and-fairness-config-consumer的poststarthook
+    const priorityAndFairnessConfigConsumerHookName = "priority-and-fairness-config-consumer"
+    if s.isPostStartHookRegistered(priorityAndFairnessConfigConsumerHookName) {
+    } else if c.FlowControl != nil {
+        err := s.AddPostStartHook(priorityAndFairnessConfigConsumerHookName, func(context PostStartHookContext) error {
+            go c.FlowControl.Run(context.StopCh)
+            return nil
+        })
+        if err != nil {
+            return nil, err
+        }
+        // TODO(yue9944882): plumb pre-shutdown-hook for request-management system?
+    } else {
+        klog.V(3).Infof("Not requested to run hook %s", priorityAndFairnessConfigConsumerHookName)
+	}
+	
+    // 添加PostStartHook以维护Priority-and-Fairness和Max-in-Flight过滤器的水印
+    if c.FlowControl != nil {
+        const priorityAndFairnessFilterHookName = "priority-and-fairness-filter"
+        if !s.isPostStartHookRegistered(priorityAndFairnessFilterHookName) {
+            err := s.AddPostStartHook(priorityAndFairnessFilterHookName, func(context PostStartHookContext) error {
+                genericfilters.StartPriorityAndFairnessWatermarkMaintenance(context.StopCh)
+                return nil
+            })
+            if err != nil {
+                return nil, err
+            }
+        }
+    } else {
+        const maxInFlightFilterHookName = "max-in-flight-filter"
+        if !s.isPostStartHookRegistered(maxInFlightFilterHookName) {
+            err := s.AddPostStartHook(maxInFlightFilterHookName, func(context PostStartHookContext) error {
+                genericfilters.StartMaxInFlightWatermarkMaintenance(context.StopCh)
+                return nil
+            })
+            if err != nil {
+                return nil, err
+            }
+        }
+    }
+
+    // 添加PostStartHook以维护对象计数追踪器
+    if c.StorageObjectCountTracker != nil {
+        const storageObjectCountTrackerHookName = "storage-object-count-tracker-hook"
+        if !s.isPostStartHookRegistered(storageObjectCountTrackerHookName) {
+            if err := s.AddPostStartHook(storageObjectCountTrackerHookName, func(context PostStartHookContext) error {
+                go c.StorageObjectCountTracker.RunUntil(context.StopCh)
+                return nil
+            }); err != nil {
+                return nil, err
+            }
+        }
+    }
+
+    // 将委托目标的HealthzChecks添加到GenericAPIServer中
+    for _, delegateCheck := range delegationTarget.HealthzChecks() {
+        skip := false
+        for _, existingCheck := range c.HealthzChecks {
+            if existingCheck.Name() == delegateCheck.Name() {
+                skip = true
+                break
+            }
+        }
+        if skip {
+            continue
+        }
+        s.AddHealthChecks(delegateCheck)
+    }
+
+    // 注册销毁函数，用于关闭跟踪器提供程序
+    s.RegisterDestroyFunc(func() {
+        if err := c.Config.TracerProvider.Shutdown(context.Background()); err != nil {
+            klog.Errorf("failed to shut down tracer provider: %v", err)
+        }
+    })
+
+    // 更新listedPathProvider，将委托目标添加到路径提供者列表中
+    s.listedPathProvider = routes.ListedPathProviders{s.listedPathProvider, delegationTarget}
+
+    // 安装API路由
+    installAPI(s, c.Config)
+
+    // 如果启用了委托目标的UnprotectedHandler，并且启用了索引功能，则设置NotFoundHandler为IndexLister
+    if delegationTarget.UnprotectedHandler() == nil && c.EnableIndex {
+        s.Handler.NonGoRestfulMux.NotFoundHandler(routes.IndexLister{
+            StatusCode:   http.StatusNotFound,
+            PathProvider: s.listedPathProvider,
+        })
+    }
+
+    return s, nil
+}
+```
+
+#### InstallAPIGroup
+
+```go
+// InstallAPIGroup 在 API 中公开给定的 API 组。
+// 此函数中传入的 <apiGroupInfo> 不应在其他地方使用，因为在服务器关闭时底层存储将被销毁。
+func (s *GenericAPIServer) InstallAPIGroup(apiGroupInfo *APIGroupInfo) error {
+	return s.InstallAPIGroups(apiGroupInfo)
+}
+```
+
+#### InstallAPIGroups
+
+```go
+// InstallAPIGroups 在 API 中公开给定的 API 组。
+// 此函数中传入的 <apiGroupInfos> 不应在其他地方使用，因为在服务器关闭时底层存储将被销毁。
+func (s *GenericAPIServer) InstallAPIGroups(apiGroupInfos ...*APIGroupInfo) error {
+    // 检查 API 组信息的合法性
+    for _, apiGroupInfo := range apiGroupInfos {
+        // 不要注册空组或空版本。这样做会将 /apis/ 声明为错误实体返回。
+        // 在这里捕捉这些错误可以将错误放置得更接近其源头。
+        if len(apiGroupInfo.PrioritizedVersions[0].Group) == 0 {
+            return fmt.Errorf("cannot register handler with an empty group for %#v", *apiGroupInfo)
+        }
+        if len(apiGroupInfo.PrioritizedVersions[0].Version) == 0 {
+            return fmt.Errorf("cannot register handler with an empty version for %#v", *apiGroupInfo)
+        }
+    }
+    // 获取 API 组的 OpenAPI 模型
+    openAPIModels, err := s.getOpenAPIModels(APIGroupPrefix, apiGroupInfos...)
+    if err != nil {
+        return fmt.Errorf("unable to get openapi models: %v", err)
+    }
+
+    // 安装 API 资源
+    for _, apiGroupInfo := range apiGroupInfos {
+        if err := s.installAPIResources(APIGroupPrefix, apiGroupInfo, openAPIModels); err != nil {
+            return fmt.Errorf("unable to install api resources: %v", err)
+        }
+
+        // 设置发现
+        // 安装版本处理程序。
+        // 在 /apis/<groupName> 添加一个处理程序，以枚举此组支持的所有版本。
+        apiVersionsForDiscovery := []metav1.GroupVersionForDiscovery{}
+        for _, groupVersion := range apiGroupInfo.PrioritizedVersions {
+            // 检查配置以确保我们删除没有任何资源的版本
+            if len(apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version]) == 0 {
+                continue
+            }
+            apiVersionsForDiscovery = append(apiVersionsForDiscovery, metav1.GroupVersionForDiscovery{
+                GroupVersion: groupVersion.String(),
+                Version:      groupVersion.Version,
+            })
+        }
+        preferredVersionForDiscovery := metav1.GroupVersionForDiscovery{
+            GroupVersion: apiGroupInfo.PrioritizedVersions[0].String(),
+            Version:      apiGroupInfo.PrioritizedVersions[0].Version,
+        }
+        apiGroup := metav1.APIGroup{
+            Name:             apiGroupInfo.PrioritizedVersions[0].Group,
+            Versions:         apiVersionsForDiscovery,
+            PreferredVersion: preferredVersionForDiscovery,
+        }
+
+        // 将 API 组添加到发现中
+        s.DiscoveryGroupManager.AddGroup(apiGroup)
+        // 向 GoRestful 容器中添加 APIGroupHandler
+        s.Handler.GoRestfulContainer.Add(discovery.NewAPIGroupHandler(s.Serializer, apiGroup).WebService())
+    }
+    return nil
+}
+```
+
+##### getOpenAPIModels
+
+```go
+// getOpenAPIModels 是一个用于获取 OpenAPI 模型的私有方法。
+func (s *GenericAPIServer) getOpenAPIModels(apiPrefix string, apiGroupInfos ...*APIGroupInfo) (map[string]*spec.Schema, error) {
+    if s.openAPIV3Config == nil {
+        //!TODO: 未来的工作应该添加一个要求 OpenAPIV3 配置是必需的的规定。可能需要一些测试代码的重构。
+        return nil, nil
+    }
+    pathsToIgnore := openapiutil.NewTrie(s.openAPIConfig.IgnorePrefixes)
+    resourceNames := make([]string, 0)
+    for _, apiGroupInfo := range apiGroupInfos {
+        groupResources, err := getResourceNamesForGroup(apiPrefix, apiGroupInfo, pathsToIgnore)
+        if err != nil {
+        	return nil, err
+        }
+        resourceNames = append(resourceNames, groupResources...)
+    }
+    // 为这些资源构建 OpenAPI 定义并将其转换为 proto 模型
+    openAPISpec, err := openapibuilder3.BuildOpenAPIDefinitionsForResources(s.openAPIV3Config, resourceNames...)
+    if err != nil {
+        return nil, err
+    }
+    for _, apiGroupInfo := range apiGroupInfos {
+        apiGroupInfo.StaticOpenAPISpec = openAPISpec
+    }
+    return openAPISpec, nil
+}
+```
+
+##### installAPIResources
+
+```go
+// installAPIResources 是一个私有方法，用于安装支持每个 API 组版本资源的 REST 存储。
+func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *APIGroupInfo, openAPIModels map[string]*spec.Schema) error {
+    // 创建 TypeConverter 对象，用于类型转换
+    var typeConverter managedfields.TypeConverter
+
+    // 如果存在 OpenAPI 模型，则创建 TypeConverter 对象
+    if len(openAPIModels) > 0 {
+        var err error
+        typeConverter, err = managedfields.NewTypeConverter(openAPIModels, false)
+        if err != nil {
+            return err
+        }
+    }
+
+    // 存储资源信息的切片
+    var resourceInfos []*storageversion.ResourceInfo
+
+    // 遍历 API 组的优先版本
+    for _, groupVersion := range apiGroupInfo.PrioritizedVersions {
+
+        // 如果该版本没有资源，则跳过
+        if len(apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version]) == 0 {
+            klog.Warningf("Skipping API %v because it has no resources.", groupVersion)
+            continue
+        }
+
+        // 获取 API 组版本对象
+        apiGroupVersion, err := s.getAPIGroupVersion(apiGroupInfo, groupVersion, apiPrefix)
+        if err != nil {
+            return err
+        }
+
+        // 设置 API 组版本的选项外部版本
+        if apiGroupInfo.OptionsExternalVersion != nil {
+            apiGroupVersion.OptionsExternalVersion = apiGroupInfo.OptionsExternalVersion
+        }
+
+        // 设置 API 组版本的类型转换器和最大请求体大小
+        apiGroupVersion.TypeConverter = typeConverter
+        apiGroupVersion.MaxRequestBodyBytes = s.maxRequestBodyBytes
+
+        // 安装 REST
+        discoveryAPIResources, r, err := apiGroupVersion.InstallREST(s.Handler.GoRestfulContainer)
+        if err != nil {
+            return fmt.Errorf("unable to setup API %v: %v", apiGroupInfo, err)
+        }
+        resourceInfos = append(resourceInfos, r...)
+
+        // 如果启用了聚合发现端点特性
+        if utilfeature.DefaultFeatureGate.Enabled(features.AggregatedDiscoveryEndpoint) {
+            // 聚合发现只聚合/apis下的资源
+            if apiPrefix == APIGroupPrefix {
+                s.AggregatedDiscoveryGroupManager.AddGroupVersion(
+                    groupVersion.Group,
+                    apidiscoveryv2beta1.APIVersionDiscovery{
+                        Freshness: apidiscoveryv2beta1.DiscoveryFreshnessCurrent,
+                        Version:   groupVersion.Version,
+                        Resources: discoveryAPIResources,
+                    },
+                )
+            } else {
+                // 对于遗留资源，只有一个组版本，优先级可以默认为0。
+                s.AggregatedLegacyDiscoveryGroupManager.AddGroupVersion(
+                    groupVersion.Group,
+                    apidiscoveryv2beta1.APIVersionDiscovery{
+                        Freshness: apidiscoveryv2beta1.DiscoveryFreshnessCurrent,
+                        Version:   groupVersion.Version,
+                        Resources: discoveryAPIResources,
+                    },
+                )
+            }
+        }
+    }
+
+    // 注册销毁函数
+    s.RegisterDestroyFunc(apiGroupInfo.destroyStorage)
+
+    // 如果启用了 StorageVersionAPI 和 APIServerIdentity 特性
+    if utilfeature.DefaultFeatureGate.Enabled(features.StorageVersionAPI) && utilfeature.DefaultFeatureGate.Enabled(features.APIServerIdentity) {
+        // 在开始监听处理程序之前进行 API 安装，
+        // 因此在这里注册 ResourceInfos 是安全的。
+        // 处理程序将阻塞写入请求，直到目标资源的存储版本被更新。
+        s.StorageVersionManager.AddResourceInfo(resourceInfos...)
+	}
+
+	return nil
+}
+```
+
+
+
+```go
+// InstallREST 将 REST 处理程序（存储、观察、代理和重定向）注册到 restful.Container 中。
+// 预期提供的路径根前缀将用于处理所有操作。根路径不得以斜杠结尾。
+func (g *APIGroupVersion) InstallREST(container *restful.Container) ([]apidiscoveryv2beta1.APIResourceDiscovery, []*storageversion.ResourceInfo, error) {
+    // 根据组和版本构建路径前缀
+	prefix := path.Join(g.Root, g.GroupVersion.Group, g.GroupVersion.Version)
+
+    // 创建 APIInstaller 对象
+    installer := &APIInstaller{
+        group:             g,
+        prefix:            prefix,
+        minRequestTimeout: g.MinRequestTimeout,
+    }
+
+    // 调用 Install 方法进行安装，获取 API 资源、资源信息、WebService 和注册错误
+    apiResources, resourceInfos, ws, registrationErrors := installer.Install()
+
+    // 创建 APIVersionHandler 对象，用于处理版本发现
+    versionDiscoveryHandler := discovery.NewAPIVersionHandler(g.Serializer, g.GroupVersion, staticLister{apiResources})
+    versionDiscoveryHandler.AddToWebService(ws)
+
+    // 将 WebService 添加到 Container 中
+    container.Add(ws)
+
+    // 转换聚合发现资源
+    aggregatedDiscoveryResources, err := ConvertGroupVersionIntoToDiscovery(apiResources)
+    if err != nil {
+        registrationErrors = append(registrationErrors, err)
+    }
+
+    // 返回聚合发现资源、持久化资源信息和注册错误的聚合错误
+    return aggregatedDiscoveryResources, removeNonPersistedResources(resourceInfos), utilerrors.NewAggregate(registrationErrors)
+}
+```
+
+
+
+```go
+// crdHandler 用于处理 /apis 端点。
+// 它被注册为过滤器，以确保不会与任何显式注册的端点发生冲突。
+type crdHandler struct {
+    versionDiscoveryHandler *versionDiscoveryHandler
+    groupDiscoveryHandler *groupDiscoveryHandler
+    customStorageLock sync.Mutex
+    // customStorage 包含 crdStorageMap
+    // 与 sync.RWMutex 相比，atomic.Value 具有非常好的读性能
+    // 参考 https://gist.github.com/dim/152e6bf80e1384ea72e17ac717a5000a
+    // 对于大多数读操作和很少写操作的情况来说，这是比较适合的
+    customStorage atomic.Value
+
+    crdLister listers.CustomResourceDefinitionLister
+
+    delegate          http.Handler
+    restOptionsGetter generic.RESTOptionsGetter
+    admission         admission.Interface
+
+    establishingController *establish.EstablishingController
+
+    // MasterCount 用于实现睡眠，以改进 HA 集群的 CRD 建立过程。
+    masterCount int
+
+    converterFactory *conversion.CRConverterFactory
+
+    // 以便我们可以在更新时进行创建。
+    authorizer authorizer.Authorizer
+
+    // 请求超时时间，我们应该延迟存储的拆除
+    requestTimeout time.Duration
+
+    // minRequestTimeout 适用于 CR 的列表/观察调用
+    minRequestTimeout time.Duration
+
+    // staticOpenAPISpec 用作管理字段结构的 CR 模式的基础，CR 处理程序通过它获取 TypeMeta 和 ObjectMeta 的结构。
+    staticOpenAPISpec map[string]*spec.Schema
+
+    // 在写入请求中接受和解码的请求大小限制
+    // 0 表示无限制。
+    maxRequestBodyBytes int64
+}
+
+// crdInfo 存储足够的信息来为自定义资源提供存储服务。
+type crdInfo struct {
+    // spec 和 acceptedNames 用于比较是否对 CRD 进行了更改。只有在这些更改之一时，我们才更新存储。
+    spec *apiextensionsv1.CustomResourceDefinitionSpec
+    acceptedNames *apiextensionsv1.CustomResourceDefinitionNames
+        // Deprecated per version
+    deprecated map[string]bool
+
+    // Warnings per version
+    warnings map[string][]string
+
+    // Storage per version
+    storages map[string]customresource.CustomResourceStorage
+
+    // Request scope per version
+    requestScopes map[string]*handlers.RequestScope
+
+    // Scale scope per version
+    scaleRequestScopes map[string]*handlers.RequestScope
+
+    // Status scope per version
+    statusRequestScopes map[string]*handlers.RequestScope
+
+    // storageVersion 是在将对象存储到 etcd 中使用的 CRD 版本。
+    storageVersion string
+
+    waitGroup *utilwaitgroup.SafeWaitGroup
+}
+
+// crdStorageMap 将自定义资源定义映射到其存储。
+type crdStorageMap map[types.UID]*crdInfo
+
+// ServeHTTP 方法处理 HTTP 请求并提供响应。
+
+func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ctx := req.Context()
+    requestInfo, ok := apirequest.RequestInfoFrom(ctx)
+    if !ok {
+        responsewriters.ErrorNegotiated(
+            apierrors.NewInternalError(fmt.Errorf("no RequestInfo found in the context")),
+            Codecs, schema.GroupVersion{}, w, req,
+    	)
+    	return
+    }
+    // 如果请求不是资源请求，则将请求转发给 delegate 处理。
+    if !requestInfo.IsResourceRequest {
+        pathParts := splitPath(requestInfo.Path)
+        // 只匹配 /apis/<group>/<version>
+        // 只注册在 /apis 下
+        if len(pathParts) == 3 {
+            r.versionDiscoveryHandler.ServeHTTP(w, req)
+            return
+        }
+        // 只匹配 /apis/<group>
+        if len(pathParts) == 2 {
+            r.groupDiscoveryHandler.ServeHTTP(w, req)
+            return
+        }
+
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+
+    crdName := requestInfo.Resource + "." + requestInfo.APIGroup
+    crd, err := r.crdLister.Get(crdName)
+
+    // 如果 CRD 不存在，则将请求转发给 delegate 处理。
+    if apierrors.IsNotFound(err) {
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+    if err != nil {
+        utilruntime.HandleError(err)
+        responsewriters.ErrorNegotiated(
+            apierrors.NewInternalError(fmt.Errorf("error resolving resource")),
+            Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+        )
+        return
+    }
+
+    // 根据 CRD 和请求信息进行条件判断，决定是否将请求转发给 delegate 处理。
+    namespacedCRD, namespacedReq := crd.Spec.Scope == apiextensionsv1.NamespaceScoped, len(requestInfo.Namespace) > 0
+    if !namespacedCRD && namespacedReq {
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+    if namespacedCRD && !namespacedReq && !possiblyAcrossAllNamespacesVerbs.Has(requestInfo.Verb) {
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+
+    if !apiextensionshelpers.HasServedCRDVersion(crd, requestInfo.APIVersion) {
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+
+    // 在 CRD 建立过程中，如果 NamesAccepted 条件为 true，但由于另一个名称更新导致冲突，
+    // 并且 EstablishingController 没有足够快地将 CRD 放入 Established 条件中，则可能出现“未提供”的情况。
+    // 我们接受这种情况，因为问题很小并且是自我修复的。
+    if !apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.NamesAccepted) &&
+        !apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.Established) {
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+
+    terminating := apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.Terminating)
+
+    crdInfo, err := r.getOrCreateServingInfoFor(crdUID, crd.Name)
+    if apierrors.IsNotFound(err) {
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+    if err != nil {
+        utilruntime.HandleError(err)
+        responsewriters.ErrorNegotiated(
+            apierrors.NewInternalError(fmt.Errorf("error resolving resource")),
+            Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+    	)
+        return
+    }
+    // 如果请求的 APIVersion 不在 CRD 的 served 版本列表中，则将请求转发给 delegate 处理。
+    if !hasServedCRDVersion(crdInfo.spec, requestInfo.APIVersion) {
+        r.delegate.ServeHTTP(w, req)
+        return
+    }
+
+    deprecated := crdInfo.deprecated[requestInfo.APIVersion]
+    for _, w := range crdInfo.warnings[requestInfo.APIVersion] {
+        warning.AddWarning(req.Context(), "", w)
+    }
+
+    verb := strings.ToUpper(requestInfo.Verb)
+    resource := requestInfo.Resource
+    subresource := requestInfo.Subresource
+    scope := metrics.CleanScope(requestInfo)
+    supportedTypes := []string{
+        string(types.JSONPatchType),
+        string(types.MergePatchType),
+        string(types.ApplyPatchType),
+    }
+
+    var handlerFunc http.HandlerFunc
+    subresources, err := apiextensionshelpers.GetSubresourcesForVersion(crd, requestInfo.APIVersion)
+    if err != nil {
+        utilruntime.HandleError(err)
+        responsewriters.ErrorNegotiated(
+            apierrors.NewInternalError(fmt.Errorf("could not properly serve the subresource")),
+            Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+        )
+        return
+    }
+    switch {
+    // 如果请求的是 status 子资源，并且 CRD 的 subresources 中包含 status 子资源，则调用 serveStatus 处理函数。
+    case subresource == "status" && subresources != nil && subresources.Status != nil:
+        handlerFunc = r.serveStatus(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+    // 如果请求的是 scale 子资源，并且 CRD 的 subresources 中包含 scale 子资源，则调用 serveScale 处理函数。
+    case subresource == "scale" && subresources != nil && subresources.Scale != nil:
+        handlerFunc = r.serveScale(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+    // 如果请求没有指定子资源，则调用 serveResource 处理函数。
+    case len(subresource) == 0:
+        handlerFunc = r.serveResource(w, req, requestInfo, crdInfo, crd, terminating, supportedTypes)
+    // 如果请求的子资源不符合上述条件，则返回 NotFound 错误。
+    default:
+        responsewriters.ErrorNegotiated(
+            apierrors.NewNotFound(schema.GroupResource{Group: requestInfo.APIGroup, Resource: requestInfo.Resource}, requestInfo.Name),
+            Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+        )
+    }
+
+    // 如果存在处理函数，则对其进行一系列操作，并最终调用 ServeHTTP 处理请求。
+    if handlerFunc != nil {
+        handlerFunc = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, deprecated, "", handlerFunc)
+        handler := genericfilters.WithWaitGroup(handlerFunc, longRunningFilter, crdInfo.waitGroup)
+        handler.ServeHTTP(w, req)
+        return
+	}
+}
 ```
 
