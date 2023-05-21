@@ -3132,7 +3132,7 @@ type Config struct {
 }
 ```
 
-
+### createAggregatorServer
 
 ```go
 func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
