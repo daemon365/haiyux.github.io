@@ -1,5 +1,5 @@
 ---
-title: Kube Apiserver Code
+title: "kube-apiserver 启动流程及CreateServerChain"
 subtitle:
 date: 2023-05-16T21:54:37+08:00
 draft: false
@@ -1538,7 +1538,7 @@ func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *A
 }
 ```
 
-
+##### InstallREST
 
 ```go
 // InstallREST 将 REST 处理程序（存储、观察、代理和重定向）注册到 restful.Container 中。
@@ -1575,7 +1575,7 @@ func (g *APIGroupVersion) InstallREST(container *restful.Container) ([]apidiscov
 }
 ```
 
-
+##### crdHandler
 
 ```go
 // crdHandler 用于处理 /apis 端点。
@@ -2008,6 +2008,582 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 }
 ```
 
+#### GenericConfig.New
+
+```go
+// New函数创建一个新的服务器，将处理链与传递的服务器逻辑上合并。
+// name用于区分日志记录。处理链特别复杂，因为它开始委托。
+// delegationTarget不能为空。
+func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
+	if c.Serializer == nil {
+		return nil, fmt.Errorf("Genericapiserver.New() called with config.Serializer == nil")
+	}
+	if c.LoopbackClientConfig == nil {
+		return nil, fmt.Errorf("Genericapiserver.New() called with config.LoopbackClientConfig == nil")
+	}
+	if c.EquivalentResourceRegistry == nil {
+		return nil, fmt.Errorf("Genericapiserver.New() called with config.EquivalentResourceRegistry == nil")
+	}
+	// 定义handlerChainBuilder函数，该函数用于构建处理链
+	handlerChainBuilder := func(handler http.Handler) http.Handler {
+		return c.BuildHandlerChainFunc(handler, c.Config)
+	}
+
+	var debugSocket *routes.DebugSocket
+	if c.DebugSocketPath != "" { // 如果配置了DebugSocketPath，则创建一个DebugSocket对象
+		debugSocket = routes.NewDebugSocket(c.DebugSocketPath)
+	}
+	// 创建API服务器处理程序
+	apiServerHandler := NewAPIServerHandler(name, c.Serializer, handlerChainBuilder, delegationTarget.UnprotectedHandler())
+	// 创建GenericAPIServer对象
+	s := &GenericAPIServer{
+		discoveryAddresses:             c.DiscoveryAddresses,
+		LoopbackClientConfig:           c.LoopbackClientConfig,
+		legacyAPIGroupPrefixes:         c.LegacyAPIGroupPrefixes,
+		admissionControl:               c.AdmissionControl,
+		Serializer:                     c.Serializer,
+		AuditBackend:                   c.AuditBackend,
+		Authorizer:                     c.Authorization.Authorizer,
+		delegationTarget:               delegationTarget,
+		EquivalentResourceRegistry:     c.EquivalentResourceRegistry,
+		NonLongRunningRequestWaitGroup: c.NonLongRunningRequestWaitGroup,
+		WatchRequestWaitGroup:          c.WatchRequestWaitGroup,
+		Handler:                        apiServerHandler,
+		UnprotectedDebugSocket:         debugSocket,
+
+		listedPathProvider: apiServerHandler,
+
+		minRequestTimeout:                   time.Duration(c.MinRequestTimeout) * time.Second,
+		ShutdownTimeout:                     c.RequestTimeout,
+		ShutdownDelayDuration:               c.ShutdownDelayDuration,
+		ShutdownWatchTerminationGracePeriod: c.ShutdownWatchTerminationGracePeriod,
+		SecureServingInfo:                   c.SecureServing,
+		ExternalAddress:                     c.ExternalAddress,
+
+		openAPIConfig:           c.OpenAPIConfig,
+		openAPIV3Config:         c.OpenAPIV3Config,
+		skipOpenAPIInstallation: c.SkipOpenAPIInstallation,
+
+		postStartHooks:         map[string]postStartHookEntry{},
+		preShutdownHooks:       map[string]preShutdownHookEntry{},
+		disabledPostStartHooks: c.DisabledPostStartHooks,
+
+		healthzChecks:    c.HealthzChecks,
+		livezChecks:      c.LivezChecks,
+		readyzChecks:     c.ReadyzChecks,
+		livezGracePeriod: c.LivezGracePeriod,
+
+		DiscoveryGroupManager: discovery.NewRootAPIsHandler(c.DiscoveryAddresses, c.Serializer),
+
+		maxRequestBodyBytes: c.MaxRequestBodyBytes,
+		livezClock:          clock.RealClock{},
+
+		lifecycleSignals:       c.lifecycleSignals,
+		ShutdownSendRetryAfter: c.ShutdownSendRetryAfter,
+
+		APIServerID:           c.APIServerID,
+		StorageVersionManager: c.StorageVersionManager,
+
+		Version: c.Version,
+
+		muxAndDiscoveryCompleteSignals: map[string]<-chan struct{}{},
+	}
+	// 如果启用了AggregatedDiscoveryEndpoint特性，则添加聚合的发现组管理器
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
+		manager := c.AggregatedDiscoveryGroupManager
+		if manager == nil {
+			manager = discoveryendpoint.NewResourceManager("apis")
+		}
+		s.AggregatedDiscoveryGroupManager = manager
+		s.AggregatedLegacyDiscoveryGroupManager = discoveryendpoint.NewResourceManager("api")
+	}
+    // 检查JSONPatchMaxCopyBytes配置，设置jsonpatch.AccumulatedCopySizeLimit的值
+	for {
+		if c.JSONPatchMaxCopyBytes <= 0 {
+			break
+		}
+		existing := atomic.LoadInt64(&jsonpatch.AccumulatedCopySizeLimit)
+		if existing > 0 && existing < c.JSONPatchMaxCopyBytes {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&jsonpatch.AccumulatedCopySizeLimit, existing, c.JSONPatchMaxCopyBytes) {
+			break
+		}
+	}
+
+	// 从委托目标中添加poststarthooks
+	for k, v := range delegationTarget.PostStartHooks() {
+		s.postStartHooks[k] = v
+	}
+	// 从委托目标中添加preshutdownhooks
+	for k, v := range delegationTarget.PreShutdownHooks() {
+		s.preShutdownHooks[k] = v
+	}
+
+	// 添加预配置的poststarthooks，如果相同的名称已经注册，则返回错误
+	for name, preconfiguredPostStartHook := range c.PostStartHooks {
+		if err := s.AddPostStartHook(name, preconfiguredPostStartHook.hook); err != nil {
+			return nil, err
+		}
+	}
+
+	// 注册委托服务器的mux信号
+	for k, v := range delegationTarget.MuxAndDiscoveryCompleteSignals() {
+		if err := s.RegisterMuxAndDiscoveryCompleteSignal(k, v); err != nil {
+			return nil, err
+		}
+	}
+
+	genericApiServerHookName := "generic-apiserver-start-informers"
+    // 如果SharedInformerFactory不为空，则添加一个poststarthook来启动SharedInformerFactory
+	if c.SharedInformerFactory != nil {
+		if !s.isPostStartHookRegistered(genericApiServerHookName) {
+			err := s.AddPostStartHook(genericApiServerHookName, func(context PostStartHookContext) error {
+				c.SharedInformerFactory.Start(context.StopCh)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		// TODO: 一旦我们摆脱/healthz，考虑将其更改为post-start-hook。
+		err := s.AddReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	const priorityAndFairnessConfigConsumerHookName = "priority-and-fairness-config-consumer"
+    // 如果已经注册了priorityAndFairnessConfigConsumerHookName
+	if s.isPostStartHookRegistered(priorityAndFairnessConfigConsumerHookName) {
+	} else if c.FlowControl != nil {
+		err := s.AddPostStartHook(priorityAndFairnessConfigConsumerHookName, func(context PostStartHookContext) error {
+			go c.FlowControl.Run(context.StopCh)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		// TODO(yue9944882): plumb pre-shutdown-hook for request-management system?
+	} else {
+		klog.V(3).Infof("Not requested to run hook %s", priorityAndFairnessConfigConsumerHookName)
+	}
+
+	// 添加用于维护Priority-and-Fairness和Max-in-Flight过滤器水印的PostStartHooks。
+	if c.FlowControl != nil {
+        // 如果FlowControl配置存在，则添加一个名为"priority-and-fairness-filter"的PostStartHook来启动Priority-and-Fairness水印的维护。
+		const priorityAndFairnessFilterHookName = "priority-and-fairness-filter"
+		if !s.isPostStartHookRegistered(priorityAndFairnessFilterHookName) {
+			err := s.AddPostStartHook(priorityAndFairnessFilterHookName, func(context PostStartHookContext) error {
+				genericfilters.StartPriorityAndFairnessWatermarkMaintenance(context.StopCh)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+        // 如果FlowControl配置不存在，则添加一个名为"max-in-flight-filter"的PostStartHook来启动Max-in-Flight水印的维护。
+		const maxInFlightFilterHookName = "max-in-flight-filter"
+		if !s.isPostStartHookRegistered(maxInFlightFilterHookName) {
+			err := s.AddPostStartHook(maxInFlightFilterHookName, func(context PostStartHookContext) error {
+				genericfilters.StartMaxInFlightWatermarkMaintenance(context.StopCh)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// 添加用于维护对象计数器的PostStartHook。
+	if c.StorageObjectCountTracker != nil {
+		const storageObjectCountTrackerHookName = "storage-object-count-tracker-hook"
+		if !s.isPostStartHookRegistered(storageObjectCountTrackerHookName) {
+			if err := s.AddPostStartHook(storageObjectCountTrackerHookName, func(context PostStartHookContext) error {
+				go c.StorageObjectCountTracker.RunUntil(context.StopCh)
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// 根据委托目标的HealthzChecks添加健康检查项。
+	for _, delegateCheck := range delegationTarget.HealthzChecks() {
+		skip := false
+		for _, existingCheck := range c.HealthzChecks {
+			if existingCheck.Name() == delegateCheck.Name() {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		s.AddHealthChecks(delegateCheck)
+	}
+    // 注册一个DestroyFunc函数，用于在服务器销毁时关闭追踪器提供程序。	
+	s.RegisterDestroyFunc(func() {
+		if err := c.Config.TracerProvider.Shutdown(context.Background()); err != nil {
+			klog.Errorf("failed to shut down tracer provider: %v", err)
+		}
+	})
+	// 更新listedPathProvider，将委托目标添加到列表中。
+	s.listedPathProvider = routes.ListedPathProviders{s.listedPathProvider, delegationTarget}
+	// 安装API路由处理器。
+	installAPI(s, c.Config)
+
+	// 在委托目标的UnprotectedHandler为nil且配置中启用了EnableIndex选项时，使用委托目标的UnprotectedHandler，
+	// 确保在委托情况下不会重复使用认证器、授权器或过滤器链的其他部分。
+	if delegationTarget.UnprotectedHandler() == nil && c.EnableIndex {
+		s.Handler.NonGoRestfulMux.NotFoundHandler(routes.IndexLister{
+			StatusCode:   http.StatusNotFound,
+			PathProvider: s.listedPathProvider,
+		})
+	}
+
+	return s, nil
+}
+```
+
+##### APIServerHandler
+
+```GO
+// APIServerHandlers包含API服务器使用的不同http.Handler。
+// 这包括完整的处理程序链、导演（用于在gorestful和nonGoRestful之间进行选择）、gorestful处理程序（用于API），它会在未注册的路径上转到nonGoRestful处理程序，
+// 以及nonGoRestful处理程序（可以包含自己的转发）。
+// FullHandlerChain -> Director -> {GoRestfulContainer，NonGoRestfulMux}，基于注册的web服务进行检查
+type APIServerHandler struct {
+    // FullHandlerChain是最终提供的处理程序。它应包含完整的过滤器链并调用Director。
+    FullHandlerChain http.Handler
+    // 注册的API。InstallAPIs使用此字段。其他服务器可能不应直接访问此字段。
+    GoRestfulContainer *restful.Container
+    // NonGoRestfulMux是链中的最终HTTP处理程序。
+    // 它位于所有过滤器和API处理程序之后。
+    // 其他服务器可以将处理程序附加到链的各个部分。
+    NonGoRestfulMux *mux.PathRecorderMux
+    // Director是为了正确处理转发和代理情况。
+    // 看起来有点疯狂，但以下是正在发生的事情。我们需要在gorestful中注册处理"/apis"，以便生成兼容的swagger文档。
+    // 使用`/apis`作为web服务，意味着它会强制对非/apis或/apis/的请求返回404（不允许默认值）。
+    // 我们需要这些调用在gorestful之后继续进行正确的委托。
+    // 尝试注册一个包括其后面所有内容的模式无法正常工作，因为gorestful会进行动词和内容编码的协商，
+    // 当gorestful实际上只需要传递时，所有这些东西都会出问题。
+    // 此外，openapi强制执行唯一动词约束，我们无法符合，并且它仍然使swagger变得混乱。
+    // 尝试将webservices切换到路由中也不起作用，因为包含的webservice面临着上面列出的所有问题。
+    // 这导致了在这里执行的疯狂操作。我们的mux做了我们需要的事情，所以我们将它放在gorestful之前。
+    // 它将内省以确定路由是否可能由gorestful处理，并在需要时将其路由到NonGoRestfulMux以处理“正常”的路径和委托。
+    // 希望没有API使用者会被迫处理这种详细级别的细节。我认为我们应该考虑完全删除gorestful。
+    // 其他服务器只能将其不透明地用于委托给API服务器。
+    Director http.Handler
+}
+
+// HandlerChainBuilderFn用于使用提供的处理程序链包装
+type HandlerChainBuilderFn func(apiHandler http.Handler) http.Handler
+
+func NewAPIServerHandler(name string, s runtime.NegotiatedSerializer, handlerChainBuilder HandlerChainBuilderFn, notFoundHandler http.Handler) *APIServerHandler {
+	nonGoRestfulMux := mux.NewPathRecorderMux(name)
+	if notFoundHandler != nil {
+		nonGoRestfulMux.NotFoundHandler(notFoundHandler)
+	}
+
+	gorestfulContainer := restful.NewContainer()
+	gorestfulContainer.ServeMux = http.NewServeMux()
+	gorestfulContainer.Router(restful.CurlyRouter{}) // e.g. for proxy/{kind}/{name}/{*}
+	gorestfulContainer.RecoverHandler(func(panicReason interface{}, httpWriter http.ResponseWriter) {
+		logStackOnRecover(s, panicReason, httpWriter)
+	})
+	gorestfulContainer.ServiceErrorHandler(func(serviceErr restful.ServiceError, request *restful.Request, response *restful.Response) {
+		serviceErrorHandler(s, serviceErr, request, response)
+	})
+
+	director := director{
+		name:               name,
+		goRestfulContainer: gorestfulContainer,
+		nonGoRestfulMux:    nonGoRestfulMux,
+	}
+
+	return &APIServerHandler{
+		FullHandlerChain:   handlerChainBuilder(director),
+		GoRestfulContainer: gorestfulContainer,
+		NonGoRestfulMux:    nonGoRestfulMux,
+		Director:           director,
+	}
+}
+
+// ListedPaths返回应在/下显示的路径。
+func (a *APIServerHandler) ListedPaths() []string {
+    var handledPaths []string
+    // 提取使用restful.WebService处理的路径
+    for _, ws := range a.GoRestfulContainer.RegisteredWebServices() {
+    	handledPaths = append(handledPaths, ws.RootPath())
+    }
+    handledPaths = append(handledPaths, a.NonGoRestfulMux.ListedPaths()...)
+    sort.Strings(handledPaths)
+	return handledPaths
+}
+
+type director struct {
+	name               string
+	goRestfulContainer *restful.Container
+	nonGoRestfulMux    *mux.PathRecorderMux
+}
+
+func (d director) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	path := req.URL.Path
+
+	// 检查我们的 WebServices 是否要求处理此路径
+	for _, ws := range d.goRestfulContainer.RegisteredWebServices() {
+		switch {
+		case ws.RootPath() == "/apis":
+			// 如果路径为 "/apis" 或 "/apis/"，则需要特殊处理。
+			// 通常，这些路径会传递给 nonGoRestfulMux，但如果启用了发现功能，它将直接处理。
+			// 我们不能依赖前缀匹配，因为 "/apis" 匹配所有路径（请参见上面对 Director 的详细注释）
+			if path == "/apis" || path == "/apis/" {
+				klog.V(5).Infof("%v: %v %q 由 gorestful 处理，使用的 webservice 是 %v", d.name, req.Method, path, ws.RootPath())
+				// 这里不使用 servemux，因为当移除 webservices 时，gorestful 的 servemux 会出错
+				// TODO 修复 gorestful，移除 TPRs，或者停止使用 gorestful
+				d.goRestfulContainer.Dispatch(w, req)
+				return
+			}
+
+		case strings.HasPrefix(path, ws.RootPath()):
+			// 确保精确匹配或路径边界匹配
+			if len(path) == len(ws.RootPath()) || path[len(ws.RootPath())] == '/' {
+				klog.V(5).Infof("%v: %v %q 由 gorestful 处理，使用的 webservice 是 %v", d.name, req.Method, path, ws.RootPath())
+				// 这里不使用 servemux，因为当移除 webservices 时，gorestful 的 servemux 会出错
+				// TODO 修复 gorestful，移除 TPRs，或者停止使用 gorestful
+				d.goRestfulContainer.Dispatch(w, req)
+				return
+			}
+		}
+	}
+
+	// 如果没有找到匹配项，则直接跳过 gorestful
+	klog.V(5).Infof("%v: %v %q 由 nonGoRestful 处理", d.name, req.Method, path)
+	d.nonGoRestfulMux.ServeHTTP(w, req)
+}
+```
+
+##### GenericAPIServer
+
+```go
+// GenericAPIServer 包含 Kubernetes 集群 API 服务器的状态。
+type GenericAPIServer struct {
+    // discoveryAddresses 用于构建用于发现的集群 IP。
+    discoveryAddresses discovery.Addresses
+    // LoopbackClientConfig 是用于与 API 服务器建立特权回环连接的配置。
+    LoopbackClientConfig *restclient.Config
+
+    // minRequestTimeout 是请求超时的最短时间。用于构建 RESTHandler。
+    minRequestTimeout time.Duration
+
+    // ShutdownTimeout 是服务器关闭的超时时间。指定服务器正常关闭返回前的超时时间。
+    ShutdownTimeout time.Duration
+
+    // legacyAPIGroupPrefixes 用于设置授权和验证 InstallLegacyAPIGroup 请求的 URL 解析。
+    legacyAPIGroupPrefixes sets.String
+
+    // admissionControl 用于构建支持 API 组的 RESTStorage。
+    admissionControl admission.Interface
+
+    // SecureServingInfo 包含 TLS 服务器的配置。
+    SecureServingInfo *SecureServingInfo
+
+    // ExternalAddress 是用于此 GenericAPIServer 的外部（公共互联网）URL 的地址（主机名或 IP 和端口）。
+    ExternalAddress string
+
+    // Serializer 控制如何对此服务器的非组/版本前缀的常见 API 对象进行序列化。
+    // 各个 API 组可以定义自己的序列化程序。
+    Serializer runtime.NegotiatedSerializer
+
+    // "Outputs"
+    // Handler 包含此 API 服务器使用的处理程序。
+    Handler *APIServerHandler
+
+    // UnprotectedDebugSocket 用于在 Unix 域套接字中提供 pprof 信息。此套接字不受身份验证/授权保护。
+    UnprotectedDebugSocket *routes.DebugSocket
+
+    // listedPathProvider 是一个提供要在 / 上显示的路径集合的列表。
+    listedPathProvider routes.ListedPathProvider
+
+    // DiscoveryGroupManager 以未聚合的形式提供 /apis 服务。
+    DiscoveryGroupManager discovery.GroupManager
+
+    // AggregatedDiscoveryGroupManager 以聚合的形式提供 /apis 服务。
+    AggregatedDiscoveryGroupManager discoveryendpoint.ResourceManager
+
+    // AggregatedLegacyDiscoveryGroupManager 以聚合的形式提供 /api 服务。
+    AggregatedLegacyDiscoveryGroupManager discoveryendpoint.ResourceManager
+
+    // 如果这些配置项非空，则启用 swagger 和/或 OpenAPI。
+    openAPIConfig *openapicommon.Config
+
+    // 如果这些配置项非空，则启用 swagger 和/或 OpenAPI V3。
+    openAPIV3Config *openapicommon.Config
+
+    // SkipOpenAPIInstallation 表示在 PrepareRun 期间不安装 OpenAPI 处理程序。
+    // 当特定的 API 服务器具有自己的 OpenAPI 处理程序时，将其设置为 true
+    //（例如 kube-aggregator）。
+    skipOpenAPIInstallation bool
+
+    // OpenAPIVersionedService 控制 /openapi/v2 端点，并可用于更新提供的规范。
+    // 如果 `openAPIConfig` 非空且 `skipOpenAPIInstallation` 为 false，则在 PrepareRun 期间设置它。
+    OpenAPIVersionedService *handler.OpenAPIService
+
+   // OpenAPIV3VersionedService 控制 /openapi/v3 端点，并可用于更新提供的规范。
+    // 如果 `openAPIConfig` 非空且 `skipOpenAPIInstallation` 为 false，则在 PrepareRun 期间设置它。
+    OpenAPIV3VersionedService *handler3.OpenAPIService
+
+    // StaticOpenAPISpec 是从 restful 容器端点派生的规范。
+    // 在 PrepareRun 期间设置它。
+    StaticOpenAPISpec *spec.Swagger
+
+    // PostStartHooks 在服务器启动监听后每个钩子都会被调用，每个钩子都在单独的 goroutine 中执行，
+    // 没有保证它们之间的顺序。映射键是用于错误报告的名称。
+    // 如果希望，它可以通过返回错误来使用 panic 终止进程。
+    postStartHookLock      sync.Mutex
+    postStartHooks         map[string]postStartHookEntry
+    postStartHooksCalled   bool
+    disabledPostStartHooks sets.String
+
+    preShutdownHookLock    sync.Mutex
+    preShutdownHooks       map[string]preShutdownHookEntry
+    preShutdownHooksCalled bool
+
+    // 健康检查
+    healthzLock            sync.Mutex
+    healthzChecks          []healthz.HealthChecker
+    healthzChecksInstalled bool
+    // 存活检查
+    livezLock            sync.Mutex
+    livezChecks          []healthz.HealthChecker
+    livezChecksInstalled bool
+    // 就绪检查
+    readyzLock            sync.Mutex
+    readyzChecks          []healthz.HealthChecker
+    readyzChecksInstalled bool
+    livezGracePeriod      time.Duration
+    livezClock            clock.Clock
+
+    // 审计。后端在服务器开始侦听之前启动。
+    AuditBackend audit.Backend
+
+    // Authorizer 确定是否允许用户进行某个请求。处理程序使用请求 URI 进行初步授权检查，
+    // 但可能需要进行其他检查，例如在创建-更新的情况下。
+    Authorizer authorizer.Authorizer
+
+    // EquivalentResourceRegistry 提供与给定资源等效的资源信息，
+    // 以及与给定资源关联的种类。在安装资源时，将在此处注册它们。
+    EquivalentResourceRegistry runtime.EquivalentResourceRegistry
+
+    // delegationTarget 是链中的下一个委托。它永远不为空。
+    delegationTarget DelegationTarget
+
+    // NonLongRunningRequestWaitGroup 允许您在服务器关闭时等待与非长时间运行请求相关的所有链处理程序完成。
+    NonLongRunningRequestWaitGroup *utilwaitgroup.SafeWaitGroup
+    // WatchRequestWaitGroup 允许我们在服务器关闭时等待与活动监视请求相关的所有链处理程序完成。
+    WatchRequestWaitGroup *utilwaitgroup.RateLimitedSafeWaitGroup
+
+    // ShutdownDelayDuration 允许阻塞关闭一段时间，例如直到指向此 API 服务器的端点在所有节点上达到一致。
+    // 在此期间，API 服务器继续提供服务，/healthz 将返回 200，
+    // 但 /readyz 将返回失败。
+    ShutdownDelayDuration time.Duration
+
+    // 接受写请求的请求体大小限制。0 表示没有限制。
+    maxRequestBodyBytes int64
+
+    // APIServerID 是此 API 服务器的 ID
+    APIServerID string
+
+    // StorageVersionManager 包含由此服务器安装的 API 资源的存储版本。
+    StorageVersionManager storageversion.Manager
+
+    // 如果非空，Version 将启用 /version 端点
+    Version *version.Info
+
+    // lifecycleSignals 提供对 apiserver 生命周期中发生的各种信号的访问。
+    lifecycleSignals lifecycleSignals
+
+    // destroyFns 包含在关闭时应调用的清理资源的函数列表。
+    destroyFns []func()
+
+    // muxAndDiscoveryCompleteSignals 包含指示已注册所有已知 HTTP 路径的信号。
+    // 它主要用于避免在资源实际存在但我们还没有安装到处理程序路径时返回 404 响应。
+    // 它公开出来是为了更容易组合各个服务器。
+    // 此字段的主要用户是 WithMuxCompleteProtection 过滤器和 NotFoundHandler。
+    muxAndDiscoveryCompleteSignals map[string]<-chan struct{}
+
+    // ShutdownSendRetryAfter 规定何时在 apiserver 优雅终止期间启动 HTTP 服务器的关闭。
+    // 如果为 true，则等待正在进行的非长时间运行的请求被耗尽，然后启动 HTTP 服务器的关闭。
+    // 如果为 false，则在 ShutdownDelayDuration 经过后立即启动 HTTP 服务器的关闭。
+    // 如果启用，则在经过 ShutdownDelayDuration 之后，拒绝任何传入请求并返回 429 状态码和 'Retry-After' 响应。
+    ShutdownSendRetryAfter bool
+
+    // ShutdownWatchTerminationGracePeriod，如果设置为正值，
+    // 则是 apiserver 等待所有活动 watch 请求完成的最长持续时间。
+    // 一旦此优雅期限到期，apiserver 将不再等待任何活动的 watch 请求完成，
+    // 它将继续进行优雅服务器关闭过程的下一步。
+    // 如果设置为正值，apiserver 将跟踪活动的 watch 请求数量，并在关闭期间，
+    // 至多等待指定的持续时间，并允许这些活动的 watch 请求进行一定的速率限制。
+    // 默认值为零，表示 apiserver 不会跟踪活动的 watch 请求，并且不会等待它们完成，这保持了向后兼容性。
+    // 这个优雅期限与其他优雅期限是相互独立的，也不受任何其他优雅期限的覆盖。
+    ShutdownWatchTerminationGracePeriod time.Duration
+}
+```
+
+##### installAPI
+
+```go
+func installAPI(s *GenericAPIServer, c *Config) {
+	if c.EnableIndex {  // 如果启用索引
+		routes.Index{}.Install(s.listedPathProvider, s.Handler.NonGoRestfulMux)  // 调用 Index 结构体的 Install 方法，传入 listedPathProvider 和 s.Handler.NonGoRestfulMux
+	}
+	if c.EnableProfiling {  // 如果启用性能分析
+		routes.Profiling{}.Install(s.Handler.NonGoRestfulMux)  // 调用 Profiling 结构体的 Install 方法，传入 s.Handler.NonGoRestfulMux
+		if c.EnableContentionProfiling {  // 如果启用争用分析
+			goruntime.SetBlockProfileRate(1)  // 设置阻塞分析的频率为1
+		}
+		// 到目前为止，只有与日志记录相关的端点被认为是有效的，用于这些调试标志。
+		routes.DebugFlags{}.Install(s.Handler.NonGoRestfulMux, "v", routes.StringFlagPutHandler(logs.GlogSetter))  // 调用 DebugFlags 结构体的 Install 方法，传入 s.Handler.NonGoRestfulMux、"v" 和 routes.StringFlagPutHandler(logs.GlogSetter)
+	}
+	if s.UnprotectedDebugSocket != nil {  // 如果未受保护的调试套接字不为空
+		s.UnprotectedDebugSocket.InstallProfiling()  // 调用 UnprotectedDebugSocket 结构体的 InstallProfiling 方法
+		s.UnprotectedDebugSocket.InstallDebugFlag("v", routes.StringFlagPutHandler(logs.GlogSetter))  // 调用 UnprotectedDebugSocket 结构体的 InstallDebugFlag 方法，传入 "v" 和 routes.StringFlagPutHandler(logs.GlogSetter)
+		if c.EnableContentionProfiling {  // 如果启用争用分析
+			goruntime.SetBlockProfileRate(1)  // 设置阻塞分析的频率为1
+		}
+	}
+
+	if c.EnableMetrics {  // 如果启用指标
+		if c.EnableProfiling {  // 如果启用性能分析
+			routes.MetricsWithReset{}.Install(s.Handler.NonGoRestfulMux)  // 调用 MetricsWithReset 结构体的 Install 方法，传入 s.Handler.NonGoRestfulMux
+			if utilfeature.DefaultFeatureGate.Enabled(features.ComponentSLIs) {  // 如果启用组件SLIs特性
+				slis.SLIMetricsWithReset{}.Install(s.Handler.NonGoRestfulMux)  // 调用 SLIMetricsWithReset 结构体的 Install 方法，传入 s.Handler.NonGoRestfulMux
+			}
+		} else {
+			routes.DefaultMetrics{}.Install(s.Handler.NonGoRestfulMux)  // 调用 DefaultMetrics 结构体的 Install 方法，传入 s.Handler.NonGoRestfulMux
+			if utilfeature.DefaultFeatureGate.Enabled(features.ComponentSLIs) {  // 如果启用组件SLIs特性
+				slis.SLIMetrics{}.Install(s.Handler.NonGoRestfulMux)  // 调用 SLIMetrics 结构体的 Install 方法，传入 s.Handler.NonGoRestfulMux
+			}
+		}
+	}
+
+	routes.Version{Version: c.Version}.Install(s.Handler.GoRestfulContainer)  // 调用 Version 结构体的 Install 方法，传入 s.Handler.GoRestfulContainer 和 c.Version
+
+	if c.EnableDiscovery {  // 如果启用发现
+		if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {  // 如果启用聚合发现端点
+			wrapped := discoveryendpoint.WrapAggregatedDiscoveryToHandler(s.DiscoveryGroupManager, s.AggregatedDiscoveryGroupManager)  // 调用 discoveryendpoint 包的 WrapAggregatedDiscoveryToHandler 方法，传入 s.DiscoveryGroupManager 和 s.AggregatedDiscoveryGroupManager，并将返回值赋给 wrapped
+			s.Handler.GoRestfulContainer.Add(wrapped.GenerateWebService("/apis", metav1.APIGroupList{}))  // 调用 wrapped 的 GenerateWebService 方法，传入 "/apis" 和 metav1.APIGroupList{}，并将返回值添加到 s.Handler.GoRestfulContainer
+		} else {
+			s.Handler.GoRestfulContainer.Add(s.DiscoveryGroupManager.WebService())  // 将 s.DiscoveryGroupManager.WebService() 添加到 s.Handler.GoRestfulContainer
+		}
+	}
+	if c.FlowControl != nil && utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIPriorityAndFairness) {  // 如果 FlowControl 不为空且启用 API 优先级和公平性特性
+		c.FlowControl.Install(s.Handler.NonGoRestfulMux)  // 调用 FlowControl 的 Install 方法，传入 s.Handler.NonGoRestfulMux
+	}
+}
+```
+
 #### InstallLegacyAPI
 
 ```go
@@ -2369,7 +2945,7 @@ func (c LegacyRESTStorageProvider) NewLegacyRESTStorage(apiResourceConfigSource 
 }
 ```
 
-###### InstallLegacyAPIGroup
+##### InstallLegacyAPIGroup
 
 ```go
 // InstallLegacyAPIGroup 在 API 中公开给定的旧版 API 组。
@@ -2405,3 +2981,467 @@ func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo 
 ```
 
 #### InstallAPIs
+
+```go
+// 如果启用了restStorageProviders，则InstallAPIs函数将安装这些API。
+func (m *Instance) InstallAPIs(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter, restStorageProviders ...RESTStorageProvider) error {
+    // 创建一个空的APIGroupInfo切片，用于存储API组信息
+    apiGroupsInfo := []*genericapiserver.APIGroupInfo{}
+    // 在循环中用于通过过期日期筛选提供的资源。
+    // resourceExpirationEvaluator将在后面用到，用于评估资源的过期情况。
+    resourceExpirationEvaluator, err := genericapiserver.NewResourceExpirationEvaluator(*m.GenericAPIServer.Version)
+    if err != nil {
+        return err
+    }
+
+    // 遍历restStorageProviders切片中的每个restStorageBuilder
+    for _, restStorageBuilder := range restStorageProviders {
+        // 获取API组的名称
+        groupName := restStorageBuilder.GroupName()
+        // 调用restStorageBuilder的NewRESTStorage方法，创建API组的REST存储
+        apiGroupInfo, err := restStorageBuilder.NewRESTStorage(apiResourceConfigSource, restOptionsGetter)
+        if err != nil {
+            return fmt.Errorf("problem initializing API group %q : %v", groupName, err)
+        }
+        if len(apiGroupInfo.VersionedResourcesStorageMap) == 0 {
+            // 如果没有配置任何资源的存储，说明该API组被禁用了
+            // 这可能发生在整个API组、版本或开发阶段（alpha、beta、GA）被禁用时
+            klog.Infof("API group %q is not enabled, skipping.", groupName)
+            continue
+        }
+
+        // 删除已删除的资源类型
+        // 这样做是为了确保我们不会为我们不提供的资源类型的版本提供资源或openapi信息
+        // 这个操作位于创建单个存储处理程序之前，以便没有sig意外忘记检查
+        resourceExpirationEvaluator.RemoveDeletedKinds(groupName, apiGroupInfo.Scheme, apiGroupInfo.VersionedResourcesStorageMap)
+        if len(apiGroupInfo.VersionedResourcesStorageMap) == 0 {
+            klog.V(1).Infof("Removing API group %v because it is time to stop serving it because it has no versions per APILifecycle.", groupName)
+            continue
+        }
+
+        klog.V(1).Infof("Enabling API group %q.", groupName)
+
+        // 检查restStorageBuilder是否实现了genericapiserver.PostStartHookProvider接口
+        if postHookProvider, ok := restStorageBuilder.(genericapiserver.PostStartHookProvider); ok {
+            // 调用PostStartHook方法获取后置钩子的名称、钩子函数和错误信息
+            name, hook, err := postHookProvider.PostStartHook()
+            if err != nil {
+                klog.Fatalf("Error building PostStartHook: %v", err)
+            }
+            // 将后置钩子添加到GenericAPIServer中
+            m.GenericAPIServer.AddPostStartHookOrDie(name, hook)
+        }
+
+        // 将API组信息添加到apiGroupsInfo切片中
+        apiGroupsInfo = append(apiGroupsInfo, &apiGroupInfo)
+    }
+
+    // 安装API组到GenericAPIServer中
+    if err := m.GenericAPIServer.InstallAPIGroups(apiGroupsInfo...); err != nil {
+        return fmt.Errorf("error in registering group versions: %v", err)
+    }
+    return nil
+}
+
+type RESTStorageProvider interface {
+	GroupName() string
+	NewRESTStorage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) (genericapiserver.APIGroupInfo, error)
+}
+```
+
+### createAggregatorConfig
+
+```go
+func createAggregatorConfig(
+kubeAPIServerConfig genericapiserver.Config,
+commandOptions *options.ServerRunOptions,
+externalInformers kubeexternalinformers.SharedInformerFactory,
+serviceResolver aggregatorapiserver.ServiceResolver,
+proxyTransport *http.Transport,
+pluginInitializers []admission.PluginInitializer,
+) (*aggregatorapiserver.Config, error) {
+	// 创建一个聚合器配置对象aggregatorConfig
+    // 创建一个泛型配置对象genericConfig，并将kubeAPIServerConfig赋值给它，以进行浅拷贝
+    // 大部分配置保持不变，只需要修改与聚合器相关的几个项目
+    genericConfig := kubeAPIServerConfig
+    // 清空PostStartHooks，以避免将它们多次添加到所有服务器上（这样会导致失败）
+    genericConfig.PostStartHooks = map[string]genericapiserver.PostStartHookConfigEntry{}
+    // 将RESTOptionsGetter设置为nil，防止泛型API服务器安装OpenAPI处理程序。
+    // 聚合器服务器有自定义的OpenAPI处理程序。
+    genericConfig.RESTOptionsGetter = nil
+    // 设置SkipOpenAPIInstallation为true，阻止泛型API服务器安装OpenAPI处理程序。
+    // 聚合器服务器有自定义的OpenAPI处理程序。
+    genericConfig.SkipOpenAPIInstallation = true
+
+    // 如果启用了StorageVersionAPI和APIServerIdentity特性
+    if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StorageVersionAPI) &&
+        utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerIdentity) {
+        // 向aggregator-apiserver添加StorageVersionPrecondition处理程序。
+        // 该处理程序将阻止写请求到内置资源，直到目标资源的存储版本为最新。
+        genericConfig.BuildHandlerChainFunc = genericapiserver.BuildHandlerChainWithStorageVersionPrecondition
+    }
+
+    // 复制etcd选项，以避免对原始选项进行修改。
+    // 假设etcd选项已经完成。避免修改StorageConfig以外的任何内容，因为这可能会导致应用选项时出现意外行为。
+    etcdOptions := *commandOptions.Etcd
+    // 根据特性门控开启或关闭APIListChunking特性
+    etcdOptions.StorageConfig.Paging = utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIListChunking)
+    // 设置etcdOptions的StorageConfig.Codec为v1和v1beta1版本的LegacyCodec编解码器
+    etcdOptions.StorageConfig.Codec = aggregatorscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion, v1beta1.SchemeGroupVersion)
+    // 设置etcdOptions的StorageConfig.EncodeVersioner为包含v1和v1beta1版本的MultiGroupVersioner编码器
+    etcdOptions.StorageConfig.EncodeVersioner = runtime.NewMultiGroupVersioner(v1.SchemeGroupVersion, schema.GroupKind{Group: v1beta1.GroupName})
+    // 设置SkipHealthEndpoints为true，避免重复连接健康检查
+    etcdOptions.SkipHealthEndpoints = true
+    // 将etcd选项应用到genericConfig中
+    if err := etcdOptions.ApplyTo(&genericConfig); err != nil {
+        return nil, err
+    }
+
+    // 使用聚合器的默认API资源配置和注册表，覆盖MergedResourceConfig
+    if err := commandOptions.APIEnablement.ApplyTo(
+        &genericConfig,
+        aggregatorapiserver.DefaultAPIResourceConfigSource(),
+        aggregatorscheme.Scheme); err != nil {
+        return nil, err
+    }
+
+    // 创建聚合器配置对象aggregatorConfig
+    aggregatorConfig := &aggregatorapiserver.Config{
+        GenericConfig: &genericapiserver.RecommendedConfig{
+            Config:                genericConfig,
+            SharedInformerFactory: externalInformers,
+        },
+        ExtraConfig: aggregatorapiserver.ExtraConfig{
+            ProxyClientCertFile:       commandOptions.ProxyClientCertFile,
+            ProxyClientKeyFile:        commandOptions.ProxyClientKeyFile,
+            ServiceResolver:           serviceResolver,
+            ProxyTransport:            proxyTransport,
+            RejectForwardingRedirects: commandOptions.AggregatorRejectForwardingRedirects,
+        },
+    }
+
+    // 清空poststarthooks，以避免将它们多次添加到所有服务器上（这样会导致失败）
+    aggregatorConfig.GenericConfig.PostStartHooks = map[string]genericapiserver.PostStartHookConfigEntry{}
+
+    return aggregatorConfig, nil
+}
+
+type Config struct {
+	GenericConfig *genericapiserver.RecommendedConfig
+	ExtraConfig   ExtraConfig
+}
+```
+
+
+
+```go
+func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
+    // 根据给定的聚合器配置、委托API服务器和API扩展Informer工厂创建聚合器服务器
+    aggregatorServer, err := aggregatorConfig.Complete().NewWithDelegate(delegateAPIServer)
+    if err != nil {
+    	return nil, err
+    }
+    // 为自动注册创建控制器
+    apiRegistrationClient, err := apiregistrationclient.NewForConfig(aggregatorConfig.GenericConfig.LoopbackClientConfig)
+    if err != nil {
+        return nil, err
+    }
+    autoRegistrationController := autoregister.NewAutoRegisterController(aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), apiRegistrationClient)
+    apiServices := apiServicesToRegister(delegateAPIServer, autoRegistrationController)
+    crdRegistrationController := crdregistration.NewCRDRegistrationController(
+        apiExtensionInformers.Apiextensions().V1().CustomResourceDefinitions(),
+        autoRegistrationController)
+
+    // 将所有内置组的优先级赋予聚合的发现
+    if aggregatorConfig.GenericConfig.AggregatedDiscoveryGroupManager != nil {
+        for gv, entry := range apiVersionPriorities {
+            aggregatorConfig.GenericConfig.AggregatedDiscoveryGroupManager.SetGroupVersionPriority(metav1.GroupVersion(gv), int(entry.group), int(entry.version))
+        }
+    }
+
+    err = aggregatorServer.GenericAPIServer.AddPostStartHook("kube-apiserver-autoregistration", func(context genericapiserver.PostStartHookContext) error {
+        // 在新启动的协程中运行CRD注册控制器和自动注册控制器
+        go crdRegistrationController.Run(5, context.StopCh)
+        go func() {
+            // 在启动自动注册控制器之前，让CRD控制器处理初始的CRD集合。
+            // 这样可以防止自动注册控制器的初始同步删除仍然存在的CRD的APIServices。
+            // 只有当该服务器上启用了CRD时才需要执行此操作。我们无法使用discovery，因为我们是discovery的来源。
+            if aggregatorConfig.GenericConfig.MergedResourceConfig.ResourceEnabled(apiextensionsv1.SchemeGroupVersion.WithResource("customresourcedefinitions")) {
+                crdRegistrationController.WaitForInitialSync()
+            }
+            autoRegistrationController.Run(5, context.StopCh)
+        }()
+        return nil
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
+        makeAPIServiceAvailableHealthCheck(
+            "autoregister-completion",
+            apiServices,
+            aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
+        ),
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    return aggregatorServer, nil
+}
+```
+
+#### NewWithDelegate
+
+```go
+// NewWithDelegate根据给定的配置返回APIAggregator的新实例。
+func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.DelegationTarget) (*APIAggregator, error) {
+    genericServer, err := c.GenericConfig.New("kube-aggregator", delegationTarget)
+    if err != nil {
+    	return nil, err
+    }
+    apiregistrationClient, err := clientset.NewForConfig(c.GenericConfig.LoopbackClientConfig)
+    if err != nil {
+        return nil, err
+    }
+    informerFactory := informers.NewSharedInformerFactory(
+        apiregistrationClient,
+        5*time.Minute, // 这实际上被用作刷新间隔。以后可能需要更好的处理方式。
+    )
+
+    // apiServiceRegistrationControllerInitiated在APIServiceRegistrationController完成"安装"所有已知APIService时关闭。
+    // 此时，我们知道代理处理程序知道APIService并且可以处理客户端请求。
+    // 在此之前，它可能会导致404响应，这可能对一些控制器（如GC和NS）产生严重后果。
+    //
+    // 注意，APIServiceRegistrationController在APIServiceInformer同步之后才会开始工作。
+    apiServiceRegistrationControllerInitiated := make(chan struct{})
+    if err := genericServer.RegisterMuxAndDiscoveryCompleteSignal("APIServiceRegistrationControllerInitiated", apiServiceRegistrationControllerInitiated); err != nil {
+        return nil, err
+    }
+
+    var proxyTransportDial *transport.DialHolder
+    if c.GenericConfig.EgressSelector != nil {
+        egressDialer, err := c.GenericConfig.EgressSelector.Lookup(egressselector.Cluster.AsNetworkContext())
+        if err != nil {
+            return nil, err
+        }
+        if egressDialer != nil {
+            proxyTransportDial = &transport.DialHolder{Dial: egressDialer}
+        }
+    } else if c.ExtraConfig.ProxyTransport != nil && c.ExtraConfig.ProxyTransport.DialContext != nil {
+        proxyTransportDial = &transport.DialHolder{Dial: c.ExtraConfig.ProxyTransport.DialContext}
+    }
+
+    s := &APIAggregator{
+        GenericAPIServer:           genericServer,
+        delegateHandler:            delegationTarget.UnprotectedHandler(),
+        proxyTransportDial:         proxyTransportDial,
+        proxyHandlers:              map[string]*proxyHandler{},
+        handledGroups:              sets.String{},
+        lister:                     informerFactory.Apiregistration().V1().APIServices().Lister(),
+        APIRegistrationInformers:   informerFactory,
+        serviceResolver:            c.ExtraConfig.ServiceResolver,
+        openAPIConfig:              c.GenericConfig.OpenAPIConfig,
+        openAPIV3Config:            c.GenericConfig.OpenAPIV3Config,
+        proxyCurrentCertKeyContent: func() (bytes []byte, bytes2 []byte) { return nil, nil },
+        rejectForwardingRedirects:  c.ExtraConfig.RejectForwardingRedirects,
+    }
+
+    // 以后用于根据已过期的资源进行筛选的评估器。
+    resourceExpirationEvaluator, err := genericapiserver.NewResourceExpirationEvaluator(*c.GenericConfig.Version)
+    if err != nil {
+        return nil, err
+    }
+
+    apiGroupInfo := apiservicerest.NewRESTStorage(c.GenericConfig.MergedResourceConfig, c.GenericConfig.RESTOptionsGetter, resourceExpirationEvaluator.ShouldServeForVersion(1,
+	// 安装 API Group
+    if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
+        return nil, err
+    }
+
+    // 创建一个集合 enabledVersions 来存储可用的版本信息
+    enabledVersions := sets.NewString()
+    for v := range apiGroupInfo.VersionedResourcesStorageMap {
+        enabledVersions.Insert(v)
+    }
+
+    // 检查所需的版本是否已启用
+    if !enabledVersions.Has(v1.SchemeGroupVersion.Version) {
+        return nil, fmt.Errorf("API group/version %s must be enabled", v1.SchemeGroupVersion.String())
+    }
+
+    // 创建 apisHandler 对象
+    apisHandler := &apisHandler{
+        codecs:         aggregatorscheme.Codecs,
+        lister:         s.lister,
+        discoveryGroup: discoveryGroup(enabledVersions),
+    }
+
+    // 根据 feature gate 判断是否使用带有聚合支持的 apisHandler
+    if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
+        apisHandlerWithAggregationSupport := aggregated.WrapAggregatedDiscoveryToHandler(apisHandler, s.GenericAPIServer.AggregatedDiscoveryGroupManager)
+        s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", apisHandlerWithAggregationSupport)
+    } else {
+        s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", apisHandler)
+    }
+    s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandle("/apis/", apisHandler)
+
+    // 创建 apiserviceRegistrationController 对象
+    apiserviceRegistrationController := NewAPIServiceRegistrationController(informerFactory.Apiregistration().V1().APIServices(), s)
+
+    // 检查是否存在代理客户端证书和密钥文件，如果存在则创建动态证书对象
+    if len(c.ExtraConfig.ProxyClientCertFile) > 0 && len(c.ExtraConfig.ProxyClientKeyFile) > 0 {
+        aggregatorProxyCerts, err := dynamiccertificates.NewDynamicServingContentFromFiles("aggregator-proxy-cert", c.ExtraConfig.ProxyClientCertFile, c.ExtraConfig.ProxyClientKeyFile)
+        if err != nil {
+            return nil, err
+        }
+
+        // 运行一次 aggregatorProxyCerts，将证书内容存储到 s.proxyCurrentCertKeyContent 中
+        ctx := context.TODO()
+        if err := aggregatorProxyCerts.RunOnce(ctx); err != nil {
+            return nil, err
+        }
+        aggregatorProxyCerts.AddListener(apiserviceRegistrationController)
+        s.proxyCurrentCertKeyContent = aggregatorProxyCerts.CurrentCertKeyContent
+
+        // 添加 aggregator-reload-proxy-client-cert 钩子函数，在启动后重新加载代理客户端证书
+        s.GenericAPIServer.AddPostStartHookOrDie("aggregator-reload-proxy-client-cert", func(postStartHookContext genericapiserver.PostStartHookContext) error {
+            ctx, cancel := context.WithCancel(context.Background())
+            go func() {
+                select {
+                case <-postStartHookContext.StopCh:
+                    cancel()
+                case <-ctx.Done():
+                }
+            }()
+            go aggregatorProxyCerts.Run(ctx, 1)
+            return nil
+        })
+    }
+
+    // 创建 availableController 对象
+    availableController, err := statuscontrollers.NewAvailableConditionController(
+        informerFactory.Apiregistration().V1().APIServices(),
+        c.GenericConfig.SharedInformerFactory.Core().V1().Services(),
+        c.GenericConfig.SharedInformerFactory.Core().V1().Endpoints(),
+        apiregistrationClient.ApiregistrationV1(),
+        proxyTransportDial,
+        (func() ([]byte, []byte))(s.proxyCurrentCertKeyContent),
+        s.serviceResolver,
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    // 添加 start-kube-aggregator-informers 钩子函数，在启动后开始 informer
+    s.GenericAPIServer.AddPostStartHookOrDie("start-kube-aggregator-informers", func(context genericapiserver.PostStartHookContext) error {
+        informerFactory.Start(context.StopCh)
+        c.GenericConfig.SharedInformerFactory.Start(context.StopCh)
+        return nil
+    })
+
+    // 添加 apiservice-registration-controller 钩子函数，在启动后运行 apiserviceRegistrationController
+    s.GenericAPIServer.AddPostStartHookOrDie("apiservice-registration-controller", func(context genericapiserver.PostStartHookContext) error {
+        go apiserviceRegistrationController.Run(context.StopCh, apiServiceRegistrationControllerInitiated)
+        select {
+        case <-context.StopCh:
+        case <-apiServiceRegistrationControllerInitiated:
+        }
+        return nil
+    })
+
+    // 添加 apiservice-status-available-controller 钩子函数，在启动后运行 availableController
+    s.GenericAPIServer.AddPostStartHookOrDie("apiservice-status-available-controller", func(context genericapiserver.PostStartHookContext) error {
+        go availableController.Run(5, context.StopCh)
+        return nil
+    })
+
+    // 如果启用了 StorageVersionAPI 和 APIServerIdentity，添加 StorageVersion 更新的钩子函数
+    if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StorageVersionAPI) &&
+        utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerIdentity) {
+        s.GenericAPIServer.AddPostStartHookOrDie(StorageVersionPostStartHookName, func(hookContext genericapiserver.PostStartHookContext) error {
+            // 在更新 StorageVersion 之前先等待 apiserver-identity 存在，避免意外删除 storage versions
+            kubeClient, err := kubernetes.NewForConfig(hookContext.LoopbackClientConfig)
+            if err != nil {
+                return err
+            }
+            if err := wait.PollImmediateUntil(100*time.Millisecond, func() (bool, error) {
+                _, err := kubeClient.CoordinationV1().Leases(metav1.NamespaceSystem).Get(
+                    context.TODO(), s.GenericAPIServer.APIServerID, metav1.GetOptions{})
+                if apierrors.IsNotFound(err) {
+                    return false, nil
+                }
+                if err != nil {
+                    return false, err
+                }
+                return true, nil
+            }, hookContext.StopCh); err != nil {
+                return fmt.Errorf("failed to wait for apiserver-identity lease %s to be created: %v",
+                    s.GenericAPIServer.APIServerID, err)
+            }
+            // 每隔 10 分钟更新一次 StorageVersion
+            go wait.PollImmediateUntil(10*time.Minute, func() (bool, error) {
+                s.GenericAPIServer.StorageVersionManager.UpdateStorageVersions(hookContext.LoopbackClientConfig, s.GenericAPIServer.APIServerID)
+                return false, nil
+            }, hookContext.StopCh)
+            // 等待 StorageVersion 更新完成
+            wait.PollImmediateUntil(1*time.Second, func() (bool, error) {
+                return s.GenericAPIServer.StorageVersionManager.Completed(), nil
+            }, hookContext.StopCh)
+            return nil
+        })
+    }
+
+    return s, nil
+}
+```
+
+##### APIAggregator
+
+```go
+// APIAggregator 包含 Kubernetes 集群主节点/ API 服务器的状态。
+type APIAggregator struct {
+	GenericAPIServer *genericapiserver.GenericAPIServer
+
+	// 用于更容易地嵌入
+	APIRegistrationInformers informers.SharedInformerFactory
+
+	delegateHandler http.Handler
+
+	// proxyCurrentCertKeyContent 包含用于标识此代理的客户端证书。支持的 APIServices 使用此证书确认代理的身份
+	proxyCurrentCertKeyContent certKeyFunc
+	proxyTransportDial         *transport.DialHolder
+
+	// proxyHandlers 是当前注册的代理处理程序，以 apiservice.name 为键
+	proxyHandlers map[string]*proxyHandler
+	// handledGroups 是已处理的组的集合
+	handledGroups sets.String
+
+	// lister 用于基于控制器状态为 /apis/<group> 聚合查找添加组处理
+	lister listers.APIServiceLister
+
+	// 用于确定聚合器路由的信息
+	serviceResolver ServiceResolver
+
+	// 如果这些配置非空，则启用 swagger 和/或 OpenAPI。
+	openAPIConfig *openapicommon.Config
+
+	// 如果这些配置非空，则启用 OpenAPI V3
+	openAPIV3Config *openapicommon.Config
+
+	// openAPIAggregationController 下载并合并 OpenAPI v2 规范。
+	openAPIAggregationController *openapicontroller.AggregationController
+
+	// openAPIV3AggregationController 下载并缓存 OpenAPI v3 规范。
+	openAPIV3AggregationController *openapiv3controller.AggregationController
+
+	// discoveryAggregationController 下载并缓存来自所有聚合的 apiservices 的发现文档，
+	// 这样当请求带有资源的发现时，它们将在 /apis 端点可用
+	discoveryAggregationController DiscoveryAggregationController
+
+	// rejectForwardingRedirects 表示是否允许转发重定向响应
+	rejectForwardingRedirects bool
+}
+```
+
