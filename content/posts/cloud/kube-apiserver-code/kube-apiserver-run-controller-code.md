@@ -2803,3 +2803,2204 @@ func (c *Controller) buildV3Spec(crd *apiextensionsv1.CustomResourceDefinition, 
 }
 ```
 
+### KubeAPIServer
+
+#### ClusterAuthenticationInfo
+
+这个控制器的作用是维护 kube-system 命名空间中的一个名为 "configmap/extension-apiserver-authentication" 的 ConfigMap 对象，该 ConfigMap 保存了有关如何配置聚合 API 服务器的信息。它监视该 ConfigMap 对象的变化，并根据变化执行相应的操作。
+
+该控制器的主要任务包括：
+
+1. 同步 kube-system 命名空间中的 ConfigMap 对象的变化。
+2. 根据 ConfigMap 的变化，执行相应的操作，如添加、更新和删除。
+3. 将待处理的工作项放入队列中，以便进行去重和错误时的重新入队列。
+4. 使用特定的 informer 跟踪 kube-system 命名空间中 ConfigMap 对象的变化。
+5. 在控制循环启动之前，同步所需的缓存。
+
+```go
+// Controller结构体保存控制器的运行状态
+type Controller struct {
+	requiredAuthenticationData ClusterAuthenticationInfo
+    configMapLister corev1listers.ConfigMapLister
+    configMapClient corev1client.ConfigMapsGetter
+    namespaceClient corev1client.NamespacesGetter
+
+    // queue用于存放待处理的工作项，实现去重和错误时的重新入队列
+    // 这里只会放入一个条目，但是按照惯例以namespace/name为键
+    queue workqueue.RateLimitingInterface
+
+    // kubeSystemConfigMapInformer用于跟踪kube-system命名空间中的ConfigMap对象的变化
+    kubeSystemConfigMapInformer cache.SharedIndexInformer
+
+    // preRunCaches是在启动控制循环的工作之前需要同步的缓存
+    preRunCaches []cache.InformerSynced
+}
+
+// ClusterAuthenticationInfo保存将包含在公共configmap中的信息
+type ClusterAuthenticationInfo struct {
+    // ClientCA是用于验证普通客户端身份的CA
+    ClientCA dynamiccertificates.CAContentProvider
+    // RequestHeaderUsernameHeaders是kube-apiserver用于确定用户名的标头
+    RequestHeaderUsernameHeaders headerrequest.StringSliceProvider
+    // RequestHeaderGroupHeaders是kube-apiserver用于确定用户组的标头
+    RequestHeaderGroupHeaders headerrequest.StringSliceProvider
+    // RequestHeaderExtraHeaderPrefixes是kube-apiserver用于确定user.extra的标头
+    RequestHeaderExtraHeaderPrefixes headerrequest.StringSliceProvider
+    // RequestHeaderAllowedNames是允许作为前端代理的主体
+    RequestHeaderAllowedNames headerrequest.StringSliceProvider
+    // RequestHeaderCA是用于验证前端代理的CA
+	RequestHeaderCA dynamiccertificates.CAContentProvider
+}
+
+// NewClusterAuthenticationTrustController返回一个控制器，该控制器将维护kube-system命名空间中的configmap/extension-apiserver-authentication
+// 该configmap包含关于如何建议（但不是必须）配置聚合API服务器的信息
+func NewClusterAuthenticationTrustController(requiredAuthenticationData ClusterAuthenticationInfo, kubeClient kubernetes.Interface) Controller {
+    // 我们构造自己的informer，因为我们只需要可用信息的一个非常小的子集，仅一个命名空间。
+    kubeSystemConfigMapInformer := corev1informers.NewConfigMapInformer(kubeClient, configMapNamespace, 12time.Hour, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+    c := &Controller{
+        requiredAuthenticationData:  requiredAuthenticationData,
+        configMapLister:             corev1listers.NewConfigMapLister(kubeSystemConfigMapInformer.GetIndexer()),
+        configMapClient:             kubeClient.CoreV1(),
+        namespaceClient:             kubeClient.CoreV1(),
+        queue:                       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "cluster_authentication_trust_controller"),
+        preRunCaches:                []cache.InformerSynced{kubeSystemConfigMapInformer.HasSynced},
+        kubeSystemConfigMapInformer: kubeSystemConfigMapInformer,
+    }
+
+    kubeSystemConfigMapInformer.AddEventHandler(cache.FilteringResourceEventHandler{
+        FilterFunc: func(obj interface{}) bool {
+            if cast, ok := obj.(*corev1.ConfigMap); ok {
+                return cast.Name == configMapName
+            }
+            if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+                if cast, ok := tombstone.Obj.(*corev1.ConfigMap); ok {
+                    return cast.Name == configMapName
+                }
+            }
+            return true // 总是返回true，以防万一。这些检查是相当便宜的
+        },
+        Handler: cache.ResourceEventHandlerFuncs{
+            // 由于有过滤器，所以每次被调用时都可以入队列。我们只检查一个configmap
+            // 所以我们不必挑剔我们的键。
+            AddFunc: func(obj interface{}) {
+                c.queue.Add(keyFn())
+            },
+            UpdateFunc: func(oldObj, newObj interface{}) {
+                c.queue.Add(keyFn())
+            },
+            DeleteFunc: func(obj interface{}) {
+                c.queue.Add(keyFn())
+            },
+        },
+    })
+
+    return c
+}
+
+func (c *Controller) Enqueue() {
+	c.queue.Add(keyFn())
+}
+
+// 运行控制器直到停止。
+func (c *Controller) Run(ctx context.Context, workers int) {
+    defer utilruntime.HandleCrash()
+    // 确保工作队列被关闭，这将触发工作线程结束
+    defer c.queue.ShutDown()
+	klog.Infof("Starting cluster_authentication_trust_controller controller")
+    defer klog.Infof("Shutting down cluster_authentication_trust_controller controller")
+
+    // 我们有一个范围狭窄的个人informer，启动它。
+    go c.kubeSystemConfigMapInformer.Run(ctx.Done())
+
+    // 在开始工作之前，等待辅助缓存填充
+    if !cache.WaitForNamedCacheSync("cluster_authentication_trust_controller", ctx.Done(), c.preRunCaches...) {
+        return
+    }
+
+    // 只运行一个工作线程
+    go wait.Until(c.runWorker, time.Second, ctx.Done())
+
+    // 检查是廉价的操作。每分钟运行一次，以确保我们保持同步，以防fsnotify再次失败
+    // 启动每分钟重新检查的定时器，以快速启动控制器。
+    _ = wait.PollImmediateUntil(1*time.Minute, func() (bool, error) {
+        c.queue.Add(keyFn())
+        return false, nil
+    }, ctx.Done())
+
+    // 等待直到收到停止信号
+    <-ctx.Done()
+}
+
+func (c *Controller) runWorker() {
+    // 热循环，直到收到停止信号。processNextWorkItem会自动等待直到有工作可用，所以不必担心二次等待
+    for c.processNextWorkItem() {
+    }
+}
+
+// processNextWorkItem处理队列中的一个键。当需要退出时返回false。
+func (c *Controller) processNextWorkItem() bool {
+// 从队列中获取下一个工作项。它应该是一个用于在缓存中查找的键
+    key, quit := c.queue.Get()
+    if quit {
+        return false
+    }
+    // 你总是要通知队列你已经完成了一项工作
+    defer c.queue.Done(key)
+    // 在键上执行工作。这个方法包含你的"做事情"逻辑
+    err := c.syncConfigMap()
+    if err == nil {
+        // 如果没有错误，告诉队列停止跟踪该键的历史记录。这将重置每个项的故障计数，用于每项速率限制
+        c.queue.Forget(key)
+        return true
+    }
+
+    // 出现错误，确保报告它。这个方法允许可插入的错误处理，可以用于集群监控等功能
+    utilruntime.HandleError(fmt.Errorf("%v failed with : %v", key, err))
+    // 由于失败，我们应该重新将该项加入队列，以便以后处理。这个方法将添加退避，以避免对特定项进行热循环（它们可能还不能立即正常工作）
+    // 并提供整体控制器保护（我所做的一切都是错误的，这个控制器需要冷静下来，否则它会让其他有用的工作饿死）。
+    c.queue.AddRateLimited(key)
+
+    return true
+}
+
+func keyFn() string {
+    // 这个格式与我们的单个键的DeletionHandlingMetaNamespaceKeyFunc匹配
+    return configMapNamespace + "/" + configMapName
+}
+
+func encodeCertificates(certs ...*x509.Certificate) ([]byte, error) {
+    b := bytes.Buffer{}
+    for _, cert := range certs {
+        if err := pem.Encode(&b, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
+        	return []byte{}, err
+        }
+    }
+    return b.Bytes(), nil
+}
+
+func (c *Controller) syncConfigMap() error {
+	// 同步 ConfigMap
+	originalAuthConfigMap, err := c.configMapLister.ConfigMaps(configMapNamespace).Get(configMapName)
+	if apierrors.IsNotFound(err) {
+		// 如果 ConfigMap 不存在，则创建一个新的 ConfigMap
+		originalAuthConfigMap = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: configMapNamespace, Name: configMapName},
+		}
+	} else if err != nil {
+		return err
+	}
+	// 保留原始的 ConfigMap 以便后面比较更新
+	authConfigMap := originalAuthConfigMap.DeepCopy()
+
+	// 获取现有的身份验证信息
+	existingAuthenticationInfo, err := getClusterAuthenticationInfoFor(originalAuthConfigMap.Data)
+	if err != nil {
+		return err
+	}
+	// 将现有的身份验证信息和所需的身份验证数据合并
+	combinedInfo, err := combinedClusterAuthenticationInfo(existingAuthenticationInfo, c.requiredAuthenticationData)
+	if err != nil {
+		return err
+	}
+	// 根据合并后的身份验证信息生成新的 ConfigMap 数据
+	authConfigMap.Data, err = getConfigMapDataFor(combinedInfo)
+	if err != nil {
+		return err
+	}
+
+	// 检查是否有更新，如果没有更新则直接返回
+	if equality.Semantic.DeepEqual(authConfigMap, originalAuthConfigMap) {
+		klog.V(5).Info("no changes to configmap")
+		return nil
+	}
+	klog.V(2).Infof("writing updated authentication info to  %s configmaps/%s", configMapNamespace, configMapName)
+
+	// 如果需要，创建命名空间
+	if err := createNamespaceIfNeeded(c.namespaceClient, authConfigMap.Namespace); err != nil {
+		return err
+	}
+	// 写入 ConfigMap
+	if err := writeConfigMap(c.configMapClient, authConfigMap); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// 如果命名空间不存在，则创建命名空间
+func createNamespaceIfNeeded(nsClient corev1client.NamespacesGetter, ns string) error {
+	if _, err := nsClient.Namespaces().Get(context.TODO(), ns, metav1.GetOptions{}); err == nil {
+		// 命名空间已经存在
+		return nil
+	}
+	// 创建新的命名空间
+	newNs := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ns,
+			Namespace: "",
+		},
+	}
+	_, err := nsClient.Namespaces().Create(context.TODO(), newNs, metav1.CreateOptions{})
+	if err != nil && apierrors.IsAlreadyExists(err) {
+		err = nil
+	}
+	return err
+}
+
+// 写入 ConfigMap
+func writeConfigMap(configMapClient corev1client.ConfigMapsGetter, required *corev1.ConfigMap) error {
+	_, err := configMapClient.ConfigMaps(required.Namespace).Update(context.TODO(), required, metav1.UpdateOptions{})
+	if apierrors.IsNotFound(err) {
+		// 如果 ConfigMap 不存在，则创建新的 ConfigMap
+		_, err := configMapClient.ConfigMaps(required.Namespace).Create(context.TODO(), required, metav1.CreateOptions{})
+		return err
+	}
+
+	// 如果 ConfigMap 太大，清除整个 ConfigMap，并依靠该控制器（或另一个控制器）添加正确的数据。
+	// 返回原始的错误以重新排队。
+	// 太大的意思是
+	//   1. 请求太大，被通用请求捕捉器发现
+	//   2. 内容太大，服务器发送一个验证错误 "Too long: must have at most 1048576 characters"
+	if apierrors.IsRequestEntityTooLargeError(err) || (apierrors.IsInvalid(err) && strings.Contains(err.Error(), "Too long")) {
+		// 如果删除 ConfigMap 失败，则返回删除错误
+		if deleteErr := configMapClient.ConfigMaps(required.Namespace).Delete(context.TODO(), required.Name, metav1.DeleteOptions{}); deleteErr != nil {
+			return deleteErr
+		}
+		return err
+	}
+
+	return err
+}
+
+// combinedClusterAuthenticationInfo 函数将两组认证信息合并为一组新的信息
+func combinedClusterAuthenticationInfo(lhs, rhs ClusterAuthenticationInfo) (ClusterAuthenticationInfo, error) {
+    ret := ClusterAuthenticationInfo{
+        RequestHeaderAllowedNames: combineUniqueStringSlices(lhs.RequestHeaderAllowedNames, rhs.RequestHeaderAllowedNames), // 将 lhs.RequestHeaderAllowedNames 和 rhs.RequestHeaderAllowedNames 合并为一个去重的字符串切片
+        RequestHeaderExtraHeaderPrefixes: combineUniqueStringSlices(lhs.RequestHeaderExtraHeaderPrefixes, rhs.RequestHeaderExtraHeaderPrefixes), // 将 lhs.RequestHeaderExtraHeaderPrefixes 和 rhs.RequestHeaderExtraHeaderPrefixes 合并为一个去重的字符串切片
+        RequestHeaderGroupHeaders: combineUniqueStringSlices(lhs.RequestHeaderGroupHeaders, rhs.RequestHeaderGroupHeaders), // 将 lhs.RequestHeaderGroupHeaders 和 rhs.RequestHeaderGroupHeaders 合并为一个去重的字符串切片
+        RequestHeaderUsernameHeaders: combineUniqueStringSlices(lhs.RequestHeaderUsernameHeaders, rhs.RequestHeaderUsernameHeaders), // 将 lhs.RequestHeaderUsernameHeaders 和 rhs.RequestHeaderUsernameHeaders 合并为一个去重的字符串切片
+    }
+    var err error
+    ret.ClientCA, err = combineCertLists(lhs.ClientCA, rhs.ClientCA) // 将 lhs.ClientCA 和 rhs.ClientCA 合并为一个证书列表
+    if err != nil {
+        return ClusterAuthenticationInfo{}, err
+    }
+    ret.RequestHeaderCA, err = combineCertLists(lhs.RequestHeaderCA, rhs.RequestHeaderCA) // 将 lhs.RequestHeaderCA 和 rhs.RequestHeaderCA 合并为一个证书列表
+    if err != nil {
+        return ClusterAuthenticationInfo{}, err
+    }
+
+    return ret, nil
+}
+
+// getConfigMapDataFor 函数根据给定的认证信息返回配置映射数据
+func getConfigMapDataFor(authenticationInfo ClusterAuthenticationInfo) (map[string]string, error) {
+	data := map[string]string{}
+    if authenticationInfo.ClientCA != nil {
+        if caBytes := authenticationInfo.ClientCA.CurrentCABundleContent(); len(caBytes) > 0 {
+            data["client-ca-file"] = string(caBytes) // 将 caBytes 转换为字符串并存储在 "client-ca-file" 键下
+        }
+    }
+
+    if authenticationInfo.RequestHeaderCA == nil {
+        return data, nil
+    }
+
+    if caBytes := authenticationInfo.RequestHeaderCA.CurrentCABundleContent(); len(caBytes) > 0 {
+        var err error
+
+        // 编码错误不会变好，所以直接报错
+        data["requestheader-username-headers"], err = jsonSerializeStringSlice(authenticationInfo.RequestHeaderUsernameHeaders.Value()) // 将 authenticationInfo.RequestHeaderUsernameHeaders 序列化为字符串切片并存储在 "requestheader-username-headers" 键下
+        if err != nil {
+            return nil, err
+        }
+        data["requestheader-group-headers"], err = jsonSerializeStringSlice(authenticationInfo.RequestHeaderGroupHeaders.Value()) // 将 authenticationInfo.RequestHeaderGroupHeaders 序列化为字符串切片并存储在 "requestheader-group-headers" 键下
+        if err != nil {
+            return nil, err
+        }
+        data["requestheader-extra-headers-prefix"], err = jsonSerializeStringSlice(authenticationInfo.RequestHeaderExtraHeaderPrefixes.Value()) // 将 authenticationInfo.RequestHeaderExtraHeaderPrefixes 序列化为字符串切片并存储在 "requestheader-extra-headers-prefix" 键下
+        if err != nil {
+            return nil, err
+        }
+
+        data["requestheader-client-ca-file"] = string(caBytes) // 将 caBytes 转换为字符串并存储在 "requestheader-client-ca-file" 键下
+        data["requestheader-allowed-names"], err = jsonSerializeStringSlice(authenticationInfo.RequestHeaderAllowedNames.Value()) // 将 authenticationInfo.RequestHeaderAllowedNames 序列化为字符串切片并存储在 "requestheader-allowed-names" 键下
+        if err != nil {
+            return nil, err
+        }
+    }
+
+    return data, nil
+}
+
+// jsonSerializeStringSlice 函数将字符串切片序列化为字符串
+func jsonSerializeStringSlice(in []string) (string, error) {
+    out, err := json.Marshal(in)
+    if err != nil {
+    	return "", err
+    }
+    return string(out), err
+}
+
+// jsonDeserializeStringSlice 函数将字符串反序列化为 headerrequest.StringSliceProvider
+func jsonDeserializeStringSlice(in string) (headerrequest.StringSliceProvider, error) {
+    if len(in) == 0 {
+        return nil, nil
+    }
+    out := []string{}
+    if err := json.Unmarshal([]byte(in), &out); err != nil {
+        return nil, err
+    }
+    return headerrequest.StaticStringSlice(out), nil // 将字符串切片转换为 headerrequest.StaticStringSlice 类型
+}
+
+// combineUniqueStringSlices 函数将两个字符串切片合并为一个去重的字符串切片
+func combineUniqueStringSlices(lhs, rhs headerrequest.StringSliceProvider) headerrequest.StringSliceProvider {
+    ret := []string{}
+    present := sets.String{}
+    if lhs != nil {
+        for _, curr := range lhs.Value() {
+            if present.Has(curr) {
+                continue
+            }
+            ret = append(ret, curr)
+            present.Insert(curr)
+        }
+    }
+
+    if rhs != nil {
+        for _, curr := range rhs.Value() {
+            if present.Has(curr) {
+                continue
+            }
+            ret = append(ret, curr)
+            present.Insert(curr)
+        }
+    }
+
+    return headerrequest.StaticStringSlice(ret) // 将字符串切片转换为 headerrequest.StaticStringSlice 类型并返回
+}
+
+// combineCertLists 函数将两个证书列表合并为一个，并进行过滤和去重操作
+func combineCertLists(lhs, rhs dynamiccertificates.CAContentProvider) (dynamiccertificates.CAContentProvider, error) {
+	certificates := []*x509.Certificate{}
+    if lhs != nil {
+        lhsCABytes := lhs.CurrentCABundleContent()
+        lhsCAs, err := cert.ParseCertsPEM(lhsCABytes) // 解析 PEM 格式的证书为 x509.Certificate 列表
+        if err != nil {
+            return nil, err
+        }
+        certificates = append(certificates, lhsCAs...)
+    }
+    if rhs != nil {
+        rhsCABytes := rhs.CurrentCABundleContent()
+        rhsCAs, err := cert.ParseCertsPEM(rhsCABytes) // 解析 PEM 格式的证书为 x509.Certificate 列表
+        if err != nil {
+            return nil, err
+        }
+        certificates = append(certificates, rhsCAs...)
+    }
+
+    certificates = filterExpiredCerts(certificates...) // 过滤已过期的证书
+
+    finalCertificates := []*x509.Certificate{}
+    // 检查重复证书，时间复杂度为 n^2，但非常简单
+    for i := range certificates {
+        found := false
+        for j := range finalCertificates {
+            if reflect.DeepEqual(certificates[i].Raw, finalCertificates[j].Raw) {
+                found = true
+                break
+            }
+        }
+        if !found {
+            finalCertificates = append(finalCertificates, certificates[i])
+        }
+    }
+
+    finalCABytes, err := encodeCertificates(finalCertificates...) // 将证书列表编码为 PEM 格式的字节数组
+    if err != nil {
+        return nil, err
+    }
+
+    if len(finalCABytes) == 0 {
+        return nil, nil
+    }
+    // 由于组合的来源只在写入之前使用且会重新计算，因此将此列表设为静态的
+    return dynamiccertificates.NewStaticCAContent("combined", finalCABytes) // 使用给定的证书字节数组创建动态证书提供者
+}
+```
+
+#### lease.controller
+
+这个控制器是一个租约控制器，用于管理和续约租约。租约是在分布式系统中用于协调多个实例之间访问共享资源的机制。该控制器负责创建、维护和更新租约，并确保租约在过期之前得到续约。
+
+控制器的主要功能包括：
+
+- 使用给定的持有者标识、租约名称和租约命名空间构建控制器实例。
+- 使用客户端接口和租约客户端接口初始化控制器。
+- 在指定的续约间隔内定期执行同步操作。
+- 处理重复心跳失败的情况。
+- 提供自定义租约对象处理函数，用于在创建/刷新租约之前对租约对象进行自定义操作。
+
+通过运行控制器的`Run`方法，可以启动控制器并开始处理租约。控制器会定期执行同步操作，根据需要创建、更新和续约租约。如果没有正确初始化租约客户端接口，则控制器将不会执行任何操作。
+
+```GO
+// ProcessLeaseFunc函数在原地处理给定的租约
+type ProcessLeaseFunc func(*coordinationv1.Lease) error
+
+type controller struct {
+    client clientset.Interface // 客户端接口
+    leaseClient coordclientset.LeaseInterface // 租约客户端接口
+    holderIdentity string // 持有者标识
+    leaseName string // 租约名称
+    leaseNamespace string // 租约命名空间
+    leaseDurationSeconds int32 // 租约持续时间（秒）
+    renewInterval time.Duration // 续约间隔
+    clock clock.Clock // 时钟
+    onRepeatedHeartbeatFailure func() // 重复心跳失败时的回调函数
+    // latestLease是控制器更新或创建的最新租约
+    latestLease *coordinationv1.Lease
+
+    // newLeasePostProcessFunc允许在每次创建/刷新（更新）租约之前自定义租约对象（例如设置OwnerReference）。
+    // 注意，如果出现错误，将阻止租约的创建，导致控制器下次重试，但错误不会阻止租约的更新。
+    newLeasePostProcessFunc ProcessLeaseFunc
+}
+
+// NewController构造并返回一个控制器
+func NewController(clock clock.Clock, client clientset.Interface, holderIdentity string, leaseDurationSeconds int32, onRepeatedHeartbeatFailure func(), renewInterval time.Duration, leaseName, leaseNamespace string, newLeasePostProcessFunc ProcessLeaseFunc) Controller {
+    var leaseClient coordclientset.LeaseInterface
+    if client != nil {
+    	leaseClient = client.CoordinationV1().Leases(leaseNamespace)
+    }
+	return &controller{
+        client: client,
+        leaseClient: leaseClient,
+        holderIdentity: holderIdentity,
+        leaseName: leaseName,
+        leaseNamespace: leaseNamespace,
+        leaseDurationSeconds: leaseDurationSeconds,
+        renewInterval: renewInterval,
+        clock: clock,
+        onRepeatedHeartbeatFailure: onRepeatedHeartbeatFailure,
+        newLeasePostProcessFunc: newLeasePostProcessFunc,
+    }
+}
+
+// Run运行控制器
+func (c *controller) Run(ctx context.Context) {
+    if c.leaseClient == nil {
+        klog.FromContext(ctx).Info("lease controller has nil lease client, will not claim or renew leases")
+        return
+    }
+    wait.JitterUntilWithContext(ctx, c.sync, c.renewInterval, 0.04, true)
+}
+
+func (c *controller) sync(ctx context.Context) {
+	if c.latestLease != nil {
+		// 如果最新的租约不为空，则尝试基于之前的版本进行更新，以避免进行 GET 调用并减少对 etcd 和 kube-apiserver 的负载
+		err := c.retryUpdateLease(ctx, c.latestLease)
+		if err == nil {
+			return
+		}
+		klog.FromContext(ctx).Info("failed to update lease using latest lease, fallback to ensure lease", "err", err)
+	}
+
+	lease, created := c.backoffEnsureLease(ctx)
+	c.latestLease = lease
+	// 如果刚创建了租约，则不需要更新租约
+	if !created && lease != nil {
+		if err := c.retryUpdateLease(ctx, lease); err != nil {
+			klog.FromContext(ctx).Error(err, "Will retry updating lease", "interval", c.renewInterval)
+		}
+	}
+}
+
+func (c *controller) backoffEnsureLease(ctx context.Context) (*coordinationv1.Lease, bool) {
+	var (
+		lease   *coordinationv1.Lease
+		created bool
+		err     error
+	)
+	sleep := 100 * time.Millisecond
+	for {
+		lease, created, err = c.ensureLease(ctx)
+		if err == nil {
+			break
+		}
+		sleep = minDuration(2*sleep, maxBackoff)
+		klog.FromContext(ctx).Error(err, "Failed to ensure lease exists, will retry", "interval", sleep)
+		// 等待一段时间，并在上下文被取消时提前返回
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(sleep):
+		}
+	}
+	return lease, created
+}
+
+func (c *controller) ensureLease(ctx context.Context) (*coordinationv1.Lease, bool, error) {
+	lease, err := c.leaseClient.Get(ctx, c.leaseName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		// 租约不存在，创建新的租约
+		leaseToCreate, err := c.newLease(nil)
+		// 在分配新租约时出现错误（可能来自于 newLeasePostProcessFunc），因此此次不创建租约，将在下一次迭代中重试
+		if err != nil {
+			return nil, false, nil
+		}
+		lease, err := c.leaseClient.Create(ctx, leaseToCreate, metav1.CreateOptions{})
+		if err != nil {
+			return nil, false, err
+		}
+		return lease, true, nil
+	} else if err != nil {
+		// 获取租约时出现意外错误
+		return nil, false, err
+	}
+	// 租约已存在
+	return lease, false, nil
+}
+
+// retryUpdateLease 尝试更新租约（lease）maxUpdateRetries次，确保在创建租约后调用此函数。
+func (c *controller) retryUpdateLease(ctx context.Context, base *coordinationv1.Lease) error {
+    for i := 0; i < maxUpdateRetries; i++ {
+        leaseToUpdate, _ := c.newLease(base) // 创建新的租约或者复制base租约
+        lease, err := c.leaseClient.Update(ctx, leaseToUpdate, metav1.UpdateOptions{}) // 更新租约
+        if err == nil {
+        	c.latestLease = lease // 更新最新的租约
+        	return nil
+        }
+        klog.FromContext(ctx).Error(err, "Failed to update lease") // 输出错误日志，更新租约失败
+        // 如果是乐观锁错误（OptimisticLockError），需要获取较新版本的租约来继续
+        if apierrors.IsConflict(err) {
+            base, _ = c.backoffEnsureLease(ctx)
+            continue
+        }
+        // 如果已经重试过，并且存在重复心跳失败的回调函数，则调用该函数
+        if i > 0 && c.onRepeatedHeartbeatFailure != nil {
+        	c.onRepeatedHeartbeatFailure()
+        }
+    }
+    return fmt.Errorf("failed %d attempts to update lease", maxUpdateRetries) // 更新租约失败，返回错误信息
+}
+
+// newLease 如果base为nil，则构造一个新的租约；否则返回base的副本，并在副本上断言所需的状态。
+// 注意，错误会阻塞租约的创建（CREATE），导致在下一次迭代中进行重试；但是错误不会阻塞租约的刷新（UPDATE）。
+func (c *controller) newLease(base *coordinationv1.Lease) (*coordinationv1.Lease, error) {
+    // 使用最少的字段集；其他字段用于调试/遗留，但我们不需要在组件心跳中使用它们来复杂化。
+    var lease *coordinationv1.Lease
+    if base == nil {
+        lease = &coordinationv1.Lease{
+            ObjectMeta: metav1.ObjectMeta{
+                Name: c.leaseName,
+                Namespace: c.leaseNamespace,
+            },
+            Spec: coordinationv1.LeaseSpec{
+                HolderIdentity: pointer.StringPtr(c.holderIdentity),
+                LeaseDurationSeconds: pointer.Int32Ptr(c.leaseDurationSeconds),
+            },
+   		}
+    } else {
+    	lease = base.DeepCopy() // 复制base租约
+    }
+   	lease.Spec.RenewTime = &metav1.MicroTime{Time: c.clock.Now()} // 设置租约的续约时间为当前时间
+    if c.newLeasePostProcessFunc != nil {
+        err := c.newLeasePostProcessFunc(lease) // 执行新租约的后处理函数
+        return lease, err
+    }
+
+    return lease, nil
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+    if a < b {
+    	return a
+    }
+    return b
+}
+```
+
+#### apiserverleasegc.NewAPIServerLeaseGC
+
+这个控制器的作用是删除过期的 API 服务器租约（leases）。租约是在 Kubernetes 集群中用于协调对 API 资源的访问的机制。租约具有特定的持续时间，超过持续时间后，租约被认为过期并需要被删除。
+
+该控制器的主要功能包括：
+
+- 创建一个用于管理 API 服务器租约的控制器实例。
+- 构建一个独立的 Informer（信息提供者），用于获取指定命名空间和标签选择器下的租约信息。
+- 启动 Informer 并等待其与集群进行同步，确保获取最新的租约数据。
+- 定期执行垃圾回收操作，遍历租约列表并删除过期的租约。
+- 监听停止信号，并在接收到停止信号时优雅地停止控制器的运行。
+
+```go
+// Controller用于删除过期的API服务器租约。
+type Controller struct {
+    kubeclientset kubernetes.Interface // Kubernetes客户端接口
+
+    leaseLister   listers.LeaseLister   // 租约列表
+    leaseInformer cache.SharedIndexInformer   // 租约Informer
+    leasesSynced  cache.InformerSynced   // 租约同步状态
+
+    leaseNamespace string   // 租约命名空间
+
+    gcCheckPeriod time.Duration   // 垃圾回收检查周期
+}
+
+// NewAPIServerLeaseGC创建一个新的控制器。
+func NewAPIServerLeaseGC(clientset kubernetes.Interface, gcCheckPeriod time.Duration, leaseNamespace, leaseLabelSelector string) *Controller {
+    // 我们构建自己的Informer，因为我们只需要可用信息的一个很小的子集。仅限一个具有标签选择器的命名空间。
+    leaseInformer := informers.NewFilteredLeaseInformer(
+        clientset,
+        leaseNamespace,
+        0,
+    	cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+            func(listOptions *metav1.ListOptions) {
+                listOptions.LabelSelector = leaseLabelSelector
+    })
+	return &Controller{
+        kubeclientset: clientset,
+        leaseLister: listers.NewLeaseLister(leaseInformer.GetIndexer()),
+        leaseInformer: leaseInformer,
+        leasesSynced: leaseInformer.HasSynced,
+        leaseNamespace: leaseNamespace,
+        gcCheckPeriod: gcCheckPeriod,
+    }
+}
+
+// Run启动一个工作器。
+func (c *Controller) Run(stopCh <-chan struct{}) {
+    defer utilruntime.HandleCrash()
+    defer klog.Infof("Shutting down apiserver lease garbage collector")
+    klog.Infof("Starting apiserver lease garbage collector")
+
+    // 我们有一个范围狭窄的个人Informer，启动它。
+    go c.leaseInformer.Run(stopCh)
+
+    if !cache.WaitForCacheSync(stopCh, c.leasesSynced) {
+        utilruntime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
+        return
+    }
+
+    go wait.Until(c.gc, c.gcCheckPeriod, stopCh)
+
+    <-stopCh
+}
+
+func (c *Controller) gc() {
+	leases, err := c.leaseLister.Leases(c.leaseNamespace).List(labels.Everything())
+	if err != nil {
+		klog.ErrorS(err, "Error while listing apiserver leases")
+		return
+	}
+	for _, lease := range leases {
+		// 从缓存中评估租约
+		if !isLeaseExpired(lease) {
+			continue
+		}
+		// 在删除之前，从apiserver中再次检查最新的租约
+		lease, err := c.kubeclientset.CoordinationV1().Leases(c.leaseNamespace).Get(context.TODO(), lease.Name, metav1.GetOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			klog.ErrorS(err, "Error getting lease")
+			continue
+		}
+		if errors.IsNotFound(err) || lease == nil {
+			// 在高可用集群中，如果租约被同一个GC控制器在另一个apiserver中删除，这是合法的情况。
+			// 我们不希望其他组件删除该租约。
+			klog.V(4).InfoS("Cannot find apiserver lease", "err", err)
+			continue
+		}
+		// 从apiserver评估租约
+		if !isLeaseExpired(lease) {
+			continue
+		}
+		if err := c.kubeclientset.CoordinationV1().Leases(c.leaseNamespace).Delete(
+			context.TODO(), lease.Name, metav1.DeleteOptions{}); err != nil {
+			if errors.IsNotFound(err) {
+				// 在高可用集群中，如果租约被同一个GC控制器在另一个apiserver中删除，这是合法的情况。
+				// 我们不希望其他组件删除该租约。
+				klog.V(4).InfoS("Apiserver lease is gone already", "err", err)
+			} else {
+				klog.ErrorS(err, "Error deleting lease")
+			}
+		}
+	}
+}
+
+func isLeaseExpired(lease *v1.Lease) bool {
+	currentTime := time.Now()
+	// 由apiserver租约控制器创建的租约应该具有非空的续约时间和租约持续时间设置。
+	// 没有设置这些字段的租约是无效的，应该进行垃圾回收（GC）。
+	return lease.Spec.RenewTime == nil ||
+		lease.Spec.LeaseDurationSeconds == nil ||
+		lease.Spec.RenewTime.Add(time.Duration(*lease.Spec.LeaseDurationSeconds)*time.Second).Before(currentTime)
+}
+```
+
+#### legacytokentracking.NewController
+
+这个控制器的作用是管理名为 `kube-apiserver-legacy-service-account-token-tracking` 的 ConfigMap。它维护该 ConfigMap 的状态，并根据需要创建或删除该 ConfigMap。该 ConfigMap 用于指示集群中是否启用了旧版令牌的跟踪。
+
+控制器通过监听 ConfigMap 的变化来保持其状态的同步。当有新的 ConfigMap 被添加、更新或删除时，控制器会相应地对其进行处理。根据控制器的配置，它可能会创建新的 ConfigMap、删除现有的 ConfigMap，或执行其他必要的操作以保持 ConfigMap 的状态与预期一致。
+
+此外，控制器还使用速率限制器来控制创建 ConfigMap 的速率，以防止在多个 API Server 集群中出现冲突操作。
+
+```go
+// Controller 维护一个名为 `kube-apiserver-legacy-service-account-token-tracking` 的 ConfigMap，
+// 用于指示集群中是否启用了旧版令牌的跟踪。
+// 对于高可用（HA）集群，在所有控制器实例启用该功能后，该 ConfigMap 最终将被创建。
+// 在禁用此功能时，将删除现有的 ConfigMap。
+type Controller struct {
+	configMapClient   corev1client.ConfigMapsGetter
+	configMapInformer cache.SharedIndexInformer
+	configMapCache    cache.Indexer
+	configMapSynced   cache.InformerSynced
+	queue             workqueue.RateLimitingInterface
+
+	// enabled 控制控制器的行为：如果 enabled 为 true，则创建 ConfigMap；否则，删除 ConfigMap。
+	enabled bool
+	// rate limiter 控制创建 ConfigMap 的速率限制。
+	// 在多个 API Server 集群中，这对于防止配置在已启用/禁用的控制器的混合集群中存在很有用。
+	// 否则，这些 API Server 将竞争创建/删除，直到所有 API Server 都启用或禁用。
+	creationRatelimiter *rate.Limiter
+	clock               clock.Clock
+}
+
+// NewController 返回一个 Controller 结构体。
+func NewController(cs kubernetes.Interface) *Controller {
+	return newController(cs, clock.RealClock{}, rate.NewLimiter(rate.Every(30*time.Minute), 1))
+}
+
+func newController(cs kubernetes.Interface, cl clock.Clock, limiter *rate.Limiter) *Controller {
+	informer := corev1informers.NewFilteredConfigMapInformer(cs, metav1.NamespaceSystem, 12*time.Hour, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, func(options *metav1.ListOptions) {
+		options.FieldSelector = fields.OneTermEqualSelector("metadata.name", ConfigMapName).String()
+	})
+
+	c := &Controller{
+		configMapClient:     cs.CoreV1(),
+		queue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "legacy_token_tracking_controller"),
+		configMapInformer:   informer,
+		configMapCache:      informer.GetIndexer(),
+		configMapSynced:     informer.HasSynced,
+		enabled:             utilfeature.DefaultFeatureGate.Enabled(kubefeatures.LegacyServiceAccountTokenTracking),
+		creationRatelimiter: limiter,
+		clock:               cl,
+	}
+
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			c.enqueue()
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			c.enqueue()
+		},
+		DeleteFunc: func(obj interface{}) {
+			c.enqueue()
+		},
+	})
+
+	return c
+}
+
+func (c *Controller) enqueue() {
+	c.queue.Add(queueKey)
+}
+
+func (c *Controller) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	defer c.queue.ShutDown()
+
+	klog.Info("Starting legacy_token_tracking_controller")
+	defer klog.Infof("Shutting down legacy_token_tracking_controller")
+
+	go c.configMapInformer.Run(stopCh)
+	if !cache.WaitForNamedCacheSync("configmaps", stopCh, c.configMapSynced) {
+		return
+	}
+
+	go wait.Until(c.runWorker, time.Second, stopCh)
+
+	c.queue.Add(queueKey)
+
+	<-stopCh
+	klog.Info("Ending legacy_token_tracking_controller")
+}
+
+func (c *Controller) runWorker() {
+	for c.processNext() {
+	}
+}
+
+func (c *Controller) processNext() bool {
+	key, quit := c.queue.Get()
+	if quit {
+		return false
+	}
+	defer c.queue.Done(key)
+
+	if err := c.syncConfigMap(); err != nil {
+		utilruntime.HandleError(fmt.Errorf("while syncing ConfigMap %q, err: %w", key, err))
+		c.queue.AddRateLimited(key)
+		return true
+	}
+	c.queue.Forget(key)
+	return true
+}
+
+func (c *Controller) processNext() bool {
+	key, quit := c.queue.Get() // 从队列中获取下一个键值和退出标志
+    if quit {
+    	return false
+    }
+    defer c.queue.Done(key) // 在函数返回前调用Done方法标记键值已经处理完毕
+
+    if err := c.syncConfigMap(); err != nil { // 同步ConfigMap
+        utilruntime.HandleError(fmt.Errorf("while syncing ConfigMap %q, err: %w", key, err)) // 处理同步ConfigMap过程中的错误
+        c.queue.AddRateLimited(key) // 将键值重新添加到队列，并限制添加速率
+        return true
+    }
+    c.queue.Forget(key) // 不再需要处理该键值，将其从队列中移除
+    return true
+}
+
+func (c *Controller) syncConfigMap() error {
+    obj, exists, err := c.configMapCache.GetByKey(queueKey) // 根据键值从缓存中获取ConfigMap对象
+    if err != nil {
+    	return err
+	}
+    now := c.clock.Now() // 获取当前时间
+    switch {
+    case c.enabled: // 如果Controller启用
+        if !exists { // 如果ConfigMap不存在
+            r := c.creationRatelimiter.ReserveN(now, 1) // 使用创建速率限制器进行限制
+            if delay := r.DelayFrom(now); delay > 0 { // 如果需要延迟处理
+                c.queue.AddAfter(queueKey, delay) // 将键值添加到队列的指定延迟后
+                r.CancelAt(now) // 取消限制器的预定
+                return nil
+            }
+
+            if _, err = c.configMapClient.ConfigMaps(metav1.NamespaceSystem).Create(context.TODO(), &corev1.ConfigMap{
+                ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: ConfigMapName},
+                Data:       map[string]string{ConfigMapDataKey: now.UTC().Format(dateFormat)},
+            }, metav1.CreateOptions{}); err != nil {
+                if apierrors.IsAlreadyExists(err) { // 如果ConfigMap已经存在
+                    return nil
+                }
+                // 对于创建失败的尝试不消耗创建速率限制器
+                r.CancelAt(now)
+                return err
+            }
+        } else { // 如果ConfigMap存在
+            configMap := obj.(*corev1.ConfigMap)
+            if _, err = time.Parse(dateFormat, configMap.Data[ConfigMapDataKey]); err != nil { // 解析时间字符串
+                configMap := configMap.DeepCopy()
+                configMap.Data[ConfigMapDataKey] = now.UTC().Format(dateFormat) // 更新ConfigMap的数据
+                if _, err = c.configMapClient.ConfigMaps(metav1.NamespaceSystem).Update(context.TODO(), configMap, metav1.UpdateOptions{}); err != nil {
+                    if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+                        return nil
+                    }
+                    return err
+                }
+            }
+        }
+
+    case !c.enabled: // 如果Controller未启用
+        if exists && obj.(*corev1.ConfigMap).DeletionTimestamp == nil { // 如果ConfigMap存在且没有设置删除时间戳
+            if err := c.configMapClient.ConfigMaps(metav1.NamespaceSystem).Delete(context.TODO(), ConfigMapName, metav1.DeleteOptions{}); err != nil {
+                if apierrors.IsNotFound(err) {
+                    return nil
+                }
+                return err
+            }
+        }
+    }
+    return nil
+}
+```
+
+### AggregatorServer
+
+#### APIServiceRegistrationController
+
+这个控制器的作用是管理 API 服务的注册和移除。它实现了 `APIHandlerManager` 接口，并负责调用 `APIHandlerManager` 的方法来添加或移除 API 服务。
+
+该控制器通过监听 API 服务的变化来保持其状态的同步。当有新的 API 服务被添加、更新或删除时，控制器会相应地触发相应的处理方法。根据控制器的配置，它可能会调用 `APIHandlerManager` 的方法来添加或移除相应的 API 服务。
+
+控制器还维护一个工作队列，用于对 API 服务进行排队处理。当 API 服务发生变化时，控制器会将其添加到工作队列中，以便后续处理。
+
+此外，该控制器还实现了 `dynamiccertificates.Listener` 接口，用于监听代理证书内容的更改。当代理证书内容发生更改时，控制器会通过调用 `Enqueue` 方法来重新处理所有的 API 服务，以确保其状态与最新的证书内容保持一致。
+
+```go
+// APIHandlerManager 定义了 API 处理程序应具有的行为。
+type APIHandlerManager interface {
+	AddAPIService(apiService *v1.APIService) error
+	RemoveAPIService(apiServiceName string)
+}
+
+// APIServiceRegistrationController 负责注册和移除 API 服务。
+type APIServiceRegistrationController struct {
+	apiHandlerManager APIHandlerManager
+
+	apiServiceLister listers.APIServiceLister
+	apiServiceSynced cache.InformerSynced
+
+	// To allow injection for testing.
+	syncFn func(key string) error
+
+	queue workqueue.RateLimitingInterface
+}
+
+var _ dynamiccertificates.Listener = &APIServiceRegistrationController{}
+
+// NewAPIServiceRegistrationController 返回一个新的 APIServiceRegistrationController。
+func NewAPIServiceRegistrationController(apiServiceInformer informers.APIServiceInformer, apiHandlerManager APIHandlerManager) *APIServiceRegistrationController {
+	c := &APIServiceRegistrationController{
+		apiHandlerManager: apiHandlerManager,
+		apiServiceLister:  apiServiceInformer.Lister(),
+		apiServiceSynced:  apiServiceInformer.Informer().HasSynced,
+		queue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "APIServiceRegistrationController"),
+	}
+
+	apiServiceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addAPIService,
+		UpdateFunc: c.updateAPIService,
+		DeleteFunc: c.deleteAPIService,
+	})
+
+	c.syncFn = c.sync
+
+	return c
+}
+
+func (c *APIServiceRegistrationController) enqueueInternal(obj *v1.APIService) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		klog.Errorf("Couldn't get key for object %#v: %v", obj, err)
+		return
+	}
+
+	c.queue.Add(key)
+}
+
+func (c *APIServiceRegistrationController) addAPIService(obj interface{}) {
+	castObj := obj.(*v1.APIService)
+	klog.V(4).Infof("Adding %s", castObj.Name)
+	c.enqueueInternal(castObj)
+}
+
+func (c *APIServiceRegistrationController) updateAPIService(obj, _ interface{}) {
+	castObj := obj.(*v1.APIService)
+	klog.V(4).Infof("Updating %s", castObj.Name)
+	c.enqueueInternal(castObj)
+}
+
+func (c *APIServiceRegistrationController) deleteAPIService(obj interface{}) {
+	castObj, ok := obj.(*v1.APIService)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			klog.Errorf("Couldn't get object from tombstone %#v", obj)
+			return
+		}
+		castObj, ok = tombstone.Obj.(*v1.APIService)
+		if !ok {
+			klog.Errorf("Tombstone contained object that is not expected %#v", obj)
+			return
+		}
+	}
+	klog.V(4).Infof("Deleting %q", castObj.Name)
+	c.enqueueInternal(castObj)
+}
+
+// Enqueue 将所有 API 服务加入队列以重新处理。
+// 此方法由控制器用于在代理证书内容更改时通知。
+func (c *APIServiceRegistrationController) Enqueue() {
+	apiServices, err := c.apiServiceLister.List(labels.Everything())
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	for _, apiService := range apiServices {
+		c.addAPIService(apiService)
+	}
+}
+
+func (c *APIServiceRegistrationController) Run(stopCh <-chan struct{}, handlerSyncedCh chan<- struct{}) {
+	defer utilruntime.HandleCrash()
+	defer c.queue.ShutDown()
+
+	klog.Info("Starting APIServiceRegistrationController")
+	defer klog.Info("Shutting down APIServiceRegistrationController")
+
+	if !controllers.WaitForCacheSync("APIServiceRegistrationController", stopCh, c.apiServiceSynced) {
+		return
+	}
+
+	/// initially sync all APIServices to make sure the proxy handler is complete
+	if err := wait.PollImmediateUntil(time.Second, func() (bool, error) {
+		services, err := c.apiServiceLister.List(labels.Everything())
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("failed to initially list APIServices: %v", err))
+			return false, nil
+		}
+		for _, s := range services {
+			if err := c.apiHandlerManager.AddAPIService(s); err != nil {
+				utilruntime.HandleError(fmt.Errorf("failed to initially sync APIService %s: %v", s.Name, err))
+				return false, nil
+			}
+		}
+		return true, nil
+	}, stopCh); err == wait.ErrWaitTimeout {
+		utilruntime.HandleError(fmt.Errorf("timed out waiting for proxy handler to initialize"))
+		return
+	} else if err != nil {
+		panic(fmt.Errorf("unexpected error: %v", err))
+	}
+	close(handlerSyncedCh)
+
+	// only start one worker thread since its a slow moving API and the aggregation server adding bits
+	// aren't threadsafe
+	go wait.Until(c.runWorker, time.Second, stopCh)
+
+	<-stopCh
+}
+
+func (c *APIServiceRegistrationController) runWorker() {
+	for c.processNextWorkItem() {
+	}
+}
+
+// processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+func (c *APIServiceRegistrationController) processNextWorkItem() bool {
+	key, quit := c.queue.Get()
+	if quit {
+		return false
+	}
+	defer c.queue.Done(key)
+
+	err := c.syncFn(key.(string))
+	if err == nil {
+		c.queue.Forget(key)
+		return true
+	}
+
+	utilruntime.HandleError(fmt.Errorf("%v failed with : %v", key, err))
+	c.queue.AddRateLimited(key)
+
+	return true
+}
+
+func (c *APIServiceRegistrationController) sync(key string) error {
+apiService, err := c.apiServiceLister.Get(key) // 根据键值从apiServiceLister中获取APIService对象
+    if apierrors.IsNotFound(err) { // 如果对象不存在
+        c.apiHandlerManager.RemoveAPIService(key) // 从apiHandlerManager中移除该APIService
+        return nil
+    }
+    if err != nil { // 如果发生其他错误
+    	return err
+    }
+
+    return c.apiHandlerManager.AddAPIService(apiService) // 将APIService添加到apiHandlerManager中
+}
+```
+
+#### DynamicCertKeyPairContent
+
+这个控制器的作用是监视和管理证书和密钥文件的内容，并根据文件的变化来动态地更新和提供证书和密钥的内容。
+
+它的主要功能包括：
+
+1. 加载证书和密钥文件的内容：控制器会定期读取证书和密钥文件，并将它们的内容加载到内存中。
+2. 监视文件变化：控制器使用文件系统监视器（fsnotify）来监视证书和密钥文件的变化。当文件被修改、移除或重命名时，控制器会触发重新加载文件内容，并更新内存中的证书和密钥内容。
+3. 提供证书和密钥内容：控制器实现了 CertKeyContentProvider 接口，可以提供当前的证书和密钥的字节内容。其他组件可以通过调用 CurrentCertKeyContent() 方法获取当前的证书和密钥内容。
+4. 添加监听器：控制器允许其他组件注册监听器（Listener），当证书和密钥内容发生变化时，控制器会通知所有的监听器。
+5. 运行控制循环：控制器通过调用 Run() 方法启动运行循环，它会在后台不断运行，并定期检查证书和密钥文件的变化。控制器会根据文件变化来触发相应的操作，并通知监听器和其他相关组件。
+
+```GO
+// DynamicCertKeyPairContent 提供了一个 CertKeyContentProvider，可以根据新的文件内容动态地做出反应。
+type DynamicCertKeyPairContent struct {
+	name string
+    // certFile 是要读取的证书文件的名称。
+    certFile string
+    // keyFile 是要读取的密钥文件的名称。
+    keyFile string
+
+    // certKeyPair 是一个 certKeyContent，包含上次读取的非零长度的密钥和证书内容。
+    certKeyPair atomic.Value
+
+    listeners []Listener
+
+    // queue 只有一个项，但具有良好的错误处理回退/重试语义。
+    queue workqueue.RateLimitingInterface
+}
+
+var _ CertKeyContentProvider = &DynamicCertKeyPairContent{}
+var _ ControllerRunner = &DynamicCertKeyPairContent{}
+
+// NewDynamicServingContentFromFiles 根据证书和密钥文件名返回一个动态的 CertKeyContentProvider。
+func NewDynamicServingContentFromFiles(purpose, certFile, keyFile string) (*DynamicCertKeyPairContent, error) {
+    if len(certFile) == 0 || len(keyFile) == 0 {
+    	return nil, fmt.Errorf("missing filename for serving cert")
+    }
+    name := fmt.Sprintf("%s::%s::%s", purpose, certFile, keyFile)
+    ret := &DynamicCertKeyPairContent{
+        name:     name,
+        certFile: certFile,
+        keyFile:  keyFile,
+        queue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), fmt.Sprintf("DynamicCABundle-%s", purpose)),
+    }
+    if err := ret.loadCertKeyPair(); err != nil {
+        return nil, err
+    }
+
+    return ret, nil
+}
+
+// AddListener 添加一个监听器，以便在服务证书内容发生更改时得到通知。
+func (c *DynamicCertKeyPairContent) AddListener(listener Listener) {
+	c.listeners = append(c.listeners, listener)
+}
+
+// loadCertKeyPair 确定文件的下一组内容。
+func (c *DynamicCertKeyPairContent) loadCertKeyPair() error {
+    cert, err := ioutil.ReadFile(c.certFile)
+    if err != nil {
+    	return err
+    }
+    key, err := ioutil.ReadFile(c.keyFile)
+    if err != nil {
+    	return err
+    }
+    if len(cert) == 0 || len(key) == 0 {
+    	return fmt.Errorf("missing content for serving cert %q", c.Name())
+    }
+    // 确保密钥与证书匹配且有效
+    _, err = tls.X509KeyPair(cert, key)
+    if err != nil {
+        return err
+    }
+
+    newCertKey := &certKeyContent{
+        cert: cert,
+        key:  key,
+    }
+
+    // 检查是否有更改。如果值相同，则不做任何操作。
+    existing, ok := c.certKeyPair.Load().(*certKeyContent)
+    if ok && existing != nil && existing.Equal(newCertKey) {
+        return nil
+    }
+
+    c.certKeyPair.Store(newCertKey)
+    klog.V(2).InfoS("Loaded a new cert/key pair", "name", c.Name())
+
+    for _, listener := range c.listeners {
+        listener.Enqueue()
+    }
+
+    return nil
+}
+
+// RunOnce 运行一次同步循环。
+func (c *DynamicCertKeyPairContent) RunOnce(ctx context.Context) error {
+	return c.loadCertKeyPair()
+}
+
+// Run 启动控制器并阻塞，直到上下文被终止。
+func (c *DynamicCertKeyPairContent) Run(ctx context.Context, workers int) {
+    defer utilruntime.HandleCrash()
+    defer c.queue.ShutDown()
+    klog.InfoS("Starting controller", "name", c.name)
+    defer klog.InfoS("Shutting down controller", "name", c.name)
+
+    // 不管 workers 参数是什么，只启动一个。
+    go wait.Until(c.runWorker, time.Second, ctx.Done())
+
+    // 启动观察证书和密钥文件的循环，直到 stopCh 被关闭。
+    go wait.Until(func() {
+        if err := c.watchCertKeyFile(ctx.Done()); err != nil {
+            klog.ErrorS(err, "Failed to watch cert and key file, will retry later")
+        }
+    }, time.Minute, ctx.Done())
+
+    <-ctx.Done()
+}
+
+func (c *DynamicCertKeyPairContent) watchCertKeyFile(stopCh <-chan struct{}) error {
+    // 触发检查以确保内容将定期进行检查，即使以下观察失败。
+    c.queue.Add(workItemKey)
+    w, err := fsnotify.NewWatcher()
+    if err != nil {
+        return fmt.Errorf("error creating fsnotify watcher: %v", err)
+    }
+    defer w.Close()
+
+    if err := w.Add(c.certFile); err != nil {
+        return fmt.Errorf("error adding watch for file %s: %v", c.certFile, err)
+    }
+    if err := w.Add(c.keyFile); err != nil {
+        return fmt.Errorf("error adding watch for file %s: %v", c.keyFile, err)
+    }
+    // 触发检查，以防文件在观察开始之前被更新。
+    c.queue.Add(workItemKey)
+
+    for {
+        select {
+        case e := <-w.Events:
+            if err := c.handleWatchEvent(e, w); err != nil {
+                return err
+            }
+        case err := <-w.Errors:
+            return fmt.Errorf("received fsnotify error: %v", err)
+        case <-stopCh:
+            return nil
+        }
+    }
+}
+
+// handleWatchEvent 触发重新加载证书和密钥文件，并在移除或重命名事件时重新启动新的观察。
+// 如果一个文件在另一个文件之前被更新，loadCertKeyPair 方法将捕捉到不匹配，并且不会应用更改。
+// 当接收到另一个文件的事件时，将触发重新加载文件，新内容将被加载和使用。
+func (c *DynamicCertKeyPairContent) handleWatchEvent(e fsnotify.Event, w *fsnotify.Watcher) error {
+    // 在重新启动观察之后执行此操作，以确保不会丢失任何文件事件。
+    defer c.queue.Add(workItemKey)
+    if !e.Has(fsnotify.Remove) && !e.Has(fsnotify.Rename) {
+    	return nil
+    }
+    if err := w.Remove(e.Name); err != nil {
+    	klog.InfoS("Failed to remove file watch, it may have been deleted", "file", e.Name, "err", err)
+    }
+    if err := w.Add(e.Name); err != nil {
+    	return fmt.Errorf("error adding watch for file %s: %v", e.Name, err)
+    }
+    return nil
+}
+
+func (c *DynamicCertKeyPairContent) runWorker() {
+    for c.processNextWorkItem() {
+    }
+}
+
+func (c *DynamicCertKeyPairContent) processNextWorkItem() bool {
+    dsKey, quit := c.queue.Get()
+    if quit {
+    	return false
+    }
+    defer c.queue.Done(dsKey)
+    err := c.loadCertKeyPair()
+    if err == nil {
+        c.queue.Forget(dsKey)
+        return true
+    }
+
+    utilruntime.HandleError(fmt.Errorf("%v failed with : %v", dsKey, err))
+    c.queue.AddRateLimited(dsKey)
+
+    return true
+}
+
+// Name 只是一个标识符。
+func (c *DynamicCertKeyPairContent) Name() string {
+	return c.name
+}
+
+// CurrentCertKeyContent 提供证书和密钥的字节内容。
+func (c *DynamicCertKeyPairContent) CurrentCertKeyContent() ([]byte, []byte) {
+    certKeyContent := c.certKeyPair.Load().(*certKeyContent)
+    return certKeyContent.cert, certKeyContent.key
+}
+```
+
+#### AvailableConditionController
+
+这个控制器的作用是监视 Kubernetes 集群中的 API 服务的可用性条件。API 服务是用于公开和管理 Kubernetes API 的重要组件。通过监控 API 服务的可用性，可以及时发现和处理与 API 服务相关的连接问题，确保 Kubernetes API 的可用性和稳定性。
+
+该控制器会定期检查每个 API 服务的连接状态，并根据连接的成功与否更新 API 服务的可用性条件。如果连接建立成功，则将条件设置为可用（True），表示 API 服务正常运行。如果连接建立失败，则将条件设置为不可用（False），表示 API 服务出现故障。控制器还会记录每个 API 服务的可用性状态指标，以便后续监控和分析。
+
+通过使用这个控制器，管理员可以及时了解到 API 服务的可用性状况，并在发现故障时采取相应的措施，例如自动进行故障恢复或通知相关团队进行处理。这有助于提高 Kubernetes 系统的可靠性和稳定性，确保应用程序能够正常访问和使用 Kubernetes API。
+
+```GO
+// 确保我们只将指标注册到旧的注册表中一次
+var registerIntoLegacyRegistryOnce sync.Once
+
+type certKeyFunc func() ([]byte, []byte)
+
+// ServiceResolver 知道如何将服务引用转换为实际位置。
+type ServiceResolver interface {
+	ResolveEndpoint(namespace, name string, port int32) (*url.URL, error)
+}
+
+// AvailableConditionController 处理检查已注册的 API 服务的可用性。
+type AvailableConditionController struct {
+	apiServiceClient apiregistrationclient.APIServicesGetter
+    apiServiceLister listers.APIServiceLister
+    apiServiceSynced cache.InformerSynced
+
+    // serviceLister 用于获取 IP 以创建传输层
+    serviceLister  v1listers.ServiceLister
+    servicesSynced cache.InformerSynced
+
+    endpointsLister v1listers.EndpointsLister
+    endpointsSynced cache.InformerSynced
+
+    // proxyTransportDial 指定用于创建未加密的 TCP 连接的拨号函数。
+    proxyTransportDial         *transport.DialHolder
+    proxyCurrentCertKeyContent certKeyFunc
+    serviceResolver            ServiceResolver
+
+    // 用于测试的注入
+    syncFn func(key string) error
+
+    queue workqueue.RateLimitingInterface
+    // 从服务命名空间到服务名称到 API 服务名称的映射
+    cache map[string]map[string][]string
+    // 此锁保护对上述缓存的操作
+    cacheLock sync.RWMutex
+
+    // 注册到旧的注册表中的指标
+    metrics *availabilityMetrics
+}
+
+// NewAvailableConditionController 返回一个新的 AvailableConditionController。
+func NewAvailableConditionController(
+    apiServiceInformer informers.APIServiceInformer,
+    serviceInformer v1informers.ServiceInformer,
+    endpointsInformer v1informers.EndpointsInformer,
+    apiServiceClient apiregistrationclient.APIServicesGetter,
+    proxyTransportDial transport.DialHolder,
+    proxyCurrentCertKeyContent certKeyFunc,
+    serviceResolver ServiceResolver,
+) (AvailableConditionController, error) {
+    c := &AvailableConditionController{
+        apiServiceClient: apiServiceClient,
+        apiServiceLister: apiServiceInformer.Lister(),
+        serviceLister: serviceInformer.Lister(),
+        endpointsLister: endpointsInformer.Lister(),
+        serviceResolver: serviceResolver,
+        queue: workqueue.NewNamedRateLimitingQueue(
+        // 我们希望重新排队的时间间隔较短。控制器监听 API，但由于它依赖于服务网络的可路由性，
+        // 外部的、不可观察的因素可能会影响可用性。这样可以将最大中断时间最小化，但会阻止热循环。
+        workqueue.NewItemExponentialFailureRateLimiter(5time.Millisecond, 30time.Second),
+        "AvailableConditionController"),
+        proxyTransportDial: proxyTransportDial,
+        proxyCurrentCertKeyContent: proxyCurrentCertKeyContent,
+        metrics: newAvailabilityMetrics(),
+    }
+    // 在此重新同步，因为它的基数很低，并且重新检查实际的发现
+    // 可以更及时地检测到网络连接到节点被切断时的健康状况，但网络仍然尝试路由到那里。参见
+    // https://github.com/openshift/origin/issues/17159#issuecomment-341798063
+    apiServiceHandler, _ := apiServiceInformer.Informer().AddEventHandlerWithResyncPeriod(
+        cache.ResourceEventHandlerFuncs{
+            AddFunc:    c.addAPIService,
+            UpdateFunc: c.updateAPIService,
+            DeleteFunc: c.deleteAPIService,
+        },
+        30*time.Second)
+    c.apiServiceSynced = apiServiceHandler.HasSynced
+
+    serviceHandler, _ := serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc:    c.addService,
+        UpdateFunc: c.updateService,
+        DeleteFunc: c.deleteService,
+    })
+    c.servicesSynced = serviceHandler.HasSynced
+
+    endpointsHandler, _ := endpointsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc:    c.addEndpoints,
+        UpdateFunc: c.updateEndpoints,
+        DeleteFunc: c.deleteEndpoints,
+    })
+    c.endpointsSynced = endpointsHandler.HasSynced
+
+    c.syncFn = c.sync
+
+    // TODO: 与 legacyregistry 解耦
+    var err error
+    registerIntoLegacyRegistryOnce.Do(func() {
+        err = c.metrics.Register(legacyregistry.Register, legacyregistry.CustomRegister)
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    return c, nil
+}
+
+func (c *AvailableConditionController) addAPIService(obj interface{}) {
+    castObj := obj.(*apiregistrationv1.APIService)
+    klog.V(4).Infof("Adding %s", castObj.Name)
+    if castObj.Spec.Service != nil {
+    	c.rebuildAPIServiceCache()
+    }
+    c.queue.Add(castObj.Name)
+}
+
+func (c *AvailableConditionController) updateAPIService(oldObj, newObj interface{}) {
+    castObj := newObj.(*apiregistrationv1.APIService)
+    oldCastObj := oldObj.(*apiregistrationv1.APIService)
+    klog.V(4).Infof("Updating %s", oldCastObj.Name)
+    if !reflect.DeepEqual(castObj.Spec.Service, oldCastObj.Spec.Service) {
+    	c.rebuildAPIServiceCache()
+    }
+    c.queue.Add(oldCastObj.Name)
+}
+
+func (c *AvailableConditionController) deleteAPIService(obj interface{}) {
+    castObj, ok := obj.(*apiregistrationv1.APIService)
+    if !ok {
+        tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+        if !ok {
+            klog.Errorf("Couldn't get object from tombstone %#v", obj)
+            return
+        }
+        castObj, ok = tombstone.Obj.(*apiregistrationv1.APIService)
+        if !ok {
+            klog.Errorf("Tombstone contained object that is not expected %#v", obj)
+            return
+        }
+    }
+    klog.V(4).Infof("Deleting %q", castObj.Name)
+    if castObj.Spec.Service != nil {
+    	c.rebuildAPIServiceCache()
+    }
+    c.queue.Add(castObj.Name)
+}
+
+func (c *AvailableConditionController) getAPIServicesFor(obj runtime.Object) []string {
+    metadata, err := meta.Accessor(obj)
+    if err != nil {
+        utilruntime.HandleError(err)
+        return nil
+    }
+    c.cacheLock.RLock()
+    defer c.cacheLock.RUnlock()
+    return c.cache[metadata.GetNamespace()][metadata.GetName()]
+}
+
+// 如果服务/端点处理程序在缓存重建之前获胜，它可能会排队一个不再相关的 API 服务
+// （这没关系，会多处理一次），并错过一个新的相关 API 服务（它将被 API 服务处理程序排队）
+func (c *AvailableConditionController) rebuildAPIServiceCache() {
+    apiServiceList, _ := c.apiServiceLister.List(labels.Everything())
+    newCache := map[string]map[string][]string{}
+    for _, apiService := range apiServiceList {
+        if apiService.Spec.Service == nil {
+        	continue
+        }
+        if newCache[apiService.Spec.Service.Namespace] == nil {
+            newCache[apiService.Spec.Service.Namespace] = map[string][]string{}
+        }
+    	newCache[apiService.Spec.Service.Namespace][apiService.Spec.Service.Name] = append(newCache[apiService.Spec.Service.Namespace][apiService.Spec.Service.Name], apiService.Name)
+    }
+    c.cacheLock.Lock()
+    defer c.cacheLock.Unlock()
+    c.cache = newCache
+}
+
+// TODO，想出一种方法来避免在每次服务操作时进行检查
+
+func (c *AvailableConditionController) addService(obj interface{}) {
+    for _, apiService := range c.getAPIServicesFor(obj.(*v1.Service)) {
+    	c.queue.Add(apiService)
+    }
+}
+
+func (c *AvailableConditionController) updateService(obj, _ interface{}) {
+    for _, apiService := range c.getAPIServicesFor(obj.(*v1.Service)) {
+    	c.queue.Add(apiService)
+    }
+}
+
+func (c *AvailableConditionController) deleteService(obj interface{}) {
+    castObj, ok := obj.(*v1.Service)
+    if !ok {
+        tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+        if !ok {
+            klog.Errorf("Couldn't get object from tombstone %#v", obj)
+            return
+        }
+        castObj, ok = tombstone.Obj.(*v1.Service)
+        if !ok {
+            klog.Errorf("Tombstone contained object that is not expected %#v", obj)
+            return
+        }
+    }
+    for _, apiService := range c.getAPIServicesFor(castObj) {
+    	c.queue.Add(apiService)
+    }
+}
+
+func (c *AvailableConditionController) addEndpoints(obj interface{}) {
+    for _, apiService := range c.getAPIServicesFor(obj.(*v1.Endpoints)) {
+    	c.queue.Add(apiService)
+    }
+}
+
+func (c *AvailableConditionController) updateEndpoints(obj, _ interface{}) {
+    for _, apiService := range c.getAPIServicesFor(obj.(*v1.Endpoints)) {
+    	c.queue.Add(apiService)
+    }
+}
+
+func (c *AvailableConditionController) deleteEndpoints(obj interface{}) {
+    castObj, ok := obj.(*v1.Endpoints)
+    if !ok {
+        tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+        if !ok {
+            klog.Errorf("Couldn't get object from tombstone %#v", obj)
+            return
+        }
+        castObj, ok = tombstone.Obj.(*v1.Endpoints)
+        if !ok {
+            klog.Errorf("Tombstone contained object that is not expected %#v", obj)
+            return
+        }
+    }
+    for _, apiService := range c.getAPIServicesFor(castObj) {
+    	c.queue.Add(apiService)
+    }
+}
+
+// setUnavailableGauge 设置指标，以反映给定服务的当前状态基于可用性
+func (c *AvailableConditionController) setUnavailableGauge(newAPIService *apiregistrationv1.APIService) {
+    if apiregistrationv1apihelper.IsAPIServiceConditionTrue(newAPIService, apiregistrationv1.Available) {
+    	c.metrics.setUnavailableGauge(newAPIService.Name, 0)
+    } else {
+    	c.metrics.setUnavailableGauge(newAPIService.Name, 1)
+    }
+}
+
+// isAvailableConditionTrue 返回给定 API 服务是否可用
+func isAvailableConditionTrue(apiService *apiregistrationv1.APIService) bool {
+	return apiregistrationv1apihelper.IsAPIServiceConditionTrue(apiService, apiregistrationv1.Available)
+}
+
+// isAPIServiceAvailable 返回给定 API 服务是否应在集群中可用
+func isAPIServiceAvailable(apiService *apiregistrationv1.APIService) bool {
+	return apiService.Spec.Service != nil && apiService.Spec.Service.Name != "" && apiService.Spec.Service.Namespace != ""
+}
+
+// sync 是控制器的主要处理循环。它从队列中弹出 API 服务，检查其可用性，
+// 并相应地更新 API 服务的条件和指标。
+func (c *AvailableConditionController) sync(key string) error {
+    namespace, name, err := cache.SplitMetaNamespaceKey(key)
+    if err != nil {
+        utilruntime.HandleError(fmt.Errorf("Error splitting meta namespace key %q: %v", key, err))
+        return nil
+    }
+    apiService, err := c.apiServiceLister.APIServices(namespace).Get(name)
+    if err != nil {
+        if errors.IsNotFound(err) {
+            c.metrics.unregister(name)
+            return nil
+        }
+        return fmt.Errorf("Error getting APIService %q: %v", key, err)
+    }
+
+    c.setUnavailableGauge(apiService)
+
+    if !isAPIServiceAvailable(apiService) {
+        return nil
+    }
+
+    serviceURL, err := c.serviceResolver.ResolveEndpoint(apiService.Spec.Service.Namespace, apiService.Spec.Service.Name, apiService.Spec.Service.Port.IntVal)
+    if err != nil {
+        // 如果无法解析服务的终结点，则将 API 服务的可用性条件设置为未知
+        return c.updateAPIServiceCondition(apiService, metav1.ConditionUnknown, fmt.Sprintf("Unable to resolve service endpoint: %v", err))
+    }
+
+    conn, err := c.proxyTransportDial.Dial(serviceURL)
+    if err != nil {
+        // 如果无法建立与服务的连接，则将 API 服务的可用性条件设置为不可用
+        return c.updateAPIServiceCondition(apiService, metav1.ConditionFalse, fmt.Sprintf("Unable to connect to service endpoint: %v", err))
+    }
+    conn.Close()
+
+    // 如果成功建立连接，则将 API 服务的可用性条件设置为可用
+	return c.updateAPIServiceCondition(apiService, metav1.ConditionTrue, "")
+}
+
+// updateAPIServiceCondition 更新给定 API 服务的可用性条件
+func (c *AvailableConditionController) updateAPIServiceCondition(apiService *apiregistrationv1.APIService, status metav1.ConditionStatus, message string) error {
+    if status == metav1.ConditionTrue && message == "" {
+    	return nil
+    }
+    condition := apiregistrationv1.APIServiceCondition{
+        Type:               apiregistrationv1.Available,
+        Status:             status,
+        Reason:             "AvailabilityCheck",
+        Message:            message,
+        LastTransitionTime: metav1.Now(),
+    }
+
+    updated := false
+    for i, existing := range apiService.Status.Conditions {
+        if existing.Type == apiregistrationv1.Available {
+            if existing.Status != status || existing.Message != message {
+                apiService.Status.Conditions[i] = condition
+                updated = true
+            }
+            break
+        }
+    }
+
+    if !updated {
+        apiService.Status.Conditions = append(apiService.Status.Conditions, condition)
+    }
+
+    _, err := c.apiServiceClient.APIServices(apiService.Namespace).UpdateStatus(apiService)
+    if err != nil {
+        return fmt.Errorf("Error updating APIService status: %v", err)
+    }
+
+    return nil
+}
+
+func (c *AvailableConditionController) worker() {
+    for c.processNextWorkItem() {
+    }
+}
+
+func (c *AvailableConditionController) processNextWorkItem() bool {
+    key, quit := c.queue.Get()
+    if quit {
+    	return false
+    }
+    defer c.queue.Done(key)
+
+    err := c.sync(key.(string))
+    c.handleErr(err, key)
+
+    return true
+}
+
+func (c *AvailableConditionController) handleErr(err error, key interface{}) {
+    if err == nil {
+        c.queue.Forget(key)
+        return
+    }
+
+    if c.queue.NumRequeues(key) < maxRetries {
+        klog.Errorf("Error syncing APIService %v: %v", key, err)
+        c.queue.AddRateLimited(key)
+        return
+    }
+
+    utilruntime.HandleError(err)
+    klog.Errorf("Dropping APIService %q out of the queue: %v", key, err)
+    c.queue.Forget(key)
+}
+
+func (c *AvailableConditionController) sync(key string) error {
+	originalAPIService, err := c.apiServiceLister.Get(key)
+	if apierrors.IsNotFound(err) {
+		c.metrics.ForgetAPIService(key)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// 如果指定了特定的传输方式，则使用该方式，否则构建一个
+	// 构建一个忽略 TLS 验证的 HTTP 客户端（如果有人拥有网络并干扰您的状态，
+	// 那没关系），并设置一个非常短的超时时间。这是一个尽力而为的 GET 请求，
+	// 不提供额外的信息。
+	transportConfig := &transport.Config{
+		TLS: transport.TLSConfig{
+			Insecure: true,
+		},
+		DialHolder: c.proxyTransportDial,
+	}
+
+	if c.proxyCurrentCertKeyContent != nil {
+		proxyClientCert, proxyClientKey := c.proxyCurrentCertKeyContent()
+
+		transportConfig.TLS.CertData = proxyClientCert
+		transportConfig.TLS.KeyData = proxyClientKey
+	}
+	restTransport, err := transport.New(transportConfig)
+	if err != nil {
+		return err
+	}
+	discoveryClient := &http.Client{
+		Transport: restTransport,
+		// 请求应该很快完成。
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	apiService := originalAPIService.DeepCopy()
+
+	availableCondition := apiregistrationv1.APIServiceCondition{
+		Type:               apiregistrationv1.Available,
+		Status:             apiregistrationv1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+	}
+
+	// 本地 API 服务始终被认为是可用的
+	if apiService.Spec.Service == nil {
+		apiregistrationv1apihelper.SetAPIServiceCondition(apiService, apiregistrationv1apihelper.NewLocalAvailableAPIServiceCondition())
+		_, err := c.updateAPIServiceStatus(originalAPIService, apiService)
+		return err
+	}
+
+	service, err := c.serviceLister.Services(apiService.Spec.Service.Namespace).Get(apiService.Spec.Service.Name)
+	if apierrors.IsNotFound(err) {
+		availableCondition.Status = apiregistrationv1.ConditionFalse
+		availableCondition.Reason = "ServiceNotFound"
+		availableCondition.Message = fmt.Sprintf("service/%s in %q is not present", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace)
+		apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+		_, err := c.updateAPIServiceStatus(originalAPIService, apiService)
+		return err
+	} else if err != nil {
+		availableCondition.Status = apiregistrationv1.ConditionUnknown
+		availableCondition.Reason = "ServiceAccessError"
+		availableCondition.Message = fmt.Sprintf("service/%s in %q cannot be checked due to: %v", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, err)
+		apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+		_, err := c.updateAPIServiceStatus(originalAPIService, apiService)
+		return err
+	}
+
+	if service.Spec.Type == v1.ServiceTypeClusterIP {
+        // 如果服务类型是 ClusterIP，则需要检查服务是否在配置的端口上监听
+        servicePort := apiService.Spec.Service.Port
+        portName := ""
+        foundPort := false
+        for _, port := range service.Spec.Ports {
+            if port.Port == *servicePort {
+                foundPort = true
+                portName = port.Name
+                break
+            }
+        }
+        if !foundPort {
+            availableCondition.Status = apiregistrationv1.ConditionFalse
+            availableCondition.Reason = "ServicePortError"
+            availableCondition.Message = fmt.Sprintf("service/%s in %q is not listening on port %d", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, *apiService.Spec.Service.Port)
+            apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+            _, err := c.updateAPIServiceStatus(originalAPIService, apiService)
+            return err
+        }
+
+        endpoints, err := c.endpointsLister.Endpoints(apiService.Spec.Service.Namespace).Get(apiService.Spec.Service.Name)
+        if apierrors.IsNotFound(err) {
+            availableCondition.Status = apiregistrationv1.ConditionFalse
+            availableCondition.Reason = "EndpointsNotFound"
+            availableCondition.Message = fmt.Sprintf("cannot find endpoints for service/%s in %q", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace)
+            apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+            _, err := c.updateAPIServiceStatus(originalAPIService, apiService)
+            return err
+        } else if err != nil {
+            availableCondition.Status = apiregistrationv1.ConditionUnknown
+                availableCondition.Reason = "EndpointsAccessError"
+            availableCondition.Message = fmt.Sprintf("service/%s in %q cannot be checked due to: %v", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, err)
+            apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+            _, err := c.updateAPIServiceStatus(originalAPIService, apiService)
+            return err
+        }
+        hasActiveEndpoints := false
+    outer:
+        for _, subset := range endpoints.Subsets {
+            if len(subset.Addresses) == 0 {
+                continue
+            }
+            for _, endpointPort := range subset.Ports {
+                if endpointPort.Name == portName {
+                    hasActiveEndpoints = true
+                    break outer
+                }
+            }
+        }
+        if !hasActiveEndpoints {
+            availableCondition.Status = apiregistrationv1.ConditionFalse
+            availableCondition.Reason = "MissingEndpoints"
+            availableCondition.Message = fmt.Sprintf("endpoints for service/%s in %q have no addresses with port name %q", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, portName)
+            apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+            _, err := c.updateAPIServiceStatus(originalAPIService, apiService)
+            return err
+        }
+    }
+    // 实际尝试访问发现端点时，当它不是本地的并且我们正在以服务方式进行路由时。
+    if apiService.Spec.Service != nil && c.serviceResolver != nil {
+        attempts := 5
+        results := make(chan error, attempts)
+        for i := 0; i < attempts; i++ {
+            go func() {
+                discoveryURL, err := c.serviceResolver.ResolveEndpoint(apiService.Spec.Service.Namespace, apiService.Spec.Service.Name, *apiService.Spec.Service.Port)
+                if err != nil {
+                    results <- err
+                    return
+                }
+                // 当将 legacyAPIService 委派给服务时，渲染 legacyAPIService 健康检查路径
+                if apiService.Name == "v1." {
+                    discoveryURL.Path = "/api/" + apiService.Spec.Version
+                } else {
+                    discoveryURL.Path = "/apis/" + apiService.Spec.Group + "/" + apiService.Spec.Version
+                }
+
+                errCh := make(chan error, 1)
+                go func() {
+                    // 确保检查聚合 API 服务器需要提供的 URL
+                    newReq, err := http.NewRequest("GET", discoveryURL.String(), nil)
+                    if err != nil {
+                        errCh <- err
+                        return
+                    }
+
+                    // 设置 system-masters 身份以确保我们始终具有访问权限
+                    transport.SetAuthProxyHeaders(newReq, "system:kube-aggregator", []string{"system:masters"}, nil)
+                    resp, err := discoveryClient.Do(newReq)
+                    if resp != nil {
+                        resp.Body.Close()
+                        // 我们应该始终处于 200 到 300 之间的状态码范围内
+                        if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+                            errCh <- fmt.Errorf("bad status from %v: %v", discoveryURL, resp.StatusCode)
+                            return
+                        }
+                    }
+
+                    errCh <- err
+                }()
+
+                select {
+                case err = <-errCh:
+                    if err != nil {
+                        results <- fmt.Errorf("failing or missing response from %v: %v", discoveryURL, err)
+                        return
+                    }
+
+                    // 我们在处理缓慢的拨号和 DNS 响应时遇到了问题，导致等待时间过长。为此添加了保险措施
+                case <-time.After(6 * time.Second):
+                    results <- fmt.Errorf("timed out waiting for %v", discoveryURL)
+                    return
+                }
+
+                results <- nil
+            }()
+        }
+
+        var lastError error
+        for i := 0; i < attempts; i++ {
+            lastError = <-results
+            // 如果至少有一个成功，整体上就是成功的，现在可以返回
+            if lastError == nil {
+                break
+            }
+        }
+
+        if lastError != nil {
+            availableCondition.Status = apiregistrationv1.ConditionFalse
+            availableCondition.Reason = "FailedDiscoveryCheck"
+            availableCondition.Message = lastError.Error()
+            apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+            _, updateErr := c.updateAPIServiceStatus(originalAPIService, apiService)
+            if updateErr != nil {
+                return updateErr
+            }
+            // 强制重新排队，以明确表明此操作将在未来的某个时间点重试，与通过服务更改、端点更改和重新同步进行的其他重新排队一起
+            return lastError
+        }
+    }
+
+    availableCondition.Reason = "Passed"
+    availableCondition.Message = "all checks passed"
+    apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+    _, err = c.updateAPIServiceStatus(originalAPIService, apiService)
+    return err
+}
+
+// updateAPIServiceStatus 函数用于在检测到更改时更新 APIService 的状态。我们有一个紧密的重新同步循环来快速检测无效的 apiservices。这意味着我们不希望快速发出无操作的更新。
+func (c *AvailableConditionController) updateAPIServiceStatus(originalAPIService, newAPIService *apiregistrationv1.APIService) (*apiregistrationv1.APIService, error) {
+    // 在每次同步操作中更新该指标，以反映实际状态
+    c.setUnavailableGauge(newAPIService)
+    // 如果 originalAPIService.Status 和 newAPIService.Status 相等，则无需更新
+    if equality.Semantic.DeepEqual(originalAPIService.Status, newAPIService.Status) {
+        return newAPIService, nil
+    }
+
+    // 获取原始 APIService 和新的 APIService 的 Available Condition
+    orig := apiregistrationv1apihelper.GetAPIServiceConditionByType(originalAPIService, apiregistrationv1.Available)
+    now := apiregistrationv1apihelper.GetAPIServiceConditionByType(newAPIService, apiregistrationv1.Available)
+
+    // 创建一个 unknown APIServiceCondition，用于处理 nil 的情况
+    unknown := apiregistrationv1.APIServiceCondition{
+        Type:   apiregistrationv1.Available,
+        Status: apiregistrationv1.ConditionUnknown,
+    }
+
+    // 如果 orig 为 nil，则将其设置为 unknown
+    if orig == nil {
+        orig = &unknown
+    }
+
+    // 如果 now 为 nil，则将其设置为 unknown
+    if now == nil {
+        now = &unknown
+    }
+
+    // 如果 orig 和 now 不相等，则输出日志记录 APIService 的可用性更改信息
+    if *orig != *now {
+        klog.V(2).InfoS("changing APIService availability", "name", newAPIService.Name, "oldStatus", orig.Status, "newStatus", now.Status, "message", now.Message, "reason", now.Reason)
+    }
+
+    // 更新 APIService 的状态
+    newAPIService, err := c.apiServiceClient.APIServices().UpdateStatus(context.TODO(), newAPIService, metav1.UpdateOptions{})
+    if err != nil {
+        return nil, err
+    }
+
+    // 更新不可用计数器
+    c.setUnavailableCounter(originalAPIService, newAPIService)
+    return newAPIService, nil
+}
+
+// Run 函数启动 AvailableConditionController 的循环，用于管理 API 服务的可用性条件。
+func (c *AvailableConditionController) Run(workers int, stopCh <-chan struct{}) {
+    defer utilruntime.HandleCrash()
+    defer c.queue.ShutDown()
+	klog.Info("Starting AvailableConditionController")
+    defer klog.Info("Shutting down AvailableConditionController")
+
+    // 等待 informers 同步完成，并且等待处理程序被调用；
+    // 由于处理程序是三种不同的方式将相同的内容放入队列中，等待此操作允许队列最大程度地去重。
+    if !controllers.WaitForCacheSync("AvailableConditionController", stopCh, c.apiServiceSynced, c.servicesSynced, c.endpointsSynced) {
+        return
+    }
+
+    // 启动指定数量的 worker goroutine
+    for i := 0; i < workers; i++ {
+        go wait.Until(c.runWorker, time.Second, stopCh)
+    }
+
+    // 等待 stopCh 信号
+    <-stopCh
+}
+
+// runWorker 函数执行 worker 的逻辑
+func (c *AvailableConditionController) runWorker() {
+    for c.processNextWorkItem() {
+    }
+}
+
+// processNextWorkItem 函数处理队列中的一个键。当需要退出时返回 false。
+func (c *AvailableConditionController) processNextWorkItem() bool {
+    // 从队列中获取一个键和 quit 标志
+    key, quit := c.queue.Get()
+    if quit {
+    	return false
+    }
+    defer c.queue.Done(key)
+    // 调用 syncFn 处理键对应的工作项
+    err := c.syncFn(key.(string))
+    if err == nil {
+        // 处理成功，从队列中删除该键
+        c.queue.Forget(key)
+        return true
+    }
+
+    // 处理出错，记录错误并将键重新加入队列
+    utilruntime.HandleError(fmt.Errorf("%v failed with: %v", key, err))
+    c.queue.AddRateLimited(key)
+
+    return true
+}
+```
+
+#### crdRegistrationController
+
+这个控制器的作用是将自定义资源定义（CRD）的GroupVersions注册到自动APIService注册控制器，以确保它们自动保持同步。
+
+控制器通过监听CRD的创建、更新和删除事件来进行操作。当一个CRD被添加或更新时，控制器将检查其版本，并将相应的GroupVersion信息添加到工作队列中。随后，控制器会处理工作队列中的每个GroupVersion，并根据条件向AutoAPIServiceRegistration添加相应的APIService，以确保其与CRD的GroupVersion保持同步。如果一个CRD被删除，控制器会相应地从AutoAPIServiceRegistration中移除相应的APIService。
+
+```GO
+// AutoAPIServiceRegistration是一个接口，调用者可以在本地重新声明并正确地进行转换，
+// 用于添加和删除APIServices。
+type AutoAPIServiceRegistration interface {
+    // AddAPIServiceToSync将一个API服务添加到自动注册。
+    AddAPIServiceToSync(in *v1.APIService)
+    // RemoveAPIServiceToSync从自动注册中删除一个API服务。
+    RemoveAPIServiceToSync(name string)
+}
+
+type crdRegistrationController struct {
+    crdLister crdlisters.CustomResourceDefinitionLister
+    crdSynced cache.InformerSynced
+    apiServiceRegistration AutoAPIServiceRegistration
+    syncHandler func(groupVersion schema.GroupVersion) error
+    syncedInitialSet chan struct{}
+    queue workqueue.RateLimitingInterface
+}
+
+// NewCRDRegistrationController返回一个控制器，它将CRD GroupVersions注册到自动APIService注册控制器，
+// 以使它们自动保持同步。
+func NewCRDRegistrationController(crdinformer crdinformers.CustomResourceDefinitionInformer, apiServiceRegistration AutoAPIServiceRegistration) *crdRegistrationController {
+    c := &crdRegistrationController{
+        crdLister: crdinformer.Lister(),
+        crdSynced: crdinformer.Informer().HasSynced,
+        apiServiceRegistration: apiServiceRegistration,
+        syncedInitialSet: make(chan struct{}),
+        queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "crd_autoregistration_controller"),
+    }
+    c.syncHandler = c.handleVersionUpdate
+        // 为CRD Informer添加事件处理程序
+    crdinformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc: func(obj interface{}) {
+            cast := obj.(*apiextensionsv1.CustomResourceDefinition)
+            c.enqueueCRD(cast)
+        },
+        UpdateFunc: func(oldObj, newObj interface{}) {
+            // Enqueue both old and new object to make sure we remove and add appropriate API services.
+            // The working queue will resolve any duplicates and only changes will stay in the queue.
+            c.enqueueCRD(oldObj.(*apiextensionsv1.CustomResourceDefinition))
+            c.enqueueCRD(newObj.(*apiextensionsv1.CustomResourceDefinition))
+        },
+        DeleteFunc: func(obj interface{}) {
+            cast, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
+            if !ok {
+                tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+                if !ok {
+                    klog.V(2).Infof("Couldn't get object from tombstone %#v", obj)
+                    return
+                }
+                cast, ok = tombstone.Obj.(*apiextensionsv1.CustomResourceDefinition)
+                if !ok {
+                    klog.V(2).Infof("Tombstone contained unexpected object: %#v", obj)
+                    return
+                }
+            }
+            c.enqueueCRD(cast)
+        },
+    })
+
+    return c
+}
+    
+func (c *crdRegistrationController) enqueueCRD(crd *apiextensionsv1.CustomResourceDefinition) {
+	// 将CRD的每个版本添加到工作队列
+    for _, version := range crd.Spec.Versions {
+    	c.queue.Add(schema.GroupVersion{Group: crd.Spec.Group, Version: version.Name})
+    }
+    // 检查所有的CRD。虽然不会有太多的CRD，但如果以后出现问题，我们可以对它们建立索引。
+    crds, err := c.crdLister.List(labels.Everything())
+    if err != nil {
+        return err
+    }
+    for _, crd := range crds {
+        // 如果CRD的Group与指定的GroupVersion的Group不匹配，则继续下一个CRD
+        if crd.Spec.Group != groupVersion.Group {
+            continue
+        }
+        for _, version := range crd.Spec.Versions {
+            // 如果CRD的Version与指定的GroupVersion的Version不匹配或者Version未启用，则继续下一个Version
+            if version.Name != groupVersion.Version || !version.Served {
+                continue
+            }
+
+            // 向AutoAPIServiceRegistration添加APIService以保持同步
+            c.apiServiceRegistration.AddAPIServiceToSync(&v1.APIService{
+                ObjectMeta: metav1.ObjectMeta{Name: apiServiceName},
+                Spec: v1.APIServiceSpec{
+                    Group:                groupVersion.Group,
+                    Version:              groupVersion.Version,
+                    GroupPriorityMinimum: 1000, // CRDs应具有相对较低的优先级
+                    VersionPriority:      100,  // CRDs将按照类似于kube的版本进行排序，就像其他具有相同VersionPriority的APIService一样
+                },
+            })
+            return nil
+        }
+    }
+
+    // 如果没有匹配的CRD，则从AutoAPIServiceRegistration中删除相应的APIService
+    c.apiServiceRegistration.RemoveAPIServiceToSync(apiServiceName)
+    return nil
+}
+    
+func (c *crdRegistrationController) Run(workers int, stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	// make sure the work queue is shutdown which will trigger workers to end
+	defer c.queue.ShutDown()
+
+	klog.Infof("Starting crd-autoregister controller")
+	defer klog.Infof("Shutting down crd-autoregister controller")
+
+	// wait for your secondary caches to fill before starting your work
+	if !cache.WaitForNamedCacheSync("crd-autoregister", stopCh, c.crdSynced) {
+		return
+	}
+
+	// process each item in the list once
+	if crds, err := c.crdLister.List(labels.Everything()); err != nil {
+		utilruntime.HandleError(err)
+	} else {
+		for _, crd := range crds {
+			for _, version := range crd.Spec.Versions {
+				if err := c.syncHandler(schema.GroupVersion{Group: crd.Spec.Group, Version: version.Name}); err != nil {
+					utilruntime.HandleError(err)
+				}
+			}
+		}
+	}
+	close(c.syncedInitialSet)
+
+	// start up your worker threads based on workers.  Some controllers have multiple kinds of workers
+	for i := 0; i < workers; i++ {
+		// runWorker will loop until "something bad" happens.  The .Until will then rekick the worker
+		// after one second
+		go wait.Until(c.runWorker, time.Second, stopCh)
+	}
+
+	// wait until we're told to stop
+	<-stopCh
+}
+
+// WaitForInitialSync blocks until the initial set of CRD resources has been processed
+func (c *crdRegistrationController) WaitForInitialSync() {
+	<-c.syncedInitialSet
+}
+
+func (c *crdRegistrationController) runWorker() {
+	// hot loop until we're told to stop.  processNextWorkItem will automatically wait until there's work
+	// available, so we don't worry about secondary waits
+	for c.processNextWorkItem() {
+	}
+}
+
+func (c *crdRegistrationController) handleVersionUpdate(groupVersion schema.GroupVersion) error {
+	apiServiceName := groupVersion.Version + "." + groupVersion.Group
+    // 检查所有的CRDs。应该不会有太多的CRD，但如果以后出现问题，我们可以对它们建立索引。
+    crds, err := c.crdLister.List(labels.Everything())
+    if err != nil {
+        return err
+    }
+    for _, crd := range crds {
+        // 如果CRD的Group与指定的GroupVersion的Group不匹配，则继续下一个CRD
+        if crd.Spec.Group != groupVersion.Group {
+            continue
+        }
+        for _, version := range crd.Spec.Versions {
+            // 如果CRD的Version与指定的GroupVersion的Version不匹配或者Version未启用，则继续下一个Version
+            if version.Name != groupVersion.Version || !version.Served {
+                continue
+            }
+
+            // 向AutoAPIServiceRegistration添加APIService以保持同步
+            c.apiServiceRegistration.AddAPIServiceToSync(&v1.APIService{
+                ObjectMeta: metav1.ObjectMeta{Name: apiServiceName},
+                Spec: v1.APIServiceSpec{
+                    Group:                groupVersion.Group,
+                    Version:              groupVersion.Version,
+                    GroupPriorityMinimum: 1000, // CRDs应具有相对较低的优先级
+                    VersionPriority:      100,  // CRDs将按照类似于kube的版本进行排序，就像其他具有相同VersionPriority的APIService一样
+                },
+            })
+            return nil
+        }
+    }
+
+    // 如果没有匹配的CRD，则从AutoAPIServiceRegistration中删除相应的APIService
+    c.apiServiceRegistration.RemoveAPIServiceToSync(apiServiceName)
+    return nil
+}
+```
+
