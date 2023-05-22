@@ -8,7 +8,7 @@ categories: [cloud]
 tags: [kubernetes]
 authors:
     - haiyux
-featuredImagePreview: /img/k8s.webp
+featuredImagePreview: /img/preview/apiserver/kube-apiserver-createserverchain.jpg
 ---
 
 ## 简介

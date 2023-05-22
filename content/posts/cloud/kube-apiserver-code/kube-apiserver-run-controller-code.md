@@ -1,5 +1,5 @@
 ---
-title: "kube-apiserver prerun和run 代码走读"
+title: "kube-apiserver prerun,run和controller代码走读"
 subtitle:
 date: 2023-05-21T17:26:09+08:00
 draft: false
@@ -8,7 +8,7 @@ categories: [cloud]
 tags: [kubernetes]
 authors:
     - haiyux
-featuredImagePreview: /img/k8s.webp
+featuredImagePreview: /img/preview/apiserver/kube-apiserver-run-controller.jpg
 ---
 
 ## PrepareRun
