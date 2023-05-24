@@ -8,7 +8,7 @@ categories: [cloud]
 tags: [kubernetes]
 authors:
     - haiyux
-#featuredImagePreview: /img/preview/apiserver/kube-apiserver-createserverchain.jpg
+featuredImagePreview: /img/preview/apiserver/kube-apiserver-handlerchain.jpg
 ---
 
 ## Handlerchain做什么的？
