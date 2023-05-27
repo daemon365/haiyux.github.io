@@ -1,8 +1,8 @@
 ---
 title: "docker基础 namespace,Cgoup和UnionFS"
-subtitle:
 date: 2023-05-27T14:49:51+08:00
 draft: false
+toc: true
 categories: 
   - cloud
 tags: 
@@ -226,7 +226,7 @@ subsystem 是一组资源控制的模块，一般包含有：
 
 ### v2
 
-Cgroup v2[手册]([https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
+Cgroup v2[手册](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
 
 是否加载了Cgroup v2内核模块
 
