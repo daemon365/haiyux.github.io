@@ -1,5 +1,5 @@
 ---
-title: Kube Apiserver Rest Namespace Code
+title: "kube-apiserver namespace代码走读"
 subtitle:
 date: 2023-05-25T20:57:07+08:00
 draft: false
