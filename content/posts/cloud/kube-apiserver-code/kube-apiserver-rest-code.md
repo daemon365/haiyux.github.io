@@ -8,7 +8,7 @@ categories: [cloud]
 tags: [kubernetes]
 authors:
     - haiyux
-# featuredImagePreview: /img/preview/apiserver/kube-apiserver-handlerchain.jpg
+featuredImagePreview: /img/preview/apiserver/kube-apiserver-namespace.jpg
 ---
 
 ## rest注册
