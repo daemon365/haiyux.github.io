@@ -237,6 +237,8 @@ cpuset cpu io memory hugetlb pids rdma misc
 
 #### test
 
+##### Cpu
+
 执行一段go代码
 
 ```go
@@ -268,6 +270,53 @@ sudo echo "39268" | sudo tee /sys/fs/cgroup/test/cgroup.procs >/dev/null
 #    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
 #  39268 zhy       20   0  709572    868    584 R 100.3   0.0   7:45.04 test
 # 马上就只占用一个cpu了
+```
+
+##### Memory
+
+```go
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#define BLOCK_SIZE (100 * 1024 * 1024)
+#define NUM_ALLOCATIONS 10
+#define SLEEP_SECONDS 30
+
+char* allocMemory(int size) {
+    char* out = (char*)malloc(size);
+    memset(out, 'A', size);
+    return out;
+}
+
+int main() {
+    int i;
+
+    for (i = 1; i <= NUM_ALLOCATIONS; i++) {
+        char* block = allocMemory(i * BLOCK_SIZE);
+        printf("Allocated memory block of size %dMB at address: %p\n", i * 100, block);
+        sleep(SLEEP_SECONDS);
+    }
+
+    return 0;
+}
+
+/*
+ ps -p 3243 -o rss=,unit=M,cmd=
+      M
+308512 session-4.scope                ./test2
+*/
+```
+
+限制内存
+
+```bash
+sudo echo "300000000" |sudo tee /sys/fs/cgroup/test/memory.max >/dev/null
+sudo echo "64417" | sudo tee /sys/fs/cgroup/test/cgroup.procs >/dev/null
+
+#cat memory.current
+#299839488
 ```
 
 ## UnionFS
@@ -322,14 +371,14 @@ file4 from upper
 
 ### Docker 的文件系统
 
-典型的 Linux 文件系统组成：
+典型的Linux文件系统组成如下：
 
-- Bootfs（boot file system）
-  - Bootloader - 引导加载 kernel，
-  - Kernel - 当 kernel 被加载到内存中后 umount bootfs。
-- rootfs （root file system）
-  - /dev，/proc，/bin，/etc 等标准目录和文件。
-  - 对于不同的 linux 发行版，bootfs 基本是一致的，但 rootfs 会有差别。
+- Bootfs（引导文件系统）
+  - Bootloader（引导加载程序）：负责加载内核。
+  - Kernel（内核）：一旦内核加载到内存中，就会卸载bootfs。
+- Rootfs（根文件系统）
+  - /dev、/proc、/bin、/etc等标准目录和文件。
+  - 对于不同的Linux发行版，bootfs基本上是一致的，但rootfs会有所差异。
 
 ### Docker 启动
 
