@@ -1765,187 +1765,7 @@ func NewDualStackProxier(
 }
 ```
 
-### Chain
-
-```GO
-const (
-    // 服务链
-    kubeServicesChain utiliptables.Chain = "KUBE-SERVICES"
-
-    // 外部服务链
-    kubeExternalServicesChain utiliptables.Chain = "KUBE-EXTERNAL-SERVICES"
-
-    // NodePort链
-    kubeNodePortsChain utiliptables.Chain = "KUBE-NODEPORTS"
-
-    // Kubernetes出口链
-    kubePostroutingChain utiliptables.Chain = "KUBE-POSTROUTING"
-
-    // kubeMarkMasqChain是用于标记伪装的链
-    kubeMarkMasqChain utiliptables.Chain = "KUBE-MARK-MASQ"
-
-    // Kubernetes转发链
-    kubeForwardChain utiliptables.Chain = "KUBE-FORWARD"
-
-    // kubeProxyFirewallChain是kube-proxy防火墙链
-    kubeProxyFirewallChain utiliptables.Chain = "KUBE-PROXY-FIREWALL"
-
-    // kube proxy canary chain用于监控规则重新加载
-    kubeProxyCanaryChain utiliptables.Chain = "KUBE-PROXY-CANARY"
-
-    // kubeletFirewallChain是kubelet的防火墙的副本，包含了反火星数据包规则。
-    // 不应该用于其他规则。
-    kubeletFirewallChain utiliptables.Chain = "KUBE-FIREWALL"
-
-    // largeClusterEndpointsThreshold是切换到“大型集群模式”的端点数，优化iptables性能而不是可调试性。
-    largeClusterEndpointsThreshold = 1000
-)
-```
-
-### iptablesJumpChain
-
-```GO
-type iptablesJumpChain struct {
-	table     utiliptables.Table  // 表示iptables规则所属的表
-	dstChain  utiliptables.Chain  // 表示iptables规则的目标链
-	srcChain  utiliptables.Chain  // 表示iptables规则的源链
-	comment   string              // 注释，用于描述iptables规则的作用
-	extraArgs []string            // 额外的参数，用于配置iptables规则
-}
-
-var iptablesJumpChains = []iptablesJumpChain{
-	{utiliptables.TableFilter, kubeExternalServicesChain, utiliptables.ChainInput, "kubernetes externally-visible service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
-	{utiliptables.TableFilter, kubeExternalServicesChain, utiliptables.ChainForward, "kubernetes externally-visible service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
-	{utiliptables.TableFilter, kubeNodePortsChain, utiliptables.ChainInput, "kubernetes health check service ports", nil},
-	{utiliptables.TableFilter, kubeServicesChain, utiliptables.ChainForward, "kubernetes service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
-	{utiliptables.TableFilter, kubeServicesChain, utiliptables.ChainOutput, "kubernetes service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
-	{utiliptables.TableFilter, kubeForwardChain, utiliptables.ChainForward, "kubernetes forwarding rules", nil},
-	{utiliptables.TableFilter, kubeProxyFirewallChain, utiliptables.ChainInput, "kubernetes load balancer firewall", []string{"-m", "conntrack", "--ctstate", "NEW"}},
-	{utiliptables.TableFilter, kubeProxyFirewallChain, utiliptables.ChainOutput, "kubernetes load balancer firewall", []string{"-m", "conntrack", "--ctstate", "NEW"}},
-	{utiliptables.TableFilter, kubeProxyFirewallChain, utiliptables.ChainForward, "kubernetes load balancer firewall", []string{"-m", "conntrack", "--ctstate", "NEW"}},
-	{utiliptables.TableNAT, kubeServicesChain, utiliptables.ChainOutput, "kubernetes service portals", nil},
-	{utiliptables.TableNAT, kubeServicesChain, utiliptables.ChainPrerouting, "kubernetes service portals", nil},
-}
-```
-
-### OnEndpointSliceAdd
-
-```GO
-// OnEndpointSliceAdd 是在观察到创建新的端点切片对象时调用的方法。
-func (proxier *Proxier) OnEndpointSliceAdd(endpointSlice *discovery.EndpointSlice) {
-	if proxier.endpointsChanges.EndpointSliceUpdate(endpointSlice, false) && proxier.isInitialized() {
-		proxier.Sync()
-	}
-}
-```
-
-#### EndpointSliceUpdate
-
-```GO
-// EndpointSliceUpdate 根据<先前的端点，当前的端点>对更新给定服务的端点更改映射。
-// 如果有更改，返回true；否则返回false。将添加/更新/删除EndpointsChangeMap中的项目。
-// 如果removeSlice为true，则删除切片；否则将添加或更新切片。
-func (ect *EndpointChangeTracker) EndpointSliceUpdate(endpointSlice *discovery.EndpointSlice, removeSlice bool) bool {
-	if !supportedEndpointSliceAddressTypes.Has(string(endpointSlice.AddressType)) {
-		klog.V(4).InfoS("EndpointSlice的地址类型不被kube-proxy支持", "addressType", endpointSlice.AddressType)
-		return false
-	}
-
-	// 这不应该发生
-	if endpointSlice == nil {
-		klog.ErrorS(nil, "传递给EndpointSliceUpdate的endpointSlice为空")
-		return false
-	}
-
-	namespacedName, _, err := endpointSliceCacheKeys(endpointSlice)
-	if err != nil {
-		klog.InfoS("获取端点切片缓存键时出错", "err", err)
-		return false
-	}
-
-	metrics.EndpointChangesTotal.Inc()
-
-	ect.lock.Lock()
-	defer ect.lock.Unlock()
-
-	changeNeeded := ect.endpointSliceCache.updatePending(endpointSlice, removeSlice)
-
-	if changeNeeded {
-		metrics.EndpointChangesPending.Inc()
-		// 在删除Endpoints时，LastChangeTriggerTime注释按定义来自上次更新的时间，
-		// 这不是我们想要测量的。所以在这种情况下，我们简单地忽略它。
-		// TODO（wojtek-t，robscott）：在删除EndpointSlice时，解决该服务的其他EndpointSlice仍然存在的问题。
-		if removeSlice {
-			delete(ect.lastChangeTriggerTimes, namespacedName)
-		} else if t := getLastChangeTriggerTime(endpointSlice.Annotations); !t.IsZero() && t.After(ect.trackerStartTime) {
-			ect.lastChangeTriggerTimes[namespacedName] =
-				append(ect.lastChangeTriggerTimes[namespacedName], t)
-		}
-	}
-
-	return changeNeeded
-}
-```
-
-#### isInitialized
-
-```GO
-// 返回proxier.initialized的原子加载结果是否大于0，即是否已初始化。
-func (proxier *Proxier) isInitialized() bool {
-	return atomic.LoadInt32(&proxier.initialized) > 0
-}
-```
-
-#### Sync
-
-```GO
-// Sync 尽快将proxier的状态与iptables同步。
-func (proxier *Proxier) Sync() {
-	if proxier.healthzServer != nil {
-		proxier.healthzServer.QueuedUpdate()
-	}
-	metrics.SyncProxyRulesLastQueuedTimestamp.SetToCurrentTime()
-	proxier.syncRunner.Run()
-}
-```
-
-### OnEndpointSliceUpdate
-
-```GO
-// OnEndpointSliceUpdate 在观察到对现有的 endpoint slice 对象进行修改时调用。
-func (proxier *Proxier) OnEndpointSliceUpdate(_, endpointSlice *discovery.EndpointSlice) {
-    if proxier.endpointsChanges.EndpointSliceUpdate(endpointSlice, false) && proxier.isInitialized() {
-    	proxier.Sync()
-    }
-}
-```
-
-### OnEndpointSliceDelete
-
-```GO
-// OnEndpointSliceDelete 在观察到删除现有的 endpoint slice 对象时调用。
-func (proxier *Proxier) OnEndpointSliceDelete(endpointSlice *discovery.EndpointSlice) {
-	if proxier.endpointsChanges.EndpointSliceUpdate(endpointSlice, true) && proxier.isInitialized() {
-		proxier.Sync()
-	}
-}
-```
-
-### OnEndpointSlicesSynced
-
-```GO
-func (proxier *Proxier) OnEndpointSlicesSynced() {
-    proxier.mu.Lock() // 加锁，获取互斥锁
-    proxier.endpointSlicesSynced = true // 将 endpointSlicesSynced 设置为 true，表示同步完成
-    proxier.setInitialized(proxier.servicesSynced) // 调用 setInitialized 函数，设置 proxier 的 initialized 属性为 proxier.servicesSynced 的值
-    proxier.mu.Unlock() // 解锁，释放互斥锁
-
-    // 无条件地进行同步 - 每次生命周期调用一次。
-    proxier.syncProxyRules()
-}
-```
-
-#### syncProxyRules
+### syncProxyRules
 
 ```GO
 // 这是所有 iptables-save/restore 调用发生的地方。
@@ -2672,6 +2492,186 @@ func (proxier *Proxier) syncProxyRules() {
 }
 ```
 
+### Chain
+
+```GO
+const (
+    // 服务链
+    kubeServicesChain utiliptables.Chain = "KUBE-SERVICES"
+
+    // 外部服务链
+    kubeExternalServicesChain utiliptables.Chain = "KUBE-EXTERNAL-SERVICES"
+
+    // NodePort链
+    kubeNodePortsChain utiliptables.Chain = "KUBE-NODEPORTS"
+
+    // Kubernetes出口链
+    kubePostroutingChain utiliptables.Chain = "KUBE-POSTROUTING"
+
+    // kubeMarkMasqChain是用于标记伪装的链
+    kubeMarkMasqChain utiliptables.Chain = "KUBE-MARK-MASQ"
+
+    // Kubernetes转发链
+    kubeForwardChain utiliptables.Chain = "KUBE-FORWARD"
+
+    // kubeProxyFirewallChain是kube-proxy防火墙链
+    kubeProxyFirewallChain utiliptables.Chain = "KUBE-PROXY-FIREWALL"
+
+    // kube proxy canary chain用于监控规则重新加载
+    kubeProxyCanaryChain utiliptables.Chain = "KUBE-PROXY-CANARY"
+
+    // kubeletFirewallChain是kubelet的防火墙的副本，包含了反火星数据包规则。
+    // 不应该用于其他规则。
+    kubeletFirewallChain utiliptables.Chain = "KUBE-FIREWALL"
+
+    // largeClusterEndpointsThreshold是切换到“大型集群模式”的端点数，优化iptables性能而不是可调试性。
+    largeClusterEndpointsThreshold = 1000
+)
+```
+
+### iptablesJumpChain
+
+```GO
+type iptablesJumpChain struct {
+	table     utiliptables.Table  // 表示iptables规则所属的表
+	dstChain  utiliptables.Chain  // 表示iptables规则的目标链
+	srcChain  utiliptables.Chain  // 表示iptables规则的源链
+	comment   string              // 注释，用于描述iptables规则的作用
+	extraArgs []string            // 额外的参数，用于配置iptables规则
+}
+
+var iptablesJumpChains = []iptablesJumpChain{
+	{utiliptables.TableFilter, kubeExternalServicesChain, utiliptables.ChainInput, "kubernetes externally-visible service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
+	{utiliptables.TableFilter, kubeExternalServicesChain, utiliptables.ChainForward, "kubernetes externally-visible service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
+	{utiliptables.TableFilter, kubeNodePortsChain, utiliptables.ChainInput, "kubernetes health check service ports", nil},
+	{utiliptables.TableFilter, kubeServicesChain, utiliptables.ChainForward, "kubernetes service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
+	{utiliptables.TableFilter, kubeServicesChain, utiliptables.ChainOutput, "kubernetes service portals", []string{"-m", "conntrack", "--ctstate", "NEW"}},
+	{utiliptables.TableFilter, kubeForwardChain, utiliptables.ChainForward, "kubernetes forwarding rules", nil},
+	{utiliptables.TableFilter, kubeProxyFirewallChain, utiliptables.ChainInput, "kubernetes load balancer firewall", []string{"-m", "conntrack", "--ctstate", "NEW"}},
+	{utiliptables.TableFilter, kubeProxyFirewallChain, utiliptables.ChainOutput, "kubernetes load balancer firewall", []string{"-m", "conntrack", "--ctstate", "NEW"}},
+	{utiliptables.TableFilter, kubeProxyFirewallChain, utiliptables.ChainForward, "kubernetes load balancer firewall", []string{"-m", "conntrack", "--ctstate", "NEW"}},
+	{utiliptables.TableNAT, kubeServicesChain, utiliptables.ChainOutput, "kubernetes service portals", nil},
+	{utiliptables.TableNAT, kubeServicesChain, utiliptables.ChainPrerouting, "kubernetes service portals", nil},
+}
+```
+
+### OnEndpointSliceAdd
+
+```GO
+// OnEndpointSliceAdd 是在观察到创建新的端点切片对象时调用的方法。
+func (proxier *Proxier) OnEndpointSliceAdd(endpointSlice *discovery.EndpointSlice) {
+	if proxier.endpointsChanges.EndpointSliceUpdate(endpointSlice, false) && proxier.isInitialized() {
+		proxier.Sync()
+	}
+}
+```
+
+#### EndpointSliceUpdate
+
+```GO
+// EndpointSliceUpdate 根据<先前的端点，当前的端点>对更新给定服务的端点更改映射。
+// 如果有更改，返回true；否则返回false。将添加/更新/删除EndpointsChangeMap中的项目。
+// 如果removeSlice为true，则删除切片；否则将添加或更新切片。
+func (ect *EndpointChangeTracker) EndpointSliceUpdate(endpointSlice *discovery.EndpointSlice, removeSlice bool) bool {
+	if !supportedEndpointSliceAddressTypes.Has(string(endpointSlice.AddressType)) {
+		klog.V(4).InfoS("EndpointSlice的地址类型不被kube-proxy支持", "addressType", endpointSlice.AddressType)
+		return false
+	}
+
+	// 这不应该发生
+	if endpointSlice == nil {
+		klog.ErrorS(nil, "传递给EndpointSliceUpdate的endpointSlice为空")
+		return false
+	}
+
+	namespacedName, _, err := endpointSliceCacheKeys(endpointSlice)
+	if err != nil {
+		klog.InfoS("获取端点切片缓存键时出错", "err", err)
+		return false
+	}
+
+	metrics.EndpointChangesTotal.Inc()
+
+	ect.lock.Lock()
+	defer ect.lock.Unlock()
+
+	changeNeeded := ect.endpointSliceCache.updatePending(endpointSlice, removeSlice)
+
+	if changeNeeded {
+		metrics.EndpointChangesPending.Inc()
+		// 在删除Endpoints时，LastChangeTriggerTime注释按定义来自上次更新的时间，
+		// 这不是我们想要测量的。所以在这种情况下，我们简单地忽略它。
+		// TODO（wojtek-t，robscott）：在删除EndpointSlice时，解决该服务的其他EndpointSlice仍然存在的问题。
+		if removeSlice {
+			delete(ect.lastChangeTriggerTimes, namespacedName)
+		} else if t := getLastChangeTriggerTime(endpointSlice.Annotations); !t.IsZero() && t.After(ect.trackerStartTime) {
+			ect.lastChangeTriggerTimes[namespacedName] =
+				append(ect.lastChangeTriggerTimes[namespacedName], t)
+		}
+	}
+
+	return changeNeeded
+}
+```
+
+#### isInitialized
+
+```GO
+// 返回proxier.initialized的原子加载结果是否大于0，即是否已初始化。
+func (proxier *Proxier) isInitialized() bool {
+	return atomic.LoadInt32(&proxier.initialized) > 0
+}
+```
+
+#### Sync
+
+```GO
+// Sync 尽快将proxier的状态与iptables同步。
+func (proxier *Proxier) Sync() {
+	if proxier.healthzServer != nil {
+		proxier.healthzServer.QueuedUpdate()
+	}
+	metrics.SyncProxyRulesLastQueuedTimestamp.SetToCurrentTime()
+	proxier.syncRunner.Run()
+}
+```
+
+### OnEndpointSliceUpdate
+
+```GO
+// OnEndpointSliceUpdate 在观察到对现有的 endpoint slice 对象进行修改时调用。
+func (proxier *Proxier) OnEndpointSliceUpdate(_, endpointSlice *discovery.EndpointSlice) {
+    if proxier.endpointsChanges.EndpointSliceUpdate(endpointSlice, false) && proxier.isInitialized() {
+    	proxier.Sync()
+    }
+}
+```
+
+### OnEndpointSliceDelete
+
+```GO
+// OnEndpointSliceDelete 在观察到删除现有的 endpoint slice 对象时调用。
+func (proxier *Proxier) OnEndpointSliceDelete(endpointSlice *discovery.EndpointSlice) {
+	if proxier.endpointsChanges.EndpointSliceUpdate(endpointSlice, true) && proxier.isInitialized() {
+		proxier.Sync()
+	}
+}
+```
+
+### OnEndpointSlicesSynced
+
+```GO
+func (proxier *Proxier) OnEndpointSlicesSynced() {
+    proxier.mu.Lock() // 加锁，获取互斥锁
+    proxier.endpointSlicesSynced = true // 将 endpointSlicesSynced 设置为 true，表示同步完成
+    proxier.setInitialized(proxier.servicesSynced) // 调用 setInitialized 函数，设置 proxier 的 initialized 属性为 proxier.servicesSynced 的值
+    proxier.mu.Unlock() // 解锁，释放互斥锁
+
+    // 无条件地进行同步 - 每次生命周期调用一次。
+    proxier.syncProxyRules()
+}
+```
+
 ### OnServiceAdd
 
 ```go
@@ -2813,736 +2813,6 @@ func (proxier *Proxier) OnServiceSynced() {
 
     // Sync unconditionally - this is called once per lifetime.
     proxier.syncProxyRules()  // 调用syncProxyRules()函数进行iptables规则同步
-}
-```
-
-#### syncProxyRules
-
-```GO
-// 这里是所有iptables-save/restore调用发生的地方。
-// 唯一的其他iptables规则是在iptablesInit()函数中设置的。
-// 这里假设proxier.mu没有被持有。
-func (proxier *Proxier) syncProxyRules() {
-    proxier.mu.Lock() // 加锁，防止并发访问
-    defer proxier.mu.Unlock() // 解锁
-	// 在收到服务和端点之前不要同步规则
-    if !proxier.isInitialized() {
-        klog.V(2).InfoS("Not syncing iptables until Services and Endpoints have been received from master") // 打印日志信息，表示在从主节点接收到服务和端点之前不进行iptables同步
-        return
-    }
-
-    // proxier.needFullSync的值可能在defer函数运行之前发生变化，因此
-    // 我们需要追踪它是否在同步的*开始*时被设置。
-    tryPartialSync := !proxier.needFullSync
-
-    // 跟踪同步所需的时间。
-    start := time.Now() // 记录当前时间
-    defer func() {
-        metrics.SyncProxyRulesLatency.Observe(metrics.SinceInSeconds(start)) // 记录同步代理规则的延迟时间
-        if tryPartialSync {
-            metrics.SyncPartialProxyRulesLatency.Observe(metrics.SinceInSeconds(start)) // 记录部分同步代理规则的延迟时间
-        } else {
-            metrics.SyncFullProxyRulesLatency.Observe(metrics.SinceInSeconds(start)) // 记录完全同步代理规则的延迟时间
-        }
-        klog.V(2).InfoS("SyncProxyRules complete", "elapsed", time.Since(start)) // 打印日志信息，表示SyncProxyRules完成，并记录经过的时间
-    }()
-
-    var serviceChanged, endpointsChanged sets.Set[string] // 声明serviceChanged和endpointsChanged变量，类型为sets.Set[string]
-    if tryPartialSync {
-        serviceChanged = proxier.serviceChanges.PendingChanges() // 获取待处理的服务更改
-        endpointsChanged = proxier.endpointsChanges.PendingChanges() // 获取待处理的端点更改
-    }
-    serviceUpdateResult := proxier.svcPortMap.Update(proxier.serviceChanges) // 更新服务端口映射
-    endpointUpdateResult := proxier.endpointsMap.Update(proxier.endpointsChanges) // 更新端点映射
-
-    klog.V(2).InfoS("Syncing iptables rules") // 打印日志信息，表示正在同步iptables规则
-
-    success := false
-    defer func() {
-        if !success {
-            klog.InfoS("Sync failed", "retryingTime", proxier.syncPeriod) // 打印日志信息，表示同步失败，记录重试时间
-            proxier.syncRunner.RetryAfter(proxier.syncPeriod) // 设置重试时间间隔
-            if tryPartialSync {
-                metrics.IptablesPartialRestoreFailuresTotal.Inc() // 增加部分恢复失败的计数
-            }
-            // proxier.serviceChanges和proxier.endpointChanges已经被
-            // 刷新，因此我们丢失了进行部分同步所需的状态。
-            proxier.needFullSync = true // 将proxier.needFullSync标记为true，表示需要进行完全同步
-        }
-    }()
-
-    if !tryPartialSync {
-        // 确保我们的跳转规则（例如从PREROUTING到KUBE-SERVICES）存在。
-        // 我们不能在iptables-restore的一部分中执行此操作，因为我们不想
-        // 指定/替换PREROUTING中的*所有*规则。
-        //
-        // 当kube-proxy首次启动时，我们需要创建这些规则，并且如果utiliptables
-        // Monitor检测到iptables已被刷新，我们需要重新创建它们。
-        // 在所有其他情况下，我们可以安全地假设规则已经存在，因此在进行部分同步时
-        // 我们将跳过此步骤，以避免在每次同步时调用/sbin/iptables 20次（对于具有
-        // 大量iptables规则的主机来说，这将非常慢）。
-        for _, jump := range append(iptablesJumpChains, iptablesKubeletJumpChains...) {
-            if _, err := proxier.iptables.EnsureChain(jump.table, jump.dstChain); err != nil {
-                klog.ErrorS(err, "Failed to ensure chain exists", "table", jump.table, "chain", jump.dstChain) // 打印日志信息，表示无法确保链的存在
-                return
-            }
-            args := jump.extraArgs
-            if jump.comment != "" {
-                args = append(args, "-m", "comment", "--comment", jump.comment)
-            }
-            args = append(args, "-j", string(jump.dstChain))
-            if _, err := proxier.iptables.EnsureRule(utiliptables.Prepend, jump.table, jump.srcChain, args...); err != nil {
-                klog.ErrorS(err, "Failed to ensure chain jumps", "table", jump.table, "srcChain", jump.srcChain, "dstChain", jump.dstChain) // 打印日志信息，表示无法确保链的跳转
-                return
-            }
-        }
-    }
-
-    //
-    // 在此点以下，我们将在尝试写入iptables规则之前不返回。
-    //
-
-    // 重置后续使用的所有缓冲区。
-    // 这样可以避免内存重新分配，从而提高性能。
-    proxier.filterChains.Reset() // 重置filterChains缓冲区
-    proxier.filterRules.Reset() // 重置filterRules缓冲区
-    proxier.natChains.Reset() // 重置natChains缓冲区
-    proxier.natRules.Reset() // 重置natRules缓冲区
-
-    // 为我们将填充的所有“顶级”链写入链行
-    for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeExternalServicesChain, kubeForwardChain, kubeNodePortsChain, kubeProxyFirewallChain} {
-        proxier.filterChains.Write(utiliptables.MakeChainLine(chainName)) // 将链行写入filterChains缓冲区
-    }
-    for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, kubeMarkMasqChain} {
-        proxier.natChains.Write(utiliptables.MakeChainLine(chainName)) // 将链行写入natChains缓冲区
-    }
-
-    // 安装特定于Kubernetes的postrouting规则。我们使用一个完整的链来
-    // 实现这一点，以便更容易刷新和更改，例如如果标记值发生变化。
-    //
-    // 注意：kubelet会创建这些规则的相同副本。如果将来要更改这些规则，
-    // 必须以与kubelet创建的规则兼容的方式进行更改。（一旦IPTablesOwnershipCleanup
-    // 成为GA，删除此注释。）
-    proxier.natRules.Write(
-        "-A", string(kubePostroutingChain),
-        "-m", "mark", "!", "--mark", fmt.Sprintf("%s/%s", proxier.masqueradeMark, proxier.masqueradeMark),
-        "-j", "RETURN",
-    )
-    // 清除标记，以避免在数据包重新遍历网络栈时重新封装。
-    proxier.natRules.Write(
-        "-A", string(kubePostroutingChain),
-        "-j", "MARK", "--xor-mark", proxier.masqueradeMark,
-    )
-    masqRule := []string{
-        "-A", string(kubePostroutingChain),
-        "-m", "comment", "--comment", `"kubernetes service traffic requiring SNAT"`,
-        "-j", "MASQUERADE",
-    }
-    if proxier.iptables.HasRandomFully() {
-        masqRule = append(masqRule, "--random-fully")
-    }
-    proxier.natRules.Write(masqRule)
-
-    // 安装特定于Kubernetes的伪装标记规则。我们使用一个完整的链来
-    // 实现这一点，以便更容易刷新和更改，例如如果标记值发生变化。
-    proxier.natRules.Write(
-        "-A", string(kubeMarkMasqChain),
-        "-j", "MARK", "--or-mark", proxier.masqueradeMark,
-    )
-	isIPv6 := proxier.iptables.IsIPv6()
-    if !isIPv6 && proxier.localhostNodePorts {
-        // 如果不是IPv6并且启用了localhostNodePorts选项
-        // Kube-proxy使用`route_localnet`在localhost上启用NodePorts
-        // 这会导致安全漏洞（https://issue.k8s.io/90259），这个iptables规则用于缓解该问题。
-
-        // 注意：kubelet会创建一个完全相同的规则。
-        // 如果要在将来更改此规则，必须以一种与kubelet创建的规则版本兼容的方式进行更改。
-        // （实际上，kubelet使用"--dst"/"--src"而不是"-d"/"-s"，但这只是命令行的事情，最终在内核中创建的规则是相同的。）
-        proxier.filterChains.Write(utiliptables.MakeChainLine(kubeletFirewallChain))
-        proxier.filterRules.Write(
-            "-A", string(kubeletFirewallChain),
-            "-m", "comment", "--comment", `"block incoming localnet connections"`,
-            "-d", "127.0.0.0/8",
-            "!", "-s", "127.0.0.0/8",
-            "-m", "conntrack",
-            "!", "--ctstate", "RELATED,ESTABLISHED,DNAT",
-            "-j", "DROP",
-        )
-    }
-
-    // 累积需要保留的NAT链。
-    activeNATChains := map[utiliptables.Chain]bool{} // 使用map作为集合
-
-    // 为了避免增加此切片的大小，我们将其大小任意设置为64，
-    // 因为单行代码的参数数量永远不会超过64个。
-    // 需要注意的是，即使超过64个参数，结果仍然是正确的，
-    // 这只是为了提高效率而不是正确性。
-    args := make([]string, 64)
-
-    // 计算所有服务的端点链的总数，以了解集群的规模。
-    totalEndpoints := 0
-    for svcName := range proxier.svcPortMap {
-        totalEndpoints += len(proxier.endpointsMap[svcName])
-    }
-    proxier.largeClusterMode = (totalEndpoints > largeClusterEndpointsThreshold)
-
-    // 这两个变量用于发布sync_proxy_rules_no_endpoints_total指标。
-    serviceNoLocalEndpointsTotalInternal := 0
-    serviceNoLocalEndpointsTotalExternal := 0
-
-    // 为每个服务端口构建规则。
-	for svcName, svc := range proxier.svcPortMap {
-		svcInfo, ok := svc.(*servicePortInfo)
-		if !ok {
-			klog.ErrorS(nil, "Failed to cast serviceInfo", "serviceName", svcName)
-			continue
-		}
-		protocol := strings.ToLower(string(svcInfo.Protocol())) // 获取服务的协议并将其转换为小写。
-		svcPortNameString := svcInfo.nameString // 将服务端口的名称作为字符串获取。
-
-		// 确定集群和本地流量策略的终结点。
-        // allLocallyReachableEndpoints是可以从该节点路由到的所有终结点的集合，
-        // 给定服务的流量策略。如果服务在任何节点上都有可用的终结点，则hasEndpoints为true。
-		allEndpoints := proxier.endpointsMap[svcName]
-        // 根据终结点的可达性对服务进行分类。
-		clusterEndpoints, localEndpoints, allLocallyReachableEndpoints, hasEndpoints := proxy.CategorizeEndpoints(allEndpoints, svcInfo, proxier.nodeLabels)
-
-		// 记录将要使用的终结点链。
-        // 遍历本地可达的终结点，并将其链名称添加到activeNATChains中。
-		for _, ep := range allLocallyReachableEndpoints {
-			if epInfo, ok := ep.(*endpointsInfo); ok {
-				activeNATChains[epInfo.ChainName] = true
-			}
-		}
-
-		// 如果使用了"Cluster"流量策略，则记录对应的终结点链
-		clusterPolicyChain := svcInfo.clusterPolicyChainName
-		usesClusterPolicyChain := len(clusterEndpoints) > 0 && svcInfo.UsesClusterEndpoints()
-		if usesClusterPolicyChain {
-			activeNATChains[clusterPolicyChain] = true
-		}
-
-		// 如果使用了"Local"流量策略，则记录对应的终结点链
-		localPolicyChain := svcInfo.localPolicyChainName
-		usesLocalPolicyChain := len(localEndpoints) > 0 && svcInfo.UsesLocalEndpoints()
-		if usesLocalPolicyChain {
-			activeNATChains[localPolicyChain] = true
-		}
-
-		// internalPolicyChain是包含“内部”（ClusterIP）流量终结点的链。internalTrafficChain是内部流量路由到的链（始终与internalPolicyChain相同）。
-        // hasInternalEndpoints为true表示我们应该生成指向internalTrafficChain的规则，如果没有可用的内部终结点，则为false。
-		internalPolicyChain := clusterPolicyChain
-		hasInternalEndpoints := hasEndpoints
-		if svcInfo.InternalPolicyLocal() {
-			internalPolicyChain = localPolicyChain
-			if len(localEndpoints) == 0 {
-				hasInternalEndpoints = false
-			}
-		}
-		internalTrafficChain := internalPolicyChain
-
-		// 类似地，externalPolicyChain是包含“外部”（NodePort、LoadBalancer和ExternalIP）流量终结点的链。externalTrafficChain是外部流量路由到的链（始终为服务的“EXT”链）。
-        // hasExternalEndpoints为true表示通过外部流量将到达终结点。（即使没有外部可用的终结点，我们仍然可能需要生成externalTrafficChain，以确保设置本地流量的短路规则。）
-		externalPolicyChain := clusterPolicyChain
-		hasExternalEndpoints := hasEndpoints
-		if svcInfo.ExternalPolicyLocal() {
-			externalPolicyChain = localPolicyChain
-			if len(localEndpoints) == 0 {
-				hasExternalEndpoints = false
-			}
-		}
-		externalTrafficChain := svcInfo.externalChainName // 最终跳转到externalPolicyChain
-
-		// usesExternalTrafficChain基于hasEndpoints而不是hasExternalEndpoints，
-        // 因为即使没有可用的外部终结点，我们仍然需要本地流量的短路规则。
-		usesExternalTrafficChain := hasEndpoints && svcInfo.ExternallyAccessible()
-		if usesExternalTrafficChain {
-			activeNATChains[externalTrafficChain] = true
-		}
-
-		// 流量到LoadBalancer IP可以直接转到externalTrafficChain，除非LoadBalancerSourceRanges正在使用，在这种情况下，我们将创建一个防火墙链。
-		loadBalancerTrafficChain := externalTrafficChain
-		fwChain := svcInfo.firewallChainName
-		usesFWChain := hasEndpoints && len(svcInfo.LoadBalancerIPStrings()) > 0 && len(svcInfo.LoadBalancerSourceRanges()) > 0
-		if usesFWChain {
-			activeNATChains[fwChain] = true
-			loadBalancerTrafficChain = fwChain
-		}
-
-		var internalTrafficFilterTarget, internalTrafficFilterComment string
-		var externalTrafficFilterTarget, externalTrafficFilterComment string
-		if !hasEndpoints {
-			// 服务没有任何终结点；hasInternalEndpoints和hasExternalEndpoints也将为false，我们将不会为服务在“nat”表中生成任何链；只会在“filter”表中生成拒绝入站数据包的规则。
-			internalTrafficFilterTarget = "REJECT"
-			internalTrafficFilterComment = fmt.Sprintf(`"%s has no endpoints"`, svcPortNameString)
-			externalTrafficFilterTarget = "REJECT"
-			externalTrafficFilterComment = internalTrafficFilterComment
-		} else {
-			if !hasInternalEndpoints {
-				// 如果没有内部终端点
-                // internalTrafficPolicy 是 "Local"，但没有本地终端点。
-                // 对于 clusterIP 的流量将被丢弃，但仍然可以接受外部流量。
-				internalTrafficFilterTarget = "DROP"
-				internalTrafficFilterComment = fmt.Sprintf(`"%s has no local endpoints"`, svcPortNameString)
-				serviceNoLocalEndpointsTotalInternal++
-			}
-			if !hasExternalEndpoints {
-				// 如果没有外部终端点
-                // externalTrafficPolicy 是 "Local"，但没有本地终端点。
-                // 对于来自集群外部的 "external" IP 的流量将被丢弃，但来自集群内部的流量可能仍然被接受。
-				externalTrafficFilterTarget = "DROP"
-				externalTrafficFilterComment = fmt.Sprintf(`"%s has no local endpoints"`, svcPortNameString)
-				serviceNoLocalEndpointsTotalExternal++
-			}
-		}
-
-		// 捕获 clusterIP。
-		if hasInternalEndpoints {
-            // 如果有内部终端点
-    		// 将规则写入 natRules。
-			proxier.natRules.Write(
-				"-A", string(kubeServicesChain),
-				"-m", "comment", "--comment", fmt.Sprintf(`"%s cluster IP"`, svcPortNameString),
-				"-m", protocol, "-p", protocol,
-				"-d", svcInfo.ClusterIP().String(),
-				"--dport", strconv.Itoa(svcInfo.Port()),
-				"-j", string(internalTrafficChain))
-		} else {
-			// 如果没有终端点
-    		// 将规则写入 filterRules。
-			proxier.filterRules.Write(
-				"-A", string(kubeServicesChain),
-				"-m", "comment", "--comment", internalTrafficFilterComment,
-				"-m", protocol, "-p", protocol,
-				"-d", svcInfo.ClusterIP().String(),
-				"--dport", strconv.Itoa(svcInfo.Port()),
-				"-j", internalTrafficFilterTarget,
-			)
-		}
-
-		// 捕获 externalIPs。
-		for _, externalIP := range svcInfo.ExternalIPStrings() {
-			if hasEndpoints {
-				// 将流量发送到 "external destinations" 链。
-				proxier.natRules.Write(
-					"-A", string(kubeServicesChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"%s external IP"`, svcPortNameString),
-					"-m", protocol, "-p", protocol,
-					"-d", externalIP,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", string(externalTrafficChain))
-			}
-			if !hasExternalEndpoints {
-				 // 如果没有外部终端点
-        		// 要么根本没有终端点（REJECT），要么没有外部流量的终端点（DROP任何未被 EXT 链短路的内容）。
-				proxier.filterRules.Write(
-					"-A", string(kubeExternalServicesChain),
-					"-m", "comment", "--comment", externalTrafficFilterComment,
-					"-m", protocol, "-p", protocol,
-					"-d", externalIP,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", externalTrafficFilterTarget,
-				)
-			}
-		}
-
-		// 捕获 load-balancer ingress。
-		for _, lbip := range svcInfo.LoadBalancerIPStrings() {
-			if hasEndpoints {
-                 // 将流量发送到 loadBalancerTrafficChain。
-				proxier.natRules.Write(
-					"-A", string(kubeServicesChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcPortNameString),
-					"-m", protocol, "-p", protocol,
-					"-d", lbip,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", string(loadBalancerTrafficChain))
-
-			}
-			if usesFWChain {
-				proxier.filterRules.Write(
-					"-A", string(kubeProxyFirewallChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"%s traffic not accepted by %s"`, svcPortNameString, svcInfo.firewallChainName),
-					"-m", protocol, "-p", protocol,
-					"-d", lbip,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", "DROP")
-			}
-		}
-		if !hasExternalEndpoints {
-            // 如果没有外部终端点
-   			// 要么根本没有终端点（REJECT），要么没有外部流量的终端点（DROP任何未被 EXT 链短路的内容）。
-			for _, lbip := range svcInfo.LoadBalancerIPStrings() {
-				proxier.filterRules.Write(
-					"-A", string(kubeExternalServicesChain),
-					"-m", "comment", "--comment", externalTrafficFilterComment,
-					"-m", protocol, "-p", protocol,
-					"-d", lbip,
-					"--dport", strconv.Itoa(svcInfo.Port()),
-					"-j", externalTrafficFilterTarget,
-				)
-			}
-		}
-
-		// 捕获 NodePort。
-		if svcInfo.NodePort() != 0 {
-            // 如果服务有 NodePort
-			if hasEndpoints {
-				// 如果存在终端节点
-				// 跳转到外部目标链。无论好坏，NodePorts 不受 loadBalancerSourceRanges 的限制，我们无法改变它。
-				proxier.natRules.Write(
-					"-A", string(kubeNodePortsChain),
-					"-m", "comment", "--comment", svcPortNameString,
-					"-m", protocol, "-p", protocol,
-					"--dport", strconv.Itoa(svcInfo.NodePort()),
-					"-j", string(externalTrafficChain))
-			}
-			if !hasExternalEndpoints {
-				// 如果没有任何终端节点（REJECT），或者没有用于外部流量的终端节点（DROP 任何没有被 EXT 链提前终止的东西）。
-				proxier.filterRules.Write(
-					"-A", string(kubeExternalServicesChain),
-					"-m", "comment", "--comment", externalTrafficFilterComment,
-					"-m", "addrtype", "--dst-type", "LOCAL",
-					"-m", protocol, "-p", protocol,
-					"--dport", strconv.Itoa(svcInfo.NodePort()),
-					"-j", externalTrafficFilterTarget,
-				)
-			}
-		}
-
-		// 捕获 healthCheckNodePorts。
-		if svcInfo.HealthCheckNodePort() != 0 {
-			// 如果服务有 HealthCheckNodePort
-			// 无论节点是否有本地终端节点，都需要添加一个规则来接受传入的连接。
-			proxier.filterRules.Write(
-				"-A", string(kubeNodePortsChain),
-				"-m", "comment", "--comment", fmt.Sprintf(`"%s health check node port"`, svcPortNameString),
-				"-m", "tcp", "-p", "tcp",
-				"--dport", strconv.Itoa(svcInfo.HealthCheckNodePort()),
-				"-j", "ACCEPT",
-			)
-		}
-
-		// 如果自上次同步以来 SVC/SVL/EXT/FW/SEP 链没有更改，则可以从恢复输入中省略它们。 （我们已经在 activeNATChains 中标记了它们，因此它们不会被删除。）
-		if tryPartialSync && !serviceChanged.Has(svcName.NamespacedName.String()) && !endpointsChanged.Has(svcName.NamespacedName.String()) {
-			continue
-		}
-
-		// 设置内部流量处理。
-		if hasInternalEndpoints {
-            // 如果存在内部终端节点
-			args = append(args[:0],
-				"-m", "comment", "--comment", fmt.Sprintf(`"%s cluster IP"`, svcPortNameString),
-				"-m", protocol, "-p", protocol,
-				"-d", svcInfo.ClusterIP().String(),
-				"--dport", strconv.Itoa(svcInfo.Port()),
-			)
-			if proxier.masqueradeAll {
-                // 这里对集群内部流量进行伪装。
-				proxier.natRules.Write(
-					"-A", string(internalTrafficChain),
-					args,
-					"-j", string(kubeMarkMasqChain))
-			} else if proxier.localDetector.IsImplemented() {
-				// 如果 localDetector 已实现，将对集群外的流量进行伪装。
-                // 思路是，可以为服务范围建立一个静态路由，路由到任何节点，该节点将桥接到服务上。
-                // 由于可能要经过节点跳转，因此在此处进行伪装。
-				proxier.natRules.Write(
-					"-A", string(internalTrafficChain),
-					args,
-					proxier.localDetector.IfNotLocal(),
-					"-j", string(kubeMarkMasqChain))
-			}
-		}
-
-		// 设置外部流量处理（如果启用了任何“外部”目标）。所有捕获的外部目标的流量都应该跳转到 externalTrafficChain，
-        // 该链将处理一些特殊情况，然后跳转到 externalPolicyChain。
-		if usesExternalTrafficChain {
-			proxier.natChains.Write(utiliptables.MakeChainLine(externalTrafficChain))
-
-			if !svcInfo.ExternalPolicyLocal() {
-				// 如果使用非本地节点的终端节点，我们需要进行伪装，以防跨节点。
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"masquerade traffic for %s external destinations"`, svcPortNameString),
-					"-j", string(kubeMarkMasqChain))
-			} else {
-				// 如果只使用同一节点的终端节点，大多数情况下可以保留源 IP。
-				if proxier.localDetector.IsImplemented() {
-					// 将所有从本地发起的 Pod -> 外部目标流量视为特殊情况。它不受任何形式的流量策略约束，模拟了通过外部负载均衡器上下传递的流量。
-					proxier.natRules.Write(
-						"-A", string(externalTrafficChain),
-						"-m", "comment", "--comment", fmt.Sprintf(`"pod traffic for %s external destinations"`, svcPortNameString),
-						proxier.localDetector.IfLocal(),
-						"-j", string(clusterPolicyChain))
-				}
-
-				// 来自主机节点的本地发起流量（不是 Pod，而是主机节点）仍然需要进行伪装，因为 LBIP 本身是一个本地地址，所以它将成为选择的源 IP。s
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"masquerade LOCAL traffic for %s external destinations"`, svcPortNameString),
-					"-m", "addrtype", "--src-type", "LOCAL",
-					"-j", string(kubeMarkMasqChain))
-
-				// 将所有 src-type=LOCAL -> 外部目标流量重定向到 policy=cluster 链。这允许从主机发起的流量正确地重定向到服务。
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"route LOCAL traffic for %s external destinations"`, svcPortNameString),
-					"-m", "addrtype", "--src-type", "LOCAL",
-					"-j", string(clusterPolicyChain))
-			}
-
-			// 其他情况会进入相应的策略链。
-			if hasExternalEndpoints {
-				proxier.natRules.Write(
-					"-A", string(externalTrafficChain),
-					"-j", string(externalPolicyChain))
-			}
-		}
-
-		// Set up firewall chain, if needed
-		if usesFWChain {
-            // 如果 usesFWChain 为 true，则执行以下代码块。
-			proxier.natChains.Write(utiliptables.MakeChainLine(fwChain))
-
-			 // 基于 loadBalancerSourceRanges 字段创建服务防火墙规则。这仅适用于保留源 IP 的 VIP 类型的负载均衡器。
-            // 对于将流量直接定向到服务 NodePort 的负载均衡器，防火墙规则不适用。
-			args = append(args[:0],
-				"-A", string(fwChain),
-				"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcPortNameString),
-			)
-
-			 // 基于每个源范围的防火墙过滤
-			allowFromNode := false
-			for _, src := range svcInfo.LoadBalancerSourceRanges() {
-				proxier.natRules.Write(args, "-s", src, "-j", string(externalTrafficChain))
-				_, cidr, err := netutils.ParseCIDRSloppy(src)
-				if err != nil {
-					klog.ErrorS(err, "Error parsing CIDR in LoadBalancerSourceRanges, dropping it", "cidr", cidr)
-				} else if cidr.Contains(proxier.nodeIP) {
-					allowFromNode = true
-				}
-			}
-			// 对于 VIP 类型的负载均衡器，VIP 通常被添加为本地地址（通过 IP 路由规则）。
-            // 在这种情况下，从节点到 VIP 的请求不会命中负载均衡器，而是会带有源 IP 设置为 VIP 回环。我们需要以下规则来允许来自此节点的请求。
-			if allowFromNode {
-				for _, lbip := range svcInfo.LoadBalancerIPStrings() {
-					proxier.natRules.Write(
-						args,
-						"-s", lbip,
-						"-j", string(externalTrafficChain))
-				}
-			}
-			// 如果数据包能够到达防火墙链的末尾，则说明它没有经过 DNAT，因此它将与相应的 KUBE-PROXY-FIREWALL 规则匹配。
-			proxier.natRules.Write(
-				"-A", string(fwChain),
-				"-m", "comment", "--comment", fmt.Sprintf(`"other traffic to %s will be dropped by KUBE-PROXY-FIREWALL"`, svcPortNameString),
-			)
-		}
-
-		// 如果使用了 Cluster 策略，则创建链并创建从 clusterPolicyChain 跳转到 clusterEndpoints 的规则。
-		if usesClusterPolicyChain {
-			proxier.natChains.Write(utiliptables.MakeChainLine(clusterPolicyChain))
-			proxier.writeServiceToEndpointRules(svcPortNameString, svcInfo, clusterPolicyChain, clusterEndpoints, args)
-		}
-
-		// 如果使用了 Local 策略，则创建链并创建从 localPolicyChain 跳转到 localEndpoints 的规则。
-		if usesLocalPolicyChain {
-			proxier.natChains.Write(utiliptables.MakeChainLine(localPolicyChain))
-			proxier.writeServiceToEndpointRules(svcPortNameString, svcInfo, localPolicyChain, localEndpoints, args)
-		}
-
-		// 生成每个端点的链。
-		for _, ep := range allLocallyReachableEndpoints {
-			epInfo, ok := ep.(*endpointsInfo)
-			if !ok {
-                 // 如果类型转换失败，则记录错误并继续下一个循环。
-				klog.ErrorS(nil, "Failed to cast endpointsInfo", "endpointsInfo", ep)
-				continue
-			}
-
-			endpointChain := epInfo.ChainName
-
-			// 创建端点链
-			proxier.natChains.Write(utiliptables.MakeChainLine(endpointChain))
-			activeNATChains[endpointChain] = true
-
-			args = append(args[:0], "-A", string(endpointChain))
-			args = proxier.appendServiceCommentLocked(args, svcPortNameString)
-			// 处理回路到发起方的流量，并使用 SNAT 进行转发。
-			proxier.natRules.Write(
-				args,
-				"-s", epInfo.IP(),
-				"-j", string(kubeMarkMasqChain))
-			// 更新客户端亲和列表。
-			if svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP {
-				args = append(args, "-m", "recent", "--name", string(endpointChain), "--set")
-			}
-			// DNAT 到最终目标。
-			args = append(args, "-m", protocol, "-p", protocol, "-j", "DNAT", "--to-destination", epInfo.Endpoint)
-			proxier.natRules.Write(args)
-		}
-	}
-
-	// 删除不再使用的链。由于“iptables-save”在具有大量 iptables 规则的主机上可能需要几秒钟的时间，
-	// 我们不会在大型集群的每个同步中执行此操作。（陈旧的链将不会被任何活动规则引用，因此它们只会占用内存而已。）
-	if !proxier.largeClusterMode || time.Since(proxier.lastIPTablesCleanup) > proxier.syncPeriod {
-		var existingNATChains map[utiliptables.Chain]struct{}
-
-		proxier.iptablesData.Reset()
-        // 将 iptables 数据保存到 iptablesData 中
-		if err := proxier.iptables.SaveInto(utiliptables.TableNAT, proxier.iptablesData); err == nil {
-			// 获取现有的 NAT 链
-            existingNATChains = utiliptables.GetChainsFromTable(proxier.iptablesData.Bytes())
-			// 遍历现有的 NAT 链
-			for chain := range existingNATChains {
-				if !activeNATChains[chain] {
-					chainString := string(chain)
-					if !isServiceChainName(chainString) {
-						// 忽略不属于我们的链。
-						continue
-					}
-					 // 写入链行以清空链，然后删除链。
-					proxier.natChains.Write(utiliptables.MakeChainLine(chain))
-					proxier.natRules.Write("-X", chainString)
-				}
-			}
-			proxier.lastIPTablesCleanup = time.Now()
-		} else {
-			klog.ErrorS(err, "Failed to execute iptables-save: stale chains will not be deleted")
-		}
-	}
-
-	// 最后，跳转到 nodePorts 链。这需要在所有其他服务 portal 规则之后执行。
-	if proxier.nodePortAddresses.MatchAll() {
-		destinations := []string{"-m", "addrtype", "--dst-type", "LOCAL"}
-		// 如果不支持本地主机节点端口，则阻止本地主机节点端口。（对于 IPv6 它们永远不起作用，对于 IPv4 仅在先前设置了“route_localnet”时才起作用。）
-		if isIPv6 {
-			destinations = append(destinations, "!", "-d", "::1/128")
-		} else if !proxier.localhostNodePorts {
-			destinations = append(destinations, "!", "-d", "127.0.0.0/8")
-		}
-
-		proxier.natRules.Write(
-			"-A", string(kubeServicesChain),
-			"-m", "comment", "--comment", `"kubernetes service nodeports; NOTE: this must be the last rule in this chain"`,
-			destinations,
-			"-j", string(kubeNodePortsChain))
-	} else {
-		nodeIPs, err := proxier.nodePortAddresses.GetNodeIPs(proxier.networkInterfacer)
-		if err != nil {
-			klog.ErrorS(err, "Failed to get node ip address matching nodeport cidrs, services with nodeport may not work as intended", "CIDRs", proxier.nodePortAddresses)
-		}
-		for _, ip := range nodeIPs {
-			if ip.IsLoopback() {
-				if isIPv6 {
-					klog.ErrorS(nil, "--nodeport-addresses includes localhost but localhost NodePorts are not supported on IPv6", "address", ip.String())
-					continue
-				} else if !proxier.localhostNodePorts {
-					klog.ErrorS(nil, "--nodeport-addresses includes localhost but --iptables-localhost-nodeports=false was passed", "address", ip.String())
-					continue
-				}
-			}
-
-			// 逐个为每个 IP 创建 nodeport 规则
-			proxier.natRules.Write(
-				"-A", string(kubeServicesChain),
-				"-m", "comment", "--comment", `"kubernetes service nodeports; NOTE: this must be the last rule in this chain"`,
-				"-d", ip.String(),
-				"-j", string(kubeNodePortsChain))
-		}
-	}
-
-	// 丢弃处于 INVALID 状态的数据包，这可能会导致意外的连接重置。
-	// https://github.com/kubernetes/kubernetes/issues/74839
-	proxier.filterRules.Write(
-		"-A", string(kubeForwardChain),
-		"-m", "conntrack",
-		"--ctstate", "INVALID",
-		"-j", "DROP",
-	)
-
-	// 如果已添加了 masqueradeMark，则希望转发相同的流量，这允许 NodePort 流量在默认 FORWARD 策略不接受的情况下进行转发。
-	proxier.filterRules.Write(
-		"-A", string(kubeForwardChain),
-		"-m", "comment", "--comment", `"kubernetes forwarding rules"`,
-		"-m", "mark", "--mark", fmt.Sprintf("%s/%s", proxier.masqueradeMark, proxier.masqueradeMark),
-		"-j", "ACCEPT",
-	)
-
-	// 下面的规则确保在上面接受了初始数据包的情况下，接受后续的流量。
-	proxier.filterRules.Write(
-		"-A", string(kubeForwardChain),
-		"-m", "comment", "--comment", `"kubernetes forwarding conntrack rule"`,
-		"-m", "conntrack",
-		"--ctstate", "RELATED,ESTABLISHED",
-		"-j", "ACCEPT",
-	)
-
-	metrics.IptablesRulesTotal.WithLabelValues(string(utiliptables.TableFilter)).Set(float64(proxier.filterRules.Lines()))
-	metrics.IptablesRulesTotal.WithLabelValues(string(utiliptables.TableNAT)).Set(float64(proxier.natRules.Lines()))
-
-	// 同步规则。
-	proxier.iptablesData.Reset()
-	proxier.iptablesData.WriteString("*filter\n")
-	proxier.iptablesData.Write(proxier.filterChains.Bytes())
-	proxier.iptablesData.Write(proxier.filterRules.Bytes())
-	proxier.iptablesData.WriteString("COMMIT\n")
-	proxier.iptablesData.WriteString("*nat\n")
-	proxier.iptablesData.Write(proxier.natChains.Bytes())
-	proxier.iptablesData.Write(proxier.natRules.Bytes())
-	proxier.iptablesData.WriteString("COMMIT\n")
-
-	klog.V(2).InfoS("Reloading service iptables data",
-		"numServices", len(proxier.svcPortMap),
-		"numEndpoints", totalEndpoints,
-		"numFilterChains", proxier.filterChains.Lines(),
-		"numFilterRules", proxier.filterRules.Lines(),
-		"numNATChains", proxier.natChains.Lines(),
-		"numNATRules", proxier.natRules.Lines(),
-	)
-	klog.V(9).InfoS("Restoring iptables", "rules", proxier.iptablesData.Bytes())
-
-	// 注意：使用 NoFlushTables 选项，以便在表中不刷新非 Kubernetes 链。
-	err := proxier.iptables.RestoreAll(proxier.iptablesData.Bytes(), utiliptables.NoFlushTables, utiliptables.RestoreCounters)
-	if err != nil {
-		if pErr, ok := err.(utiliptables.ParseError); ok {
-			lines := utiliptables.ExtractLines(proxier.iptablesData.Bytes(), pErr.Line(), 3)
-			klog.ErrorS(pErr, "Failed to execute iptables-restore", "rules", lines)
-		} else {
-			klog.ErrorS(err, "Failed to execute iptables-restore")
-		}
-		metrics.IptablesRestoreFailuresTotal.Inc()
-		return
-	}
-	success = true
-	proxier.needFullSync = false
-
-	for name, lastChangeTriggerTimes := range endpointUpdateResult.LastChangeTriggerTimes {
-		for _, lastChangeTriggerTime := range lastChangeTriggerTimes {
-			latency := metrics.SinceInSeconds(lastChangeTriggerTime)
-			metrics.NetworkProgrammingLatency.Observe(latency)
-			klog.V(4).InfoS("Network programming", "endpoint", klog.KRef(name.Namespace, name.Name), "elapsed", latency)
-		}
-	}
-
-	metrics.SyncProxyRulesNoLocalEndpointsTotal.WithLabelValues("internal").Set(float64(serviceNoLocalEndpointsTotalInternal))
-	metrics.SyncProxyRulesNoLocalEndpointsTotal.WithLabelValues("external").Set(float64(serviceNoLocalEndpointsTotalExternal))
-	if proxier.healthzServer != nil {
-		proxier.healthzServer.Updated()
-	}
-	metrics.SyncProxyRulesLastTimestamp.SetToCurrentTime()
-
-	// 更新服务健康检查。Endpoints 列表可能包含不是 "OnlyLocal" 的服务，但 services 列表不会，serviceHealthServer 会删除这些端点。
-	if err := proxier.serviceHealthServer.SyncServices(proxier.svcPortMap.HealthCheckNodePorts()); err != nil {
-		klog.ErrorS(err, "Error syncing healthcheck services")
-	}
-	if err := proxier.serviceHealthServer.SyncEndpoints(proxier.endpointsMap.LocalReadyEndpoints()); err != nil {
-		klog.ErrorS(err, "Error syncing healthcheck endpoints")
-	}
-
-	// 完成清理工作，清除 UDP 服务的旧的 conntrack 条目
-	conntrack.CleanStaleEntries(proxier.iptables.IsIPv6(), proxier.exec, proxier.svcPortMap, serviceUpdateResult, endpointUpdateResult)
 }
 ```
 
