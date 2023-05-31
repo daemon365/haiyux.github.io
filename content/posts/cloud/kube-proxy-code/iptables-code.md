@@ -1825,25 +1825,26 @@ func (proxier *Proxier) syncProxyRules() {
         // 当kube-proxy首次启动时，我们需要创建这些规则，并且如果utiliptables Monitor检测到iptables已被刷新，我们需要重新创建它们。
         // 在这两种情况下，代码将强制执行完全同步。在所有其他情况下，我们可以安全地假设规则已经存在，
         // 因此在进行部分同步时跳过此步骤，以免在每次同步时执行20次/sbin/iptables（在具有大量iptables规则的主机上会非常慢）。
-	for _, jump := range append(iptablesJumpChains, iptablesKubeletJumpChains...) {
-        // 遍历jump数组，其中包括iptablesJumpChains和iptablesKubeletJumpChains的内容
-		for _, jump := range append(iptablesJumpChains, iptablesKubeletJumpChains...) { // 调用proxier.iptables的EnsureChain方法，确保链存在
-			if _, err := proxier.iptables.EnsureChain(jump.table, jump.dstChain); err != nil {
-				klog.ErrorS(err, "Failed to ensure chain exists", "table", jump.table, "chain", jump.dstChain)
-				return
-			}
-            // 将args设置为jump.extraArgs
-			args := jump.extraArgs
-			if jump.comment != "" {
-				args = append(args, "-m", "comment", "--comment", jump.comment)
-			}
-			args = append(args, "-j", string(jump.dstChain))
-			if _, err := proxier.iptables.EnsureRule(utiliptables.Prepend, jump.table, jump.srcChain, args...); err != nil {
-				klog.ErrorS(err, "Failed to ensure chain jumps", "table", jump.table, "srcChain", jump.srcChain, "dstChain", jump.dstChain)
-				return
-			}
-		}
-	}
+		for _, jump := range append(iptablesJumpChains, iptablesKubeletJumpChains...) {
+            // 遍历jump数组，其中包括iptablesJumpChains和iptablesKubeletJumpChains的内容
+            for _, jump := range append(iptablesJumpChains, iptablesKubeletJumpChains...) { // 调用proxier.iptables的EnsureChain方法，确保链存在
+                if _, err := proxier.iptables.EnsureChain(jump.table, jump.dstChain); err != nil {
+                    klog.ErrorS(err, "Failed to ensure chain exists", "table", jump.table, "chain", jump.dstChain)
+                    return
+                }
+                // 将args设置为jump.extraArgs
+                args := jump.extraArgs
+                if jump.comment != "" {
+                    args = append(args, "-m", "comment", "--comment", jump.comment)
+                }
+                args = append(args, "-j", string(jump.dstChain))
+                if _, err := proxier.iptables.EnsureRule(utiliptables.Prepend, jump.table, jump.srcChain, args...); err != nil {
+                    klog.ErrorS(err, "Failed to ensure chain jumps", "table", jump.table, "srcChain", jump.srcChain, "dstChain", jump.dstChain)
+                    return
+                }
+            }
+        }
+    }
 
     // 以下是在我们尝试编写iptables规则之前的代码，执行到这里后将不会返回。
     // 重置后续使用的所有缓冲区。
