@@ -2492,6 +2492,56 @@ func (proxier *Proxier) syncProxyRules() {
 }
 ```
 
+#### writeServiceToEndpointRules
+
+```go
+func (proxier *Proxier) writeServiceToEndpointRules(svcPortNameString string, svcInfo proxy.ServicePort, svcChain utiliptables.Chain, endpoints []proxy.Endpoint, args []string) {
+	// 首先写入会话亲和规则，如果适用。
+	if svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP {
+		for _, ep := range endpoints {
+			epInfo, ok := ep.(*endpointsInfo)
+			if !ok {
+				continue
+			}
+			comment := fmt.Sprintf(`"%s -> %s"`, svcPortNameString, epInfo.Endpoint)
+
+			args = append(args[:0],
+				"-A", string(svcChain),
+			)
+			args = proxier.appendServiceCommentLocked(args, comment)
+			args = append(args,
+				"-m", "recent", "--name", string(epInfo.ChainName),
+				"--rcheck", "--seconds", strconv.Itoa(svcInfo.StickyMaxAgeSeconds()), "--reap",
+				"-j", string(epInfo.ChainName),
+			)
+			proxier.natRules.Write(args)
+		}
+	}
+
+	// 现在写入负载均衡规则。
+	numEndpoints := len(endpoints)
+	for i, ep := range endpoints {
+		epInfo, ok := ep.(*endpointsInfo)
+		if !ok {
+			continue
+		}
+		comment := fmt.Sprintf(`"%s -> %s"`, svcPortNameString, epInfo.Endpoint)
+
+		args = append(args[:0], "-A", string(svcChain))
+		args = proxier.appendServiceCommentLocked(args, comment)
+		if i < (numEndpoints - 1) {
+			// 每个规则是一次性匹配。
+			args = append(args,
+				"-m", "statistic",
+				"--mode", "random",
+				"--probability", proxier.probability(numEndpoints-i))
+		}
+		// 最后一个规则（或者当 n == 1 时是唯一的规则）是一个保证匹配。
+		proxier.natRules.Write(args, "-j", string(epInfo.ChainName))
+	}
+}
+```
+
 ### Chain
 
 ```GO
