@@ -8,7 +8,7 @@ categories: [cloud]
 tags: [kubernetes]
 authors:
     - haiyux
-featuredImagePreview: /img/preview/proxy/kube-proxy.jpg
+featuredImagePreview: /img/preview/proxy/ipvs.jpg
 ---
 
 ## Proxier
@@ -2012,6 +2012,226 @@ func (proxier *Proxier) syncProxyRules() {
 
 	// 清理 UDP 服务的过时连接跟踪条目
 	conntrack.CleanStaleEntries(proxier.ipFamily == v1.IPv6Protocol, proxier.exec, proxier.svcPortMap, serviceUpdateResult, endpointUpdateResult)
+}
+```
+
+#### syncService
+
+```go
+func (proxier *Proxier) syncService(svcName string, vs *utilipvs.VirtualServer, bindAddr bool, alreadyBoundAddrs sets.Set[string]) error {
+	appliedVirtualServer, _ := proxier.ipvs.GetVirtualServer(vs)
+	// 获取当前应用的虚拟服务器配置
+	if appliedVirtualServer == nil || !appliedVirtualServer.Equal(vs) {
+		// 如果当前应用的虚拟服务器配置为空或者不等于传入的虚拟服务器配置
+		if appliedVirtualServer == nil {
+			// 如果当前应用的虚拟服务器配置为空，则创建一个新的服务
+			klog.V(3).InfoS("Adding new service", "serviceName", svcName, "virtualServer", vs)
+			// 添加 IPVS 服务
+			if err := proxier.ipvs.AddVirtualServer(vs); err != nil {
+				klog.ErrorS(err, "Failed to add IPVS service", "serviceName", svcName)
+				return err
+			}
+		} else {
+			// 如果当前应用的虚拟服务器配置不为空，则更新现有的服务
+			// 在更新期间，服务 VIP 不会下线
+			klog.V(3).InfoS("IPVS service was changed", "serviceName", svcName)
+			// 更新 IPVS 服务
+			if err := proxier.ipvs.UpdateVirtualServer(vs); err != nil {
+				klog.ErrorS(err, "Failed to update IPVS service")
+				return err
+			}
+		}
+	}
+
+	// 将服务地址绑定到虚拟接口
+	if bindAddr {
+		// 如果需要绑定地址
+		// 如果 alreadyBoundAddrs 为空，始终尝试绑定
+		// 否则，检查是否已经绑定，并提前返回
+		if alreadyBoundAddrs != nil && alreadyBoundAddrs.Has(vs.Address.String()) {
+			return nil
+		}
+
+		klog.V(4).InfoS("Bind address", "address", vs.Address)
+		_, err := proxier.netlinkHandle.EnsureAddressBind(vs.Address.String(), defaultDummyDevice)
+		if err != nil {
+			klog.ErrorS(err, "Failed to bind service address to dummy device", "serviceName", svcName)
+			return err
+		}
+	}
+
+	return nil
+}
+```
+
+#### syncEndpoint
+
+```go
+func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNodeLocalEndpoints bool, vs *utilipvs.VirtualServer) error {
+	// 获取已应用的虚拟服务器配置
+	appliedVirtualServer, err := proxier.ipvs.GetVirtualServer(vs)
+	if err != nil {
+		klog.ErrorS(err, "Failed to get IPVS service")
+		return err
+	}
+	if appliedVirtualServer == nil {
+		return errors.New("IPVS virtual service does not exist")
+	}
+
+	// curEndpoints 用于存储当前系统中的 IPVS 目的地址
+	curEndpoints := sets.New[string]()
+	curDests, err := proxier.ipvs.GetRealServers(appliedVirtualServer)
+	if err != nil {
+		klog.ErrorS(err, "Failed to list IPVS destinations")
+		return err
+	}
+	for _, des := range curDests {
+		curEndpoints.Insert(des.String())
+	}
+
+	endpoints := proxier.endpointsMap[svcPortName]
+
+	// 过滤拓扑感知的端点。只有在适当的特性开关启用且 Service 没有冲突的配置（如 externalTrafficPolicy=Local）时，才会过滤端点。
+	svcInfo, ok := proxier.svcPortMap[svcPortName]
+	if !ok {
+		klog.InfoS("Unable to filter endpoints due to missing service info", "servicePortName", svcPortName)
+	} else {
+		clusterEndpoints, localEndpoints, _, hasAnyEndpoints := proxy.CategorizeEndpoints(endpoints, svcInfo, proxier.nodeLabels)
+		if onlyNodeLocalEndpoints {
+			if len(localEndpoints) > 0 {
+				endpoints = localEndpoints
+			} else {
+				// https://github.com/kubernetes/kubernetes/pull/97081
+				// Allow access from local PODs even if no local endpoints exist.
+				// Traffic from an external source will be routed but the reply
+				// will have the POD address and will be discarded.
+				endpoints = clusterEndpoints
+
+				if hasAnyEndpoints && svcInfo.InternalPolicyLocal() {
+					proxier.serviceNoLocalEndpointsInternal.Insert(svcPortName.NamespacedName.String())
+				}
+
+				if hasAnyEndpoints && svcInfo.ExternalPolicyLocal() {
+					proxier.serviceNoLocalEndpointsExternal.Insert(svcPortName.NamespacedName.String())
+				}
+			}
+		} else {
+			endpoints = clusterEndpoints
+		}
+	}
+
+	newEndpoints := sets.New[string]()
+	for _, epInfo := range endpoints {
+		newEndpoints.Insert(epInfo.String())
+	}
+
+	// 创建新的端点
+	for _, ep := range sets.List(newEndpoints) {
+		ip, port, err := net.SplitHostPort(ep)
+		if err != nil {
+			klog.ErrorS(err, "Failed to parse endpoint", "endpoint", ep)
+			continue
+		}
+		portNum, err := strconv.Atoi(port)
+		if err != nil {
+			klog.ErrorS(err, "Failed to parse endpoint port", "port", port)
+			continue
+		}
+
+		newDest := &utilipvs.RealServer{
+			Address: netutils.ParseIPSloppy(ip),
+			Port:    uint16(portNum),
+			Weight:  1,
+		}
+
+		if curEndpoints.Has(ep) {
+			// 如果是首次同步，循环遍历所有当前目的地址并重置其权重。
+			if proxier.initialSync {
+				for _, dest := range curDests {
+					if dest.Weight != newDest.Weight {
+						err = proxier.ipvs.UpdateRealServer(appliedVirtualServer, newDest)
+						if err != nil {
+							klog.ErrorS(err, "Failed to update destination", "newDest", newDest)
+							continue
+						}
+					}
+				}
+			}
+			// 检查新的端点是否在优雅删除列表中，如果是，则立即删除该端点。
+			uniqueRS := GetUniqueRSName(vs, newDest)
+			if !proxier.gracefuldeleteManager.InTerminationList(uniqueRS) {
+				continue
+			}
+			klog.V(5).InfoS("new ep is in graceful delete list", "uniqueRealServer", uniqueRS)
+			err := proxier.gracefuldeleteManager.MoveRSOutofGracefulDeleteList(uniqueRS)
+			if err != nil {
+				klog.ErrorS(err, "Failed to delete endpoint in gracefulDeleteQueue", "endpoint", ep)
+				continue
+			}
+		}
+		err = proxier.ipvs.AddRealServer(appliedVirtualServer, newDest)
+		if err != nil {
+			klog.ErrorS(err, "Failed to add destination", "newDest", newDest)
+			continue
+		}
+	}
+
+	// 删除旧的端点
+	for _, ep := range curEndpoints.Difference(newEndpoints).UnsortedList() {
+		// 如果当前端点在优雅删除列表中，则跳过
+		uniqueRS := vs.String() + "/" + ep
+		if proxier.gracefuldeleteManager.InTerminationList(uniqueRS) {
+			continue
+		}
+		ip, port, err := net.SplitHostPort(ep)
+		if err != nil {
+			klog.ErrorS(err, "Failed to parse endpoint", "endpoint", ep)
+			continue
+		}
+		portNum, err := strconv.Atoi(port)
+		if err != nil {
+			klog.ErrorS(err, "Failed to parse endpoint port", "port", port)
+			continue
+		}
+
+		delDest := &utilipvs.RealServer{
+			Address: netutils.ParseIPSloppy(ip),
+			Port:    uint16(portNum),
+		}
+
+		klog.V(5).InfoS("Using graceful delete", "uniqueRealServer", uniqueRS)
+		err = proxier.gracefuldeleteManager.GracefulDeleteRS(appliedVirtualServer, delDest)
+		if err != nil {
+			klog.ErrorS(err, "Failed to delete destination", "uniqueRealServer", uniqueRS)
+			continue
+		}
+	}
+	return nil
+}
+```
+
+#### cleanLegacyService
+
+```go
+func (proxier *Proxier) cleanLegacyService(activeServices sets.Set[string], currentServices map[string]*utilipvs.VirtualServer) {
+	// 清理过期的服务
+	for cs, svc := range currentServices {
+		if proxier.isIPInExcludeCIDRs(svc.Address) {
+			// 如果服务的地址在排除的CIDR范围内，则跳过
+			continue
+		}
+		if getIPFamily(svc.Address) != proxier.ipFamily {
+			// 如果地址族与指定的地址族不匹配，则跳过
+			continue
+		}
+		if !activeServices.Has(cs) {
+			klog.V(4).InfoS("Delete service", "virtualServer", svc)
+			// 删除服务
+			if err := proxier.ipvs.DeleteVirtualServer(svc); err != nil {
+				klog.ErrorS(err, "Failed to delete service", "virtualServer", svc)
+			}
+		}
+	}
 }
 ```
 

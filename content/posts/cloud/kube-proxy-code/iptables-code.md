@@ -8,7 +8,7 @@ categories: [cloud]
 tags: [kubernetes]
 authors:
     - haiyux
-featuredImagePreview: /img/preview/proxy/kube-proxy.jpg
+featuredImagePreview: /img/preview/proxy/iptables.jpg
 ---
 
 ## utiliptables.Interface
