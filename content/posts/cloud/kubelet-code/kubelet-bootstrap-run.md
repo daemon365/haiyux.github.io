@@ -1,5 +1,5 @@
 ---
-title: "kubelet BootStrap Run 代码走读“
+title: "kubelet BootStrap Run 代码走读"
 subtitle:
 date: 2023-06-07T20:57:21+08:00
 draft: false
