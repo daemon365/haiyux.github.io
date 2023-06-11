@@ -65,11 +65,18 @@
   [main.params]
     icon = "fa-solid fa-info-circle"
 [[main]]
+  identifier = "code"
+  name = "代码走读"
+  url = "https://code.haiyux.cc"
+  weight = 8
+  [main.params]
+    icon = "fa-solid fa-book"
+[[main]]
   identifier = "github"
   pre = "<i class='fa-brands fa-github fa-fw' aria-hidden='true'></i>"
   url = "https://github.com/haiyux"
   title = "GitHub"
-  weight = 8
+  weight = 9
   [main.params]
     class = "text-center"
     type = "mobile"
